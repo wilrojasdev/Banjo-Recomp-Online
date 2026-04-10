@@ -1,0 +1,51 @@
+<rml>
+<head>
+<style>
+body {
+    z-index: 90;
+}
+#chat-container {
+    position: fixed;
+    bottom: 30dp;
+    left: 20dp;
+    width: 380dp;
+    font-family: "Inter Variable";
+    font-size: 13dp;
+}
+#chat-messages {
+    max-height: 180dp;
+    overflow: hidden;
+}
+.msg {
+    background-color: #00000099;
+    color: #FFFFFFEE;
+    padding: 3dp 8dp;
+    margin-bottom: 2dp;
+    border-radius: 3dp;
+}
+.msg-host { color: #58D0FFEE; }
+.msg-p2   { color: #FF8858EE; }
+.msg-p3   { color: #58FF8AEE; }
+.msg-p4   { color: #FFD058EE; }
+.name { font-weight: bold; }
+#chat-input {
+    background-color: #000000CC;
+    color: #FFFFFFDD;
+    padding: 5dp 10dp;
+    margin-top: 3dp;
+    border-radius: 4dp;
+}
+#input-cursor {
+    color: #FFFFFF88;
+}
+</style>
+</head>
+<body>
+<div id="chat-container">
+    <div id="chat-messages"></div>
+    <div id="chat-input">
+        <span style="color: #FFFFFF66;">&gt; </span><span id="input-text"></span><span id="input-cursor">_</span>
+    </div>
+</div>
+</body>
+</rml>

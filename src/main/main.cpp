@@ -7,8 +7,22 @@
 #include <numeric>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "nfd.h"
+#include "../net/net_manager.h"
+#include "../net/net_config.h"
+#include "../net/net_chat.h"
+#include "../net/net_chat_ui.h"
+
+// Network recomp API functions (defined in net_recomp_api.cpp)
+#include "recomp.h"
+extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_push_local_state(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_is_connected(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_get_remote_state(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_get_remote_count(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_get_local_player_id(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -198,7 +212,19 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 }
 
 void update_gfx(void*) {
+    // Poll chat input BEFORE game input so we can steal keyboard events
+    bknet::ChatInput::instance().poll_events();
+
     recompinput::handle_events();
+
+    // Pump network events and send/receive state
+    auto& net = bknet::NetworkManager::instance();
+    if (net.is_connected()) {
+        net.update();
+    }
+
+    // Update chat overlay UI
+    bknet::chat_ui_update();
 }
 
 static SDL_AudioCVT audio_convert;
@@ -730,6 +756,12 @@ int main(int argc, char** argv) {
     // REGISTER_FUNC(recomp_get_mouse_deltas);
     REGISTER_FUNC(recomp_get_inverted_axes);
     REGISTER_FUNC(recomp_get_analog_inverted_axes);
+    REGISTER_FUNC(recomp_net_push_full_state);
+    REGISTER_FUNC(recomp_net_push_local_state);
+    REGISTER_FUNC(recomp_net_is_connected);
+    REGISTER_FUNC(recomp_net_get_remote_state);
+    REGISTER_FUNC(recomp_net_get_remote_count);
+    REGISTER_FUNC(recomp_net_get_local_player_id);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();
@@ -740,9 +772,56 @@ int main(int argc, char** argv) {
     // Register extensions for two types: Props and ActorMarkers.
     recomputil::init_extended_object_data(2);
 
-    recompinput::players::set_single_player_mode(true);
+    // Initialize networking (ENet)
+    bknet::NetworkManager::instance().initialize();
 
     banjo::init_config();
+
+    // Read network config. Environment variables override UI settings:
+    //   BK_NET_MODE=host|join|off
+    //   BK_NET_IP=<ip>        (for join mode, default 127.0.0.1)
+    //   BK_NET_PORT=<port>    (default 7777)
+    {
+        auto ui_mode = banjo::get_network_mode();
+        auto ui_port = banjo::get_network_port();
+
+        // Env var overrides
+        const char* env_mode = std::getenv("BK_NET_MODE");
+        const char* env_ip = std::getenv("BK_NET_IP");
+        const char* env_port = std::getenv("BK_NET_PORT");
+
+        // Determine mode: env var takes priority, then UI setting
+        banjo::NetworkMode mode = ui_mode;
+        if (env_mode) {
+            std::string m(env_mode);
+            if (m == "host") mode = banjo::NetworkMode::Host;
+            else if (m == "join") mode = banjo::NetworkMode::Join;
+            else if (m == "off") mode = banjo::NetworkMode::Off;
+        }
+        // Legacy: BK_NET_IP without BK_NET_MODE implies join
+        if (!env_mode && env_ip && env_ip[0] != '\0') {
+            mode = banjo::NetworkMode::Join;
+        }
+
+        if (env_port) bknet::set_port(static_cast<uint16_t>(std::atoi(env_port)));
+        else bknet::set_port(static_cast<uint16_t>(ui_port));
+
+        recompinput::players::set_single_player_mode(true);
+
+        if (mode == banjo::NetworkMode::Host) {
+            bknet::set_mode(bknet::NetworkMode::Host);
+            bknet::NetworkManager::instance().host_game();
+        } else if (mode == banjo::NetworkMode::Join) {
+            bknet::set_mode(bknet::NetworkMode::Join);
+            if (env_ip && env_ip[0] != '\0') {
+                bknet::set_join_ip(env_ip);
+            }
+            bknet::NetworkManager::instance().join_game();
+        }
+    }
+
+    // Initialize chat input system (SDL event watcher)
+    bknet::ChatInput::instance().init();
 
     recompui::register_launcher_init_callback(on_launcher_init);
     recompui::register_launcher_update_callback(banjo::launcher_animation_update);
@@ -815,6 +894,8 @@ int main(int argc, char** argv) {
         error_handling_callbacks,
         threads_callbacks
     );
+
+    bknet::NetworkManager::instance().shutdown();
 
     NFD_Quit();
 

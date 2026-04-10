@@ -52,3 +52,11 @@ recomp_get_flying_and_swimming_inverted_axes = 0x8F0000BC;
 recomp_get_first_person_inverted_axes = 0x8F0000C0;
 recomp_get_analog_cam_sensitivity = 0x8F0000C4;
 recomp_run_ui_callbacks = 0x8F0000C8;
+
+/* Networking functions */
+recomp_net_push_full_state = 0x8F0000CC;
+recomp_net_push_local_state = 0x8F0000D0;
+recomp_net_is_connected = 0x8F0000D4;
+recomp_net_get_remote_state = 0x8F0000D8;
+recomp_net_get_remote_count = 0x8F0000DC;
+recomp_net_get_local_player_id = 0x8F0000E0;

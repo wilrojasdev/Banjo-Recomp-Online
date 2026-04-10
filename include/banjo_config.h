@@ -29,6 +29,11 @@ namespace banjo {
         namespace graphics {
             inline const std::string cutscene_aspect_ratio_mode = "cutscene_aspect_ratio_mode";
         }
+
+        namespace network {
+            inline const std::string mode = "network_mode";
+            inline const std::string port = "network_port";
+        }
     }
 
     // TODO: Move loading configs to the runtime once we have a way to allow per-project customization.
@@ -85,6 +90,22 @@ namespace banjo {
     };
 
     CutsceneAspectRatioMode get_cutscene_aspect_ratio_mode();
+
+    enum class NetworkMode {
+        Off,
+        Host,
+        Join,
+        OptionCount
+    };
+
+    NLOHMANN_JSON_SERIALIZE_ENUM(banjo::NetworkMode, {
+        {banjo::NetworkMode::Off, "Off"},
+        {banjo::NetworkMode::Host, "Host"},
+        {banjo::NetworkMode::Join, "Join"}
+    });
+
+    NetworkMode get_network_mode();
+    uint32_t get_network_port();
 
     void open_quit_game_prompt();
 };

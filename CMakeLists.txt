@@ -12,6 +12,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(FetchContent)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
 endif()
@@ -54,6 +56,14 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 set(BUILD_SHARED_LIBS OFF)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
+
+# ENet networking library for online multiplayer
+FetchContent_Declare(
+    enet
+    GIT_REPOSITORY https://github.com/lsalzman/enet.git
+    GIT_TAG v1.3.18
+)
+FetchContent_MakeAvailable(enet)
 
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 
@@ -154,10 +164,22 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/game/rom_decompression.cpp
 
     ${CMAKE_SOURCE_DIR}/rsp/n_aspMain.cpp
+
+    ${CMAKE_SOURCE_DIR}/src/net/net_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_packets.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_state_sync.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_config.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_interpolation.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_recomp_api.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_chat.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_chat_ui.cpp
 )
 
 target_include_directories(BanjoRecompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${enet_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty/sse2neon
     ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib
@@ -169,6 +191,7 @@ target_include_directories(BanjoRecompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompinput/include
     ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/include
     ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/src
+    ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/lib/RmlUi/Include
     ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/nativefiledialog-extended/src/include
     ${CMAKE_SOURCE_DIR}/lib/SlotMap
     ${CMAKE_CURRENT_BINARY_DIR}
@@ -207,8 +230,6 @@ elseif (APPLE)
 endif()
 
 if (WIN32)
-    include(FetchContent)
-
     if (DEFINED ENV{SDL2_VERSION})
         set(SDL2_VERSION $ENV{SDL2_VERSION})
     else()
@@ -344,6 +365,7 @@ target_link_libraries(BanjoRecompiled PRIVATE
     ultramodern
     rt64
     nfd
+    enet
 )
 
 # Embed all .nrm files in the "mods" directory

@@ -3,6 +3,9 @@
 #include "core1/core1.h"
 #include "core2/nc/camera.h"
 
+// @recomp Network sync - called at end of ncCamera_update each frame
+extern void bkrecomp_net_sync_frame(void);
+
 s32 cur_perspective_projection_transform_id = 0;
 s32 backup_perspective_projection_transform_id = 0;
 
@@ -277,4 +280,7 @@ RECOMP_PATCH void ncCamera_update(void) {
     viewport_update();
     func_802BEFB0();
     func_802BBA84();
+
+    // @recomp Push local player state to network module each frame
+    bkrecomp_net_sync_frame();
 }

@@ -242,6 +242,37 @@ banjo::CutsceneAspectRatioMode banjo::get_cutscene_aspect_ratio_mode() {
     return get_graphics_config_enum_value<banjo::CutsceneAspectRatioMode>(banjo::configkeys::graphics::cutscene_aspect_ratio_mode);
 }
 
+banjo::NetworkMode banjo::get_network_mode() {
+    return get_general_config_enum_value<banjo::NetworkMode>(banjo::configkeys::network::mode);
+}
+
+uint32_t banjo::get_network_port() {
+    return get_general_config_number_value<uint32_t>(banjo::configkeys::network::port);
+}
+
+static void add_network_options(recomp::config::Config &config) {
+    using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+
+    static EnumOptionVector network_mode_options = {
+        {banjo::NetworkMode::Off, "Off", "Off"},
+        {banjo::NetworkMode::Host, "Host", "Host Game"},
+        {banjo::NetworkMode::Join, "Join", "Join Game"},
+    };
+    config.add_enum_option(
+        banjo::configkeys::network::mode,
+        "Network Mode",
+        "Enable online multiplayer. <recomp-color primary>Host</recomp-color> creates a game, <recomp-color primary>Join</recomp-color> connects to a host.",
+        network_mode_options,
+        banjo::NetworkMode::Off
+    );
+    config.add_number_option(
+        banjo::configkeys::network::port,
+        "Port",
+        "Port number for hosting or joining. Default is 7777.",
+        1024, 65535, 1, 0, false, 7777
+    );
+}
+
 void banjo::init_config() {
     std::filesystem::path recomp_dir = recompui::file::get_app_folder_path();
 
@@ -256,6 +287,7 @@ void banjo::init_config() {
 
     auto &general_config = recompui::config::create_general_tab(general_options);
     add_general_options(general_config);
+    add_network_options(general_config);
 
     auto &graphics_config = recompui::config::create_graphics_tab();
     add_graphics_options(graphics_config);
