@@ -3,6 +3,7 @@
 #include "enums.h"
 #include "core2/modelRender.h"
 #include "core2/anctrl.h"
+#include "animation.h"
 #include "transform_ids.h"
 
 u32 recomp_net_is_connected(void);
@@ -40,6 +41,10 @@ extern void func_8033A280(f32);
 extern struct5Bs *D_80363780;
 extern void func_8033A450(struct5Bs *);
 extern void baanim_80289F30(void);
+extern void anim_update(Animation *this);
+extern void anim_drawSetup(Animation *this);
+extern void anim_setIndex(Animation *this, enum asset_e index);
+extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
 
 // Shadow model
 
@@ -51,6 +56,8 @@ typedef struct {
     AnimCtrl *anim_ctrl;
     u16 current_anim;
     f32 smooth_yaw;
+    f32 ghost_timer;    // Animation playback timer [0..1]
+    f32 anim_duration;  // Current animation duration in seconds
     bool initialized;
 } GhostModel;
 
@@ -86,6 +93,8 @@ static void ghost_ensure_init(u32 pid) {
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
+    gm->ghost_timer = 0.0f;
+    gm->anim_duration = 6.0f;
     gm->initialized = TRUE;
 }
 
@@ -222,17 +231,20 @@ static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
     }
 
     if (anim != gm->current_anim) {
-        anctrl_setIndex(gm->anim_ctrl, anim);
-        anctrl_setPlaybackType(gm->anim_ctrl, playback);
-        anctrl_setDuration(gm->anim_ctrl, duration);
-        _anctrl_start(gm->anim_ctrl, __FILE__, __LINE__);
         gm->current_anim = anim;
+        gm->anim_duration = duration;
+        gm->ghost_timer = 0.0f; // Reset timer on animation change
     }
 }
 
 void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     draw_debug_counter++;
     if (!recomp_net_is_connected()) return;
+
+    AnimCtrl *playerAC = baanim_getAnimCtrlPtr();
+    if (!playerAC) return;
+    Animation *pa = anctrl_getAnimPtr(playerAC);
+    if (!pa) return;
 
     u32 local_id = recomp_net_get_local_player_id();
     u32 local_map = (u32)map_get();
@@ -249,43 +261,28 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         GhostModel *gm = &ghost_models[pid];
         if (!gm->initialized) continue;
 
-        // Ghost uses the local player's bone transforms (already set by baModel_draw).
-        // This means the ghost mirrors the local player's animation pose,
-        // but position and rotation are from the remote player.
+        // Ghost uses the local player's bone transforms
+        // (already set by baModel_draw before this function is called)
 
-        // Smooth yaw
+        // === Position and rotation ===
         gm->smooth_yaw = lerp_angle(gm->smooth_yaw, rs.yaw, 0.25f);
 
-        f32 pos[3];
-        pos[0] = rs.x;
-        pos[1] = rs.y;
-        pos[2] = rs.z;
-
-        f32 rot[3];
-        rot[0] = rs.pitch;
-        rot[1] = gm->smooth_yaw;
-        rot[2] = 0.0f;
-
+        f32 pos[3] = {rs.x, rs.y, rs.z};
+        f32 rot[3] = {rs.pitch, gm->smooth_yaw, 0.0f};
         f32 ref[3] = {0.0f, 0.0f, 0.0f};
 
-        // Set unique transform ID for ghost
         cur_drawn_model_transform_id = GHOST_TRANSFORM_ID_START + (pid * GHOST_TRANSFORM_ID_STRIDE);
 
-        // === Draw shadow first ===
+        // === Draw shadow ===
         if (gm->shadow_model) {
-            f32 shadow_pos[3];
-            shadow_pos[0] = rs.x;
-            shadow_pos[1] = rs.y + 4.0f; // slightly above ground
-            shadow_pos[2] = rs.z;
-            f32 shadow_rot[3] = {0.0f, 0.0f, 0.0f};
-            // Shadow scale: smaller when higher up (same logic as player shadow)
-            f32 shadow_scale = 0.43f;
+            f32 sp[3] = {rs.x, rs.y + 4.0f, rs.z};
+            f32 sr[3] = {0.0f, 0.0f, 0.0f};
             modelRender_setAlpha(0xFF);
             modelRender_setDepthMode(MODEL_RENDER_DEPTH_COMPARE);
-            modelRender_draw(gfx, mtx, shadow_pos, shadow_rot, shadow_scale, 0, gm->shadow_model);
+            modelRender_draw(gfx, mtx, sp, sr, 0.43f, 0, gm->shadow_model);
         }
 
-        // === Draw Banjo model ===
+        // === Draw Banjo ===
         s32 env_color[3];
         func_8029A47C(env_color);
         modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
@@ -293,6 +290,8 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         func_8033A450(D_80363780);
         modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
         modelRender_draw(gfx, mtx, pos, rot, baModelScale, ref, gm->model_bin);
+
+        // No animation restore needed — using local player's bones as-is
     }
 
     // Restore local player bone transforms
