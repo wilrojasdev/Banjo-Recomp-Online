@@ -22,6 +22,11 @@ extern void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx);
 
 // @recomp Patched to set the current transform ID to banjo's when drawing the player.
 // Also draws network ghost players after the local player.
+// @recomp Ghost transform IDs: separate range so RT64 doesn't
+// interpolate between local Banjo and ghost positions.
+#define GHOST_TRANSFORM_ID_START  0x20000000
+#define GHOST_TRANSFORM_ID_STRIDE 0x100
+
 RECOMP_PATCH void player_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     if (D_8037BFB8) {
         eggShatter_draw(gfx, mtx, vtx);
@@ -35,11 +40,12 @@ RECOMP_PATCH void player_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         baModel_draw(gfx, mtx, vtx);
 
-        // @recomp Draw network ghost players using the same model
-        bkrecomp_net_draw_ghosts(gfx, mtx, vtx);
-
-        // @recomp Reset the current transform ID.
+        // @recomp Reset transform ID before drawing ghosts.
         cur_drawn_model_transform_id = prev_transform_id;
+
+        // @recomp Draw ghosts with their own transform IDs
+        // so RT64 interpolation doesn't mix local and ghost positions.
+        bkrecomp_net_draw_ghosts(gfx, mtx, vtx);
     }
 }
 
