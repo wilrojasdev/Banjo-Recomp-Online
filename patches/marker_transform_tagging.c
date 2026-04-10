@@ -17,7 +17,11 @@ ModelSkinningData sPlayerSkinningData;
 
 void bkrecomp_setup_custom_skinning(ModelSkinningData* skinning_data, u32 model_id);
 
+// @recomp Network ghost rendering
+extern void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx);
+
 // @recomp Patched to set the current transform ID to banjo's when drawing the player.
+// Also draws network ghost players after the local player.
 RECOMP_PATCH void player_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     if (D_8037BFB8) {
         eggShatter_draw(gfx, mtx, vtx);
@@ -30,6 +34,9 @@ RECOMP_PATCH void player_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         cur_drawn_model_transform_id = BANJO_TRANSFORM_ID_START;
 
         baModel_draw(gfx, mtx, vtx);
+
+        // @recomp Draw network ghost players using the same model
+        bkrecomp_net_draw_ghosts(gfx, mtx, vtx);
 
         // @recomp Reset the current transform ID.
         cur_drawn_model_transform_id = prev_transform_id;
