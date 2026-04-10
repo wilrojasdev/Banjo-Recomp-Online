@@ -93,42 +93,127 @@ static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
     u16 anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     f32 duration = 6.0f;
 
+    // Durations from actual game source (lib/bk-decomp/src/core2/bs/*.c)
     switch (bs_state) {
+        // Idle / Stand (stand.c: 5.5f once)
         case BS_0_NONE: case BS_1_IDLE: case BS_20_LANDING:
-            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 6.0f; break;
+            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; break;
         case BS_D_TIMEOUT: case BS_53_TIMEOUT:
-            anim = ASSET_77_ANIM_BSTIMEOUT; duration = 4.0f; break;
+            anim = ASSET_77_ANIM_BSTIMEOUT; duration = 3.2f; break;
+
+        // Walk (walk.c: dynamic duration, using mid-range values)
         case BS_2_WALK_SLOW: case BS_WALK_CREEP:
-            anim = ASSET_2_ANIM_BSWALK_CREEP; duration = 2.0f; break;
-        case BS_WALK:  anim = ASSET_3_ANIM_BSWALK; duration = 1.2f; break;
-        case BS_4_WALK_FAST: anim = ASSET_C_ANIM_BSWALK_RUN; duration = 0.8f; break;
-        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.4f; break;
-        case BS_SLIDE: anim = ASSET_5A_ANIM_BSSLIDE_FRONT; duration = 1.5f; break;
-        case BS_ROLL:  anim = ASSET_11_ANIM_BSWHIRL_WALK; duration = 0.5f; break;
+            anim = ASSET_2_ANIM_BSWALK_CREEP; duration = 0.9f; break;
+        case BS_WALK:  anim = ASSET_3_ANIM_BSWALK; duration = 0.7f; break;
+        case BS_4_WALK_FAST: anim = ASSET_C_ANIM_BSWALK_RUN; duration = 0.5f; break;
+        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.35f; break;
+        case BS_SLIDE: anim = ASSET_5A_ANIM_BSSLIDE_FRONT; duration = 1.0f; break;
+        case BS_ROLL:  anim = ASSET_11_ANIM_BSWHIRL_WALK; duration = 0.53f; break;
+
+        // Jump (jump.c: 2.0f once)
         case BS_5_JUMP: anim = ASSET_8_ANIM_BSJUMP; duration = 2.0f; break;
         case BS_12_BFLIP: anim = ASSET_4C_ANIM_BSBFLIP_HOLD; duration = 1.5f; break;
         case BS_2F_FALL: anim = ASSET_B0_ANIM_BSJUMP_FALL; duration = 2.0f; break;
-        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.8f; break;
-        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.2f; break;
-        case BS_F_BBUSTER: anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.2f; break;
-        case BS_BFLAP: anim = ASSET_17_ANIM_BSBFLAP; duration = 1.2f; break;
-        case BS_11_BPECK: anim = ASSET_1A_ANIM_BSBPECK; duration = 1.0f; break;
-        case BS_BBARGE: anim = ASSET_1C_ANIM_BSBBARGE; duration = 1.2f; break;
-        case BS_CROUCH: anim = ASSET_10C_ANIM_BSCROUCH_IDLE; duration = 6.0f; break;
+        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.35f; break;
+
+        // Attacks (from actual source durations)
+        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.3f; break;
+        case BS_F_BBUSTER: anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.0f; break;
+        case BS_BFLAP: anim = ASSET_18_ANIM_BSBFLAP_ENTER; duration = 0.3f; break;
+        case BS_11_BPECK: anim = ASSET_1A_ANIM_BSBPECK; duration = 0.2f; break;
+        case BS_BBARGE: anim = ASSET_1C_ANIM_BSBBARGE; duration = 1.0f; break;
+
+        // Crouch (crouch.c: 0.5f loop)
+        case BS_CROUCH: anim = ASSET_10C_ANIM_BSCROUCH_IDLE; duration = 0.5f; break;
+
+        // Eggs (bEggHead.c: 1.0f, bEggAss.c: 1.0f)
         case BS_9_EGG_HEAD: anim = ASSET_2A_ANIM_BSEGGHEAD; duration = 1.0f; break;
         case BS_A_EGG_ASS: anim = ASSET_2B_ANIM_BSEGGASS; duration = 1.0f; break;
-        case BS_15_BTROT_IDLE: anim = ASSET_26_ANIM_BSBTROT_IDLE; duration = 6.0f; break;
-        case BS_16_BTROT_WALK: anim = ASSET_15_ANIM_BSBTROT_WALK; duration = 1.0f; break;
+
+        // Talon Trot (bTrot.c)
+        case BS_14_BTROT_ENTER: anim = ASSET_16_ANIM_BSBTROT_ENTER; duration = 1.0f; break;
+        case BS_15_BTROT_IDLE: anim = ASSET_26_ANIM_BSBTROT_IDLE; duration = 1.2f; break;
+        case BS_16_BTROT_WALK: anim = ASSET_15_ANIM_BSBTROT_WALK; duration = 0.53f; break;
+        case BS_17_BTROT_EXIT: anim = ASSET_7_ANIM_BSBTROT_EXIT; duration = 0.6f; break;
         case BS_8_BTROT_JUMP: anim = ASSET_27_ANIM_BSBTROR_JUMP; duration = 1.5f; break;
-        case BS_24_FLY: anim = ASSET_38_ANIM_BSBFLY; duration = 1.5f; break;
-        case BS_2D_SWIM_IDLE: anim = ASSET_57_ANIM_BSSWIM_IDLE; duration = 4.0f; break;
-        case BS_2E_SWIM: anim = ASSET_39_ANIM_BSSWIM_MOVE; duration = 1.0f; break;
-        case BS_4F_CLIMB_IDLE: anim = ASSET_B1_ANIM_BSCLIMB_IDLE_1; duration = 6.0f; break;
-        case BS_50_CLIMB_MOVE: anim = ASSET_A_ANIM_BSCLIMB_MOVE; duration = 1.0f; break;
+
+        // Wonderwing (1.0f loop)
+        case BS_1A_WONDERWING_ENTER: case BS_1B_WONDERWING_IDLE:
+        case BS_1C_WONDERWING_WALK: case BS_1D_WONDERWING_JUMP:
+        case BS_1E_WONDERWING_EXIT:
+            anim = ASSET_23_ANIM_BSWONDERWING_IDLE; duration = 1.0f; break;
+
+        // Flying (bFly.c)
+        case BS_23_FLY_ENTER: anim = ASSET_45_ANIM_BSBFLY_ENTER; duration = 1.4f; break;
+        case BS_24_FLY: anim = ASSET_38_ANIM_BSBFLY; duration = 0.62f; break;
+        case BS_18_FLY_KNOCKBACK: case BS_FLY_OW: case BS_58_BEAKBOMB_CRASH:
+            anim = ASSET_3E_ANIM_BSBFLY_BEAKBOMB_CRASH; duration = 1.4f; break;
+        case BS_BOMB: anim = ASSET_43_ANIM_BSBFLY_BEAKBOMB_START; duration = 1.0f; break;
+
+        // Swimming (bSwim.c)
+        case BS_2D_SWIM_IDLE: anim = ASSET_57_ANIM_BSSWIM_IDLE; duration = 1.2f; break;
+        case BS_2E_SWIM: anim = ASSET_39_ANIM_BSSWIM_MOVE; duration = 0.75f; break;
+        case BS_30_DIVE_ENTER: anim = ASSET_3C_ANIM_BSSWIM_DIVE_ENTER; duration = 1.0f; break;
+        case BS_2B_DIVE_IDLE: anim = ASSET_70_ANIM_BSSWIM_DIVE_IDLE; duration = 2.0f; break;
+        case BS_2C_DIVE_B: case BS_39_DIVE_A:
+            anim = ASSET_3F_ANIM_BSSWIM_DIVE_MOVE; duration = 0.75f; break;
+        case BS_54_SWIM_DIE: anim = ASSET_B9_ANIM_BSSWIM_DIE; duration = 0.7f; break;
+
+        // Climbing (climb.c)
+        case BS_4F_CLIMB_IDLE: anim = ASSET_B2_ANIM_BSCLIMB_IDLE_2; duration = 2.64f; break;
+        case BS_50_CLIMB_MOVE: anim = ASSET_A_ANIM_BSCLIMB_MOVE; duration = 0.9f; break;
+
+        // Long legs (bLongLeg.c)
+        case BS_25_LONGLEG_ENTER: case BS_26_LONGLEG_IDLE: case BS_LONGLEG_EXIT:
+            anim = ASSET_41_ANIM_BSLONGLEG_IDLE; duration = 1.0f; break;
+        case BS_LONGLEG_WALK: anim = ASSET_42_ANIM_BSLONGLEG_WALK; duration = 0.53f; break;
+        case BS_LONGLEG_JUMP: anim = ASSET_3D_ANIM_BSLONGLEG_JUMP; duration = 1.5f; break;
+
+        // Carrying
+        case BS_3A_CARRY_IDLE: anim = ASSET_72_ANIM_BSCARRY_IDLE; duration = 5.5f; break;
+        case BS_3B_CARRY_WALK: anim = ASSET_73_ANIM_BSCARRY_WALK; duration = 0.7f; break;
+        case BS_CARRY_THROW: anim = ASSET_11B_ANIM_BSTHROW; duration = 0.8f; break;
+
+        // Damage
         case BS_E_OW: anim = ASSET_4D_ANIM_BSOW; duration = 1.0f; break;
+        case BS_56_RECOIL: anim = ASSET_F_ANIM_BSREBOUND; duration = 1.0f; break;
         case BS_41_DIE: anim = ASSET_9_ANIM_BSDIE; duration = 3.0f; break;
-        case BS_3C_TALK: anim = ASSET_14A_ANIM_BSREST_LISTEN; duration = 4.0f; break;
-        default: anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 6.0f; break;
+        case BS_SPLAT: anim = ASSET_D2_ANIM_BSSPLAT; duration = 2.25f; break;
+
+        // Talk
+        case BS_3C_TALK: anim = ASSET_14A_ANIM_BSREST_LISTEN; duration = 11.4f; break;
+        case BS_44_JIG_JIGGY: anim = ASSET_2E_ANIM_BSJIG_JIGGY; duration = 2.0f; break;
+
+        // Ant (ant.c)
+        case BS_35_ANT_IDLE: anim = ASSET_5E_ANIM_BSANT_IDLE; duration = 1.2f; break;
+        case BS_ANT_WALK: anim = ASSET_5F_ANIM_BSANT_WALK; duration = 0.8f; break;
+        case BS_ANT_JUMP: case BS_38_ANT_FALL:
+            anim = ASSET_60_ANIM_BSANT_JUMP; duration = 1.5f; break;
+        case BS_3E_ANT_OW: anim = ASSET_28_ANIM_BSANT_OW; duration = 1.0f; break;
+        case BS_43_ANT_DIE: anim = ASSET_29_ANIM_BSANT_DIE; duration = 3.0f; break;
+
+        // Pumpkin (pumpkin.c: 0.8f)
+        case BS_48_PUMPKIN_IDLE: anim = ASSET_5E_ANIM_BSANT_IDLE; duration = 1.2f; break;
+        case BS_49_PUMPKIN_WALK: case BS_4B_PUMPKIN_FALL:
+            anim = ASSET_A0_ANIM_BSPUMPKIN_WALK; duration = 0.8f; break;
+        case BS_4A_PUMPKIN_JUMP: anim = ASSET_A1_ANIM_BSPUMPKIN_JUMP; duration = 1.5f; break;
+
+        // Crocodile (croc: 1.0f idle, 0.8f walk)
+        case BS_5E_CROC_IDLE: anim = ASSET_E1_ANIM_BSCROC_IDLE; duration = 1.0f; break;
+        case BS_CROC_WALK: anim = ASSET_E0_ANIM_BSCROC_WALK; duration = 0.8f; break;
+        case BS_CROC_JUMP: anim = ASSET_11C_ANIM_BSCROC_JUMP; duration = 1.5f; break;
+
+        // Walrus (walrus.c: 4.0f idle, 0.8f walk)
+        case BS_67_WALRUS_IDLE: anim = ASSET_11F_ANIM_BSWALRUS_IDLE; duration = 4.0f; break;
+        case BS_WALRUS_WALK: anim = ASSET_120_ANIM_BSWALRUS_WALK; duration = 0.8f; break;
+        case BS_WALRUS_JUMP: anim = ASSET_121_ANIM_BSWALRUS_JUMP; duration = 1.5f; break;
+
+        // Bee
+        case BS_85_BEE_IDLE: anim = ASSET_1DE_ANIM_BEE_IDLE; duration = 3.0f; break;
+        case BS_BEE_WALK: anim = ASSET_1DD_ANIM_BEE_WALK; duration = 0.38f; break;
+        case BS_BEE_FLY: anim = ASSET_1DC_ANIM_BEE_FLY; duration = 0.38f; break;
+
+        default: anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; break;
     }
 
     if (anim != gm->current_anim) {
