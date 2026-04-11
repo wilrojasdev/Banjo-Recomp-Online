@@ -34,21 +34,30 @@ extern struct5Bs *D_80363780;
 extern void func_8033A450(struct5Bs *);
 extern void baanim_80289F30(void);
 
-// Low-level: bypass AnimCtrl, call animation pipeline directly
 extern void *animBinCache_get(enum asset_e asset_id);
 extern void animationFile_getBoneTransformList(void *anim_file, f32 progress, void *bone_list);
 extern void *boneTransformList_new(void);
 extern void modelRender_setBoneTransformList(void *bone_list);
+extern void boneTransformList_interpolate(void *result, void *start, void *end, f32 t);
+extern f32 time_getDelta(void);
 
 #define MAX_PLAYERS 4
+#define BLEND_DURATION 0.15f  // 150ms blend between animations
 
 typedef struct {
     void *shadow_model;
-    void *bone_list;     // Raw BoneTransformList, no AnimCtrl
+    void *bone_current;   // Current animation bones
+    void *bone_prev;      // Previous animation bones (for blending)
+    void *bone_blend;     // Blended result
     u16 current_anim;
+    u16 prev_anim;
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 anim_duration;
+    f32 blend_timer;      // 0.0 = fully prev, BLEND_DURATION = fully current
+    f32 ground_y;
+    bool anim_loops;
+    bool blending;        // Currently blending between animations
     bool initialized;
 } GhostModel;
 
@@ -69,157 +78,158 @@ static void ghost_ensure_init(u32 pid) {
     if (gm->initialized) return;
 
     gm->shadow_model = assetcache_get(ASSET_3BF_MODEL_PLAYER_SHADOW);
-    gm->bone_list = boneTransformList_new();
-    if (!gm->bone_list) return;
+    gm->bone_current = boneTransformList_new();
+    gm->bone_prev = boneTransformList_new();
+    gm->bone_blend = boneTransformList_new();
+    if (!gm->bone_current || !gm->bone_prev || !gm->bone_blend) return;
 
-    // Fill with idle animation at frame 0
     void *anim_file = animBinCache_get(ASSET_6F_ANIM_BSSTAND_IDLE);
     if (anim_file) {
-        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_list);
+        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_current);
+        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_prev);
+        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_blend);
     }
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
+    gm->prev_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
-    gm->anim_duration = 6.0f;
+    gm->anim_duration = 5.5f;
+    gm->ground_y = 0.0f;
+    gm->blend_timer = BLEND_DURATION;
+    gm->blending = FALSE;
+    gm->anim_loops = TRUE;
     gm->initialized = TRUE;
-    recomp_printf("[NetGhost] Ghost %d init (raw bones)\n", pid);
 }
 
-// BS state -> animation mapping
 static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
     if (!gm->initialized) return;
 
     u16 anim = ASSET_6F_ANIM_BSSTAND_IDLE;
-    f32 duration = 6.0f;
+    f32 duration = 5.5f;
+    bool loops = TRUE;
 
-    // Durations from actual game source (lib/bk-decomp/src/core2/bs/*.c)
     switch (bs_state) {
-        // Idle / Stand (stand.c: 5.5f once)
-        case BS_0_NONE: case BS_1_IDLE: case BS_20_LANDING:
-            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; break;
+        case BS_0_NONE: case BS_1_IDLE:
+            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; loops = TRUE; break;
+        case BS_20_LANDING:
+            // Keep previous animation playing (e.g. bbuster continues during landing)
+            return;
         case BS_D_TIMEOUT: case BS_53_TIMEOUT:
-            anim = ASSET_77_ANIM_BSTIMEOUT; duration = 3.2f; break;
-
-        // Walk (walk.c: dynamic duration, using mid-range values)
-        case BS_2_WALK_SLOW: case BS_WALK_CREEP:
-            anim = ASSET_2_ANIM_BSWALK_CREEP; duration = 0.9f; break;
-        case BS_WALK:  anim = ASSET_3_ANIM_BSWALK; duration = 0.7f; break;
-        case BS_4_WALK_FAST: anim = ASSET_C_ANIM_BSWALK_RUN; duration = 0.5f; break;
-        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.35f; break;
+            anim = ASSET_77_ANIM_BSTIMEOUT; duration = 3.2f; loops = TRUE; break;
+        case BS_WALK_CREEP:
+            anim = ASSET_2_ANIM_BSWALK_CREEP; duration = 1.5f; break;
+        case BS_2_WALK_SLOW:
+            anim = ASSET_3_ANIM_BSWALK; duration = 1.5f; break;
+        case BS_WALK:  anim = ASSET_C_ANIM_BSWALK_RUN; duration = 1.5f; break;
+        case BS_4_WALK_FAST: anim = ASSET_C_ANIM_BSWALK_RUN; duration = 0.6f; break;
+        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.3f; loops = TRUE; break;
         case BS_SLIDE: anim = ASSET_5A_ANIM_BSSLIDE_FRONT; duration = 1.0f; break;
-        case BS_ROLL:  anim = ASSET_11_ANIM_BSWHIRL_WALK; duration = 0.53f; break;
-
-        // Jump (jump.c: 2.0f once)
-        case BS_5_JUMP: anim = ASSET_8_ANIM_BSJUMP; duration = 2.0f; break;
-        case BS_12_BFLIP: anim = ASSET_4C_ANIM_BSBFLIP_HOLD; duration = 1.5f; break;
-        case BS_2F_FALL: anim = ASSET_B0_ANIM_BSJUMP_FALL; duration = 2.0f; break;
-        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.35f; break;
-
-        // Attacks (from actual source durations)
-        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.3f; break;
-        case BS_F_BBUSTER: anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.0f; break;
-        case BS_BFLAP: anim = ASSET_18_ANIM_BSBFLAP_ENTER; duration = 0.3f; break;
-        case BS_11_BPECK: anim = ASSET_1A_ANIM_BSBPECK; duration = 0.2f; break;
-        case BS_BBARGE: anim = ASSET_1C_ANIM_BSBBARGE; duration = 1.0f; break;
-
-        // Crouch (crouch.c: 0.5f loop)
-        case BS_CROUCH: anim = ASSET_10C_ANIM_BSCROUCH_IDLE; duration = 0.5f; break;
-
-        // Eggs (bEggHead.c: 1.0f, bEggAss.c: 1.0f)
-        case BS_9_EGG_HEAD: anim = ASSET_2A_ANIM_BSEGGHEAD; duration = 1.0f; break;
-        case BS_A_EGG_ASS: anim = ASSET_2B_ANIM_BSEGGASS; duration = 1.0f; break;
-
-        // Talon Trot (bTrot.c)
-        case BS_14_BTROT_ENTER: anim = ASSET_16_ANIM_BSBTROT_ENTER; duration = 1.0f; break;
-        case BS_15_BTROT_IDLE: anim = ASSET_26_ANIM_BSBTROT_IDLE; duration = 1.2f; break;
-        case BS_16_BTROT_WALK: anim = ASSET_15_ANIM_BSBTROT_WALK; duration = 0.53f; break;
-        case BS_17_BTROT_EXIT: anim = ASSET_7_ANIM_BSBTROT_EXIT; duration = 0.6f; break;
-        case BS_8_BTROT_JUMP: anim = ASSET_27_ANIM_BSBTROR_JUMP; duration = 1.5f; break;
-
-        // Wonderwing (1.0f loop)
-        case BS_1A_WONDERWING_ENTER: case BS_1B_WONDERWING_IDLE:
-        case BS_1C_WONDERWING_WALK: case BS_1D_WONDERWING_JUMP:
-        case BS_1E_WONDERWING_EXIT:
+        case BS_ROLL:  anim = ASSET_4F_ANIM_BSTWIRL; duration = 0.9f; loops = TRUE; break;
+        case BS_5_JUMP: anim = ASSET_8_ANIM_BSJUMP; duration = 1.9f; loops = FALSE; break;
+        case BS_12_BFLIP: anim = ASSET_4B_ANIM_BSBFLIP_ENTER; duration = 2.3f; loops = FALSE; break;
+        case BS_2F_FALL: anim = ASSET_8_ANIM_BSJUMP; duration = 2.0f; loops = FALSE; break;
+        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.35f; loops = TRUE; break;
+        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.3f; loops = FALSE; break;
+        case BS_F_BBUSTER: anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.9f; loops = FALSE; break;
+        case BS_BFLAP:
+            if (gm->current_anim != ASSET_18_ANIM_BSBFLAP_ENTER && gm->current_anim != ASSET_17_ANIM_BSBFLAP) {
+                anim = ASSET_18_ANIM_BSBFLAP_ENTER; duration = 0.30f; loops = FALSE;
+            } else if (gm->current_anim == ASSET_18_ANIM_BSBFLAP_ENTER && gm->ghost_timer >= 0.95f) {
+                anim = ASSET_17_ANIM_BSBFLAP; duration = 0.15f; loops = TRUE;
+            } else {
+                return;
+            }
+            break;
+        case BS_11_BPECK: anim = ASSET_19_ANIM_BSBPECK_ENTER; duration = 0.35f; loops = TRUE; break;
+        case BS_BBARGE: anim = ASSET_1C_ANIM_BSBBARGE; duration = 1.0f; loops = FALSE; break;
+        case BS_CROUCH: anim = ASSET_1_ANIM_BSCROUCH_ENTER; duration = 0.5f; loops = FALSE; break;
+        case BS_9_EGG_HEAD: anim = ASSET_2A_ANIM_BSEGGHEAD; duration = 1.0f; loops = FALSE; break;
+        case BS_A_EGG_ASS: anim = ASSET_2B_ANIM_BSEGGASS; duration = 1.0f; loops = FALSE; break;
+        case BS_14_BTROT_ENTER: anim = ASSET_26_ANIM_BSBTROT_IDLE; duration = 1.2f; loops = TRUE; break;
+        case BS_15_BTROT_IDLE: anim = ASSET_26_ANIM_BSBTROT_IDLE; duration = 1.2f; loops = TRUE; break;
+        case BS_16_BTROT_WALK: anim = ASSET_15_ANIM_BSBTROT_WALK; duration = 0.57f; loops = TRUE; break;
+        case BS_17_BTROT_EXIT: anim = ASSET_7_ANIM_BSBTROT_EXIT; duration = 0.6f; loops = FALSE; break;
+        case BS_8_BTROT_JUMP: anim = ASSET_27_ANIM_BSBTROR_JUMP; duration = 1.4f; loops = FALSE; break;
+        case BS_1A_WONDERWING_ENTER:
+            anim = ASSET_22_ANIM_BSWHIRL_EXIT; duration = 0.5f; loops = FALSE; break;
+        case BS_1B_WONDERWING_IDLE:
             anim = ASSET_23_ANIM_BSWONDERWING_IDLE; duration = 1.0f; break;
-
-        // Flying (bFly.c)
-        case BS_23_FLY_ENTER: anim = ASSET_45_ANIM_BSBFLY_ENTER; duration = 1.4f; break;
+        case BS_1C_WONDERWING_WALK:
+            anim = ASSET_11_ANIM_BSWHIRL_WALK; duration = 0.6f; break;
+        case BS_1D_WONDERWING_JUMP:
+            anim = ASSET_23_ANIM_BSWONDERWING_IDLE; duration = 1.0f; break;
+        case BS_1E_WONDERWING_EXIT:
+            anim = ASSET_22_ANIM_BSWHIRL_EXIT; duration = 0.5f; loops = FALSE; break;
+        case BS_23_FLY_ENTER: anim = ASSET_45_ANIM_BSBFLY_ENTER; duration = 1.4f; loops = FALSE; break;
         case BS_24_FLY: anim = ASSET_38_ANIM_BSBFLY; duration = 0.62f; break;
         case BS_18_FLY_KNOCKBACK: case BS_FLY_OW: case BS_58_BEAKBOMB_CRASH:
-            anim = ASSET_3E_ANIM_BSBFLY_BEAKBOMB_CRASH; duration = 1.4f; break;
-        case BS_BOMB: anim = ASSET_43_ANIM_BSBFLY_BEAKBOMB_START; duration = 1.0f; break;
-
-        // Swimming (bSwim.c)
+            anim = ASSET_3E_ANIM_BSBFLY_BEAKBOMB_CRASH; duration = 1.4f; loops = FALSE; break;
+        case BS_BOMB: anim = ASSET_43_ANIM_BSBFLY_BEAKBOMB_START; duration = 1.0f; loops = FALSE; break;
         case BS_2D_SWIM_IDLE: anim = ASSET_57_ANIM_BSSWIM_IDLE; duration = 1.2f; break;
         case BS_2E_SWIM: anim = ASSET_39_ANIM_BSSWIM_MOVE; duration = 0.75f; break;
-        case BS_30_DIVE_ENTER: anim = ASSET_3C_ANIM_BSSWIM_DIVE_ENTER; duration = 1.0f; break;
+        case BS_30_DIVE_ENTER: anim = ASSET_3C_ANIM_BSSWIM_DIVE_ENTER; duration = 1.0f; loops = FALSE; break;
         case BS_2B_DIVE_IDLE: anim = ASSET_70_ANIM_BSSWIM_DIVE_IDLE; duration = 2.0f; break;
         case BS_2C_DIVE_B: case BS_39_DIVE_A:
             anim = ASSET_3F_ANIM_BSSWIM_DIVE_MOVE; duration = 0.75f; break;
-        case BS_54_SWIM_DIE: anim = ASSET_B9_ANIM_BSSWIM_DIE; duration = 0.7f; break;
-
-        // Climbing (climb.c)
+        case BS_54_SWIM_DIE: anim = ASSET_B9_ANIM_BSSWIM_DIE; duration = 0.7f; loops = FALSE; break;
         case BS_4F_CLIMB_IDLE: anim = ASSET_B2_ANIM_BSCLIMB_IDLE_2; duration = 2.64f; break;
         case BS_50_CLIMB_MOVE: anim = ASSET_A_ANIM_BSCLIMB_MOVE; duration = 0.9f; break;
-
-        // Long legs (bLongLeg.c)
         case BS_25_LONGLEG_ENTER: case BS_26_LONGLEG_IDLE: case BS_LONGLEG_EXIT:
             anim = ASSET_41_ANIM_BSLONGLEG_IDLE; duration = 1.0f; break;
         case BS_LONGLEG_WALK: anim = ASSET_42_ANIM_BSLONGLEG_WALK; duration = 0.53f; break;
-        case BS_LONGLEG_JUMP: anim = ASSET_3D_ANIM_BSLONGLEG_JUMP; duration = 1.5f; break;
-
-        // Carrying
+        case BS_LONGLEG_JUMP: anim = ASSET_3D_ANIM_BSLONGLEG_JUMP; duration = 1.5f; loops = FALSE; break;
         case BS_3A_CARRY_IDLE: anim = ASSET_72_ANIM_BSCARRY_IDLE; duration = 5.5f; break;
         case BS_3B_CARRY_WALK: anim = ASSET_73_ANIM_BSCARRY_WALK; duration = 0.7f; break;
-        case BS_CARRY_THROW: anim = ASSET_11B_ANIM_BSTHROW; duration = 0.8f; break;
-
-        // Damage
-        case BS_E_OW: anim = ASSET_4D_ANIM_BSOW; duration = 1.0f; break;
-        case BS_56_RECOIL: anim = ASSET_F_ANIM_BSREBOUND; duration = 1.0f; break;
-        case BS_41_DIE: anim = ASSET_9_ANIM_BSDIE; duration = 3.0f; break;
-        case BS_SPLAT: anim = ASSET_D2_ANIM_BSSPLAT; duration = 2.25f; break;
-
-        // Talk
+        case BS_CARRY_THROW: anim = ASSET_11B_ANIM_BSTHROW; duration = 0.8f; loops = FALSE; break;
+        case BS_E_OW: anim = ASSET_4D_ANIM_BSOW; duration = 1.0f; loops = FALSE; break;
+        case BS_56_RECOIL: anim = ASSET_F_ANIM_BSREBOUND; duration = 1.0f; loops = FALSE; break;
+        case BS_41_DIE: anim = ASSET_9_ANIM_BSDIE; duration = 3.0f; loops = FALSE; break;
+        case BS_SPLAT: anim = ASSET_D2_ANIM_BSSPLAT; duration = 2.25f; loops = FALSE; break;
         case BS_3C_TALK: anim = ASSET_14A_ANIM_BSREST_LISTEN; duration = 11.4f; break;
-        case BS_44_JIG_JIGGY: anim = ASSET_2E_ANIM_BSJIG_JIGGY; duration = 2.0f; break;
-
-        // Ant (ant.c)
+        case BS_44_JIG_JIGGY: anim = ASSET_2E_ANIM_BSJIG_JIGGY; duration = 2.0f; loops = FALSE; break;
         case BS_35_ANT_IDLE: anim = ASSET_5E_ANIM_BSANT_IDLE; duration = 1.2f; break;
         case BS_ANT_WALK: anim = ASSET_5F_ANIM_BSANT_WALK; duration = 0.8f; break;
         case BS_ANT_JUMP: case BS_38_ANT_FALL:
-            anim = ASSET_60_ANIM_BSANT_JUMP; duration = 1.5f; break;
-        case BS_3E_ANT_OW: anim = ASSET_28_ANIM_BSANT_OW; duration = 1.0f; break;
-        case BS_43_ANT_DIE: anim = ASSET_29_ANIM_BSANT_DIE; duration = 3.0f; break;
-
-        // Pumpkin (pumpkin.c: 0.8f)
+            anim = ASSET_60_ANIM_BSANT_JUMP; duration = 1.5f; loops = TRUE; break;
         case BS_48_PUMPKIN_IDLE: anim = ASSET_5E_ANIM_BSANT_IDLE; duration = 1.2f; break;
         case BS_49_PUMPKIN_WALK: case BS_4B_PUMPKIN_FALL:
             anim = ASSET_A0_ANIM_BSPUMPKIN_WALK; duration = 0.8f; break;
-        case BS_4A_PUMPKIN_JUMP: anim = ASSET_A1_ANIM_BSPUMPKIN_JUMP; duration = 1.5f; break;
-
-        // Crocodile (croc: 1.0f idle, 0.8f walk)
         case BS_5E_CROC_IDLE: anim = ASSET_E1_ANIM_BSCROC_IDLE; duration = 1.0f; break;
         case BS_CROC_WALK: anim = ASSET_E0_ANIM_BSCROC_WALK; duration = 0.8f; break;
-        case BS_CROC_JUMP: anim = ASSET_11C_ANIM_BSCROC_JUMP; duration = 1.5f; break;
-
-        // Walrus (walrus.c: 4.0f idle, 0.8f walk)
         case BS_67_WALRUS_IDLE: anim = ASSET_11F_ANIM_BSWALRUS_IDLE; duration = 4.0f; break;
         case BS_WALRUS_WALK: anim = ASSET_120_ANIM_BSWALRUS_WALK; duration = 0.8f; break;
-        case BS_WALRUS_JUMP: anim = ASSET_121_ANIM_BSWALRUS_JUMP; duration = 1.5f; break;
-
-        // Bee
         case BS_85_BEE_IDLE: anim = ASSET_1DE_ANIM_BEE_IDLE; duration = 3.0f; break;
         case BS_BEE_WALK: anim = ASSET_1DD_ANIM_BEE_WALK; duration = 0.38f; break;
         case BS_BEE_FLY: anim = ASSET_1DC_ANIM_BEE_FLY; duration = 0.38f; break;
-
-        default: anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; break;
+        default: anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; loops = TRUE; break;
     }
 
     if (anim != gm->current_anim) {
+        recomp_printf("[GhostAnim] BS=0x%02X anim=0x%03X dur=%.2f %s\n", bs_state, anim, duration, loops ? "LOOP" : "ONCE");
+
+        // Copy current bones to prev for blending
+        // (bone_current has the last frame of the old animation)
+        void *tmp = gm->bone_prev;
+        gm->bone_prev = gm->bone_current;
+        gm->bone_current = tmp;
+
+        gm->prev_anim = gm->current_anim;
         gm->current_anim = anim;
         gm->anim_duration = duration;
-        gm->ghost_timer = 0.0f;
+        gm->anim_loops = loops;
+        gm->blend_timer = 0.0f;
+        gm->blending = TRUE;
+
+        if (anim == ASSET_8_ANIM_BSJUMP && bs_state == BS_5_JUMP) {
+            gm->ghost_timer = 0.35f; // Skip crouch windup for jump
+        } else if (anim == ASSET_8_ANIM_BSJUMP && bs_state == BS_2F_FALL) {
+            gm->ghost_timer = 0.7f;  // Start at falling pose for fall
+        } else if (anim == ASSET_E_ANIM_BSTURN) {
+            gm->ghost_timer = 0.4f;  // Skip arms-open start frame
+        } else {
+            gm->ghost_timer = 0.0f;
+        }
     }
 }
 
@@ -239,43 +249,78 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         ghost_ensure_init(pid);
         GhostModel *gm = &ghost_models[pid];
-        if (!gm->initialized || !gm->bone_list) continue;
+        if (!gm->initialized) continue;
 
         ghost_sync_anim(gm, rs.bs_state);
 
-        // Load animation frame directly into our raw bone list
+        // Load current animation frame into bone_current
         void *anim_file = animBinCache_get(gm->current_anim);
         if (anim_file) {
-            animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_list);
+            animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_current);
         }
 
-        // Advance timer
-        f32 speed = 1.0f / (gm->anim_duration * 60.0f);
+        // Advance animation timer
+        f32 dt = time_getDelta();
+        f32 speed = dt / gm->anim_duration;
         gm->ghost_timer += speed;
-        if (gm->ghost_timer >= 1.0f) gm->ghost_timer -= 1.0f;
+        if (gm->anim_loops) {
+            if (gm->ghost_timer >= 1.0f) gm->ghost_timer -= 1.0f;
+        } else {
+            if (gm->ghost_timer >= 0.99f) gm->ghost_timer = 0.99f;
+        }
 
-        // Position / rotation
-        gm->smooth_yaw = lerp_angle(gm->smooth_yaw, rs.yaw, 0.25f);
+        // Determine which bone list to use for rendering
+        void *render_bones = gm->bone_current;
+
+        if (gm->blending) {
+            // Advance blend timer
+            gm->blend_timer += dt;
+            f32 blend_t = gm->blend_timer / BLEND_DURATION;
+            if (blend_t >= 1.0f) {
+                blend_t = 1.0f;
+                gm->blending = FALSE;
+            }
+            // Interpolate: prev → current
+            boneTransformList_interpolate(gm->bone_blend, gm->bone_prev, gm->bone_current, blend_t);
+            render_bones = gm->bone_blend;
+        }
+
+        // Yaw (faster during skid)
+        f32 yaw_speed = (rs.bs_state == BS_SKID) ? 0.7f : 0.25f;
+
+        // Ground tracking
+        bool on_ground = (rs.bs_state == BS_1_IDLE || rs.bs_state == BS_0_NONE
+            || rs.bs_state == BS_WALK || rs.bs_state == BS_2_WALK_SLOW
+            || rs.bs_state == BS_4_WALK_FAST || rs.bs_state == BS_WALK_CREEP
+            || rs.bs_state == BS_CROUCH || rs.bs_state == BS_CLAW
+            || rs.bs_state == BS_SKID || rs.bs_state == BS_ROLL
+            || rs.bs_state == BS_15_BTROT_IDLE || rs.bs_state == BS_16_BTROT_WALK
+            || rs.bs_state == BS_20_LANDING);
+        if (on_ground) gm->ground_y = rs.y;
+
+        gm->smooth_yaw = lerp_angle(gm->smooth_yaw, rs.yaw, yaw_speed);
         f32 pos[3] = {rs.x, rs.y, rs.z};
         f32 rot[3] = {rs.pitch, gm->smooth_yaw, 0.0f};
         f32 ref[3] = {0.0f, 0.0f, 0.0f};
 
         cur_drawn_model_transform_id = GHOST_TRANSFORM_ID_START + (pid * GHOST_TRANSFORM_ID_STRIDE);
 
-        // Shadow FIRST (before setting bone transforms, as modelRender_draw resets them)
+        // Shadow on ground
         if (gm->shadow_model) {
-            f32 sp[3] = {rs.x, rs.y + 4.0f, rs.z};
+            f32 height = rs.y - gm->ground_y;
+            if (height < 0.0f) height = 0.0f;
+            f32 shadow_scale = 0.43f - (height / 800.0f);
+            if (shadow_scale < 0.15f) shadow_scale = 0.15f;
+            f32 sp[3] = {rs.x, gm->ground_y + 4.0f, rs.z};
             f32 sr[3] = {0.0f, 0.0f, 0.0f};
             modelRender_setAlpha(0xFF);
             modelRender_setDepthMode(MODEL_RENDER_DEPTH_COMPARE);
-            modelRender_draw(gfx, mtx, sp, sr, 0.43f, 0, gm->shadow_model);
+            modelRender_draw(gfx, mtx, sp, sr, shadow_scale, 0, gm->shadow_model);
         }
 
-        // Set ghost bone transforms RIGHT BEFORE Banjo render
-        // (after shadow, which may reset modelRenderBoneTransformList)
-        modelRender_setBoneTransformList(gm->bone_list);
+        // Set blended bone transforms and render
+        modelRender_setBoneTransformList(render_bones);
 
-        // Banjo
         s32 env_color[3];
         func_8029A47C(env_color);
         modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
@@ -285,11 +330,10 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         modelRender_draw(gfx, mtx, pos, rot, baModelScale, ref, baModelBin);
     }
 
-    // Restore local player bone transforms
     baanim_80289F30();
 }
 
 RECOMP_EXPORT void bkrecomp_net_manage_ghosts(void) {}
 RECOMP_EXPORT void bkrecomp_net_ghost_init(void) {
-    recomp_printf("[NetGhost] Ghost system initialized (direct anim)\n");
+    recomp_printf("[NetGhost] Ghost system initialized (blended anims)\n");
 }

@@ -1,6 +1,11 @@
 #include "patches.h"
 #include "functions.h"
 #include "enums.h"
+#include "core2/anctrl.h"
+
+extern AnimCtrl *baanim_getAnimCtrlPtr(void);
+extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
+extern f32 anctrl_getDuration(AnimCtrl *this);
 
 extern enum map_e map_get(void);
 extern s32 bs_getState(void);
@@ -88,38 +93,38 @@ static void net_sync_local_state(void) {
     state.lives = 0;
 
     recomp_net_push_full_state(&state);
+
+    // Log the REAL animation the local player is using
+    static u16 last_logged_anim = 0;
+    static u8 last_logged_bs = 0;
+    AnimCtrl *ac = baanim_getAnimCtrlPtr();
+    if (ac) {
+        u16 real_anim = anctrl_getIndex(ac);
+        f32 real_dur = anctrl_getDuration(ac);
+        u8 real_playback = anctrl_getPlaybackType(ac);
+        u8 cur_bs = state.bs_state;
+        if (real_anim != last_logged_anim || cur_bs != last_logged_bs) {
+            const char *type = "?";
+            switch(real_playback) {
+                case 1: type = "ONCE"; break;
+                case 2: type = "LOOP"; break;
+                case 3: type = "STOP"; break;
+                case 4: type = "SUBLOOP"; break;
+            }
+            recomp_printf("[LocalAnim] BS=0x%02X realAnim=0x%03X dur=%.2f %s\n", cur_bs, real_anim, real_dur, type);
+            last_logged_anim = real_anim;
+            last_logged_bs = cur_bs;
+        }
+    }
 }
 
 // Ghost management (defined in network_remote_player.c)
 extern void bkrecomp_net_manage_ghosts(void);
 
-static u32 debug_frame_counter = 0;
-
 // @recomp Export: called from ncCamera_update each game frame.
 RECOMP_EXPORT void bkrecomp_net_sync_frame(void) {
     net_sync_local_state();
 
-    // Debug: log state every ~2 seconds (120 frames)
-    debug_frame_counter++;
-    if (recomp_net_is_connected() && (debug_frame_counter % 120) == 0) {
-        u32 local_id = recomp_net_get_local_player_id();
-        f32 pos[3];
-        player_getPosition(pos);
-        u32 map = (u32)map_get();
-        recomp_printf("[NetDebug] local_id=%d map=%d pos=(%.1f,%.1f,%.1f)\n",
-                      local_id, map, pos[0], pos[1], pos[2]);
-
-        // Check remote players
-        NetFullState rs;
-        for (u32 pid = 0; pid < 4; pid++) {
-            if (pid == local_id) continue;
-            u32 active = recomp_net_get_remote_state(pid, &rs);
-            if (active) {
-                recomp_printf("[NetDebug] remote pid=%d active map=%d pos=(%.1f,%.1f,%.1f)\n",
-                              pid, rs.map_id, rs.x, rs.y, rs.z);
-            }
-        }
-    }
 
     // Manage ghost actors (spawn/despawn/update)
     bkrecomp_net_manage_ghosts();
