@@ -3,7 +3,7 @@
 #include "enums.h"
 #include "core2/modelRender.h"
 #include "core2/anctrl.h"
-// #include "core2/dustemitter.h" // Walking dust uses unknown rendering system
+#include "core2/commonParticle.h"
 #include "core2/commonParticle.h"
 
 extern s32 commonParticle_new(enum common_particle_e particle_id, s32 arg1);
@@ -47,6 +47,14 @@ extern void boneTransformList_interpolate(void *result, void *start, void *end, 
 extern f32 time_getDelta(void);
 extern f32 mapModel_getFloorY(f32 pos[3]);
 
+// Dust puff: commonParticle type 7 (from code_CBD10.c func_80352CF4)
+// Used for walking dust AND beak buster impact (different scale params)
+extern void func_80352CF4(f32 pos[3], f32 vel[3], f32 startScale, f32 endScale);
+// Angle to velocity vector (from code_A2B0.c)
+extern void func_802589E4(f32 dst[3], f32 angle, f32 magnitude);
+// Normalize angle
+extern f32 mlNormalizeAngle(f32 angle);
+
 #define MAX_PLAYERS 4
 #define BLEND_DURATION 0.15f  // 150ms blend between animations
 
@@ -63,6 +71,7 @@ typedef struct {
     f32 blend_timer;      // 0.0 = fully prev, BLEND_DURATION = fully current
     f32 ground_y;
     u8 prev_bs_state;
+    u8 dust_cooldown;
     bool anim_loops;
     bool blending;
     bool initialized;
@@ -260,16 +269,112 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         ghost_sync_anim(gm, rs.bs_state);
 
-        // === Ground tracking for shadow ===
+        // === Ground tracking + dust particles ===
+        // Walking dust uses commonParticle system (type 6) via func_8029CDC0
+        // Beak buster impact uses commonParticle type 0xB via func_80354030
+        // Skid/run dust uses commonParticle type 0xE via func_80354380
         {
             f32 ghost_pos[3] = {rs.x, rs.y, rs.z};
             f32 floor_y = mapModel_getFloorY(ghost_pos);
-            bool ground_contact = (rs.y - floor_y >= -10.0f && rs.y - floor_y < 30.0f);
-            if (ground_contact) gm->ground_y = floor_y;
+            f32 height = rs.y - floor_y;
+            bool on_ground = (height >= -10.0f && height < 30.0f);
+            if (on_ground) gm->ground_y = floor_y;
+
+            if (gm->dust_cooldown > 0) gm->dust_cooldown--;
+
+            bool running = (rs.bs_state == BS_4_WALK_FAST || rs.bs_state == BS_WALK);
+            bool walking = (rs.bs_state == BS_2_WALK_SLOW || rs.bs_state == BS_WALK_CREEP);
+
+            // Dust events (commonParticle type 7 = brown/gray puff)
+            // All dust uses commonParticle type 7 via func_80352CF4
+            // Parameters from: code_B850.c, bs/bBuster.c, bs/slide.c, bs/bBarge.c, bs/crouch.c
+            bool start_moving = ((running || walking) &&
+                (gm->prev_bs_state == BS_1_IDLE || gm->prev_bs_state == BS_0_NONE
+                || gm->prev_bs_state == BS_20_LANDING));
+            bool direction_change = (rs.bs_state == BS_SKID);
+            bool bbuster_land = (rs.bs_state == BS_20_LANDING && gm->prev_bs_state == BS_F_BBUSTER);
+            bool is_sliding = (rs.bs_state == BS_SLIDE);
+            bool is_barge = (rs.bs_state == BS_BBARGE);
+            bool btrot_start = (rs.bs_state == BS_16_BTROT_WALK &&
+                (gm->prev_bs_state == BS_15_BTROT_IDLE || gm->prev_bs_state == BS_14_BTROT_ENTER));
+            bool btrot_walking = (rs.bs_state == BS_16_BTROT_WALK);
+
+            f32 dust_pos[3] = {rs.x, rs.y + 10.0f, rs.z};
+
+            if (on_ground && gm->dust_cooldown == 0) {
+                if (bbuster_land) {
+                    // Beak buster: 12 puffs circular (bBuster.c func_8029FB30)
+                    f32 i;
+                    for (i = 0.0f; i < 359.0f; i += 60.0f) {
+                        f32 vel[3];
+                        func_802589E4(vel, i, 730.0f * 0.51f);
+                        vel[1] = 100.0f;
+                        func_80352CF4(dust_pos, vel, 150.0f, 10.0f);
+                    }
+                    for (i = 0.0f; i < 359.0f; i += 60.0f) {
+                        f32 vel[3];
+                        func_802589E4(vel, mlNormalizeAngle(i + 30.0f), 430.0f * 0.51f);
+                        vel[1] = 40.0f;
+                        func_80352CF4(dust_pos, vel, 150.0f, 10.0f);
+                    }
+                    gm->dust_cooldown = 15;
+                } else if (is_sliding) {
+                    // Slide dust: zigzag trail (bs/slide.c func_802B40D0)
+                    // Alternates offset left/right/center using yaw+90
+                    static s32 slide_phase = 0;
+                    f32 slide_pos[3] = {rs.x, rs.y + 20.0f, rs.z};
+                    slide_phase++;
+                    if (slide_phase >= 3) slide_phase = 0;
+                    if (slide_phase != 0) {
+                        f32 side_offset[3];
+                        f32 side_angle = mlNormalizeAngle(rs.yaw + 90.0f);
+                        func_802589E4(side_offset, side_angle, randf() * 10.0f + 20.0f);
+                        side_offset[1] = 0.0f;
+                        if (slide_phase == 1) {
+                            slide_pos[0] -= side_offset[0];
+                            slide_pos[2] -= side_offset[2];
+                        } else {
+                            slide_pos[0] += side_offset[0];
+                            slide_pos[2] += side_offset[2];
+                        }
+                    }
+                    f32 vel[3];
+                    func_802589E4(vel, rs.yaw, 40.0f);
+                    vel[1] = 50.0f;
+                    func_80352CF4(slide_pos, vel, 10.0f, 150.0f);
+                    gm->dust_cooldown = 4;
+                } else if (is_barge) {
+                    // Barge (Z+B): dust trail (bs/bBarge.c)
+                    f32 vel[3] = {0.0f, 40.0f, 0.0f};
+                    f32 barge_pos[3];
+                    func_802589E4(barge_pos, rs.yaw - 20.0f, 20.0f);
+                    barge_pos[0] += rs.x; barge_pos[1] = rs.y + 10.0f; barge_pos[2] += rs.z;
+                    func_80352CF4(barge_pos, vel, 10.0f, 150.0f);
+                    gm->dust_cooldown = 4;
+                } else if (direction_change) {
+                    // Turn/skid dust (bs/turn.c func_802927E0)
+                    f32 vel[3];
+                    func_802589E4(vel, rs.yaw, 200.0f * 0.51f);
+                    vel[1] = 40.0f;
+                    func_80352CF4(dust_pos, vel, 10.0f, 150.0f);
+                    gm->dust_cooldown = 6;
+                } else if (btrot_walking) {
+                    // Talon trot walking: alternating puffs (code_14420.c func_8029C22C)
+                    f32 vel[3] = {0.0f, 40.0f, 0.0f};
+                    f32 trot_pos[3];
+                    f32 offset = (gm->dust_cooldown % 2 == 0) ? -20.0f : 20.0f;
+                    func_802589E4(trot_pos, rs.yaw + offset, 20.0f);
+                    trot_pos[0] += rs.x; trot_pos[1] = rs.y + 10.0f; trot_pos[2] += rs.z;
+                    func_80352CF4(trot_pos, vel, 10.0f, 150.0f);
+                    gm->dust_cooldown = 6;
+                } else if (start_moving || btrot_start) {
+                    // Start walking/running: single puff
+                    f32 vel[3] = {0.0f, 40.0f, 0.0f};
+                    func_80352CF4(dust_pos, vel, 10.0f, 150.0f);
+                    gm->dust_cooldown = 10;
+                }
+            }
         }
-        // NOTE: Walking dust uses an unknown rendering system (not particles,
-        // not dustEmitter). Both systems were disabled via patches and the
-        // walking dust persisted. This remains an open investigation.
 
         gm->prev_bs_state = rs.bs_state;
 
