@@ -2,6 +2,7 @@
 #include "functions.h"
 #include "enums.h"
 #include "core2/anctrl.h"
+#include "core2/particle.h"
 
 extern AnimCtrl *baanim_getAnimCtrlPtr(void);
 extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
@@ -94,29 +95,8 @@ static void net_sync_local_state(void) {
 
     recomp_net_push_full_state(&state);
 
-    // Log the REAL animation the local player is using
-    static u16 last_logged_anim = 0;
-    static u8 last_logged_bs = 0;
-    AnimCtrl *ac = baanim_getAnimCtrlPtr();
-    if (ac) {
-        u16 real_anim = anctrl_getIndex(ac);
-        f32 real_dur = anctrl_getDuration(ac);
-        u8 real_playback = anctrl_getPlaybackType(ac);
-        u8 cur_bs = state.bs_state;
-        if (real_anim != last_logged_anim || cur_bs != last_logged_bs) {
-            const char *type = "?";
-            switch(real_playback) {
-                case 1: type = "ONCE"; break;
-                case 2: type = "LOOP"; break;
-                case 3: type = "STOP"; break;
-                case 4: type = "SUBLOOP"; break;
-            }
-            recomp_printf("[LocalAnim] BS=0x%02X realAnim=0x%03X dur=%.2f %s\n", cur_bs, real_anim, real_dur, type);
-            last_logged_anim = real_anim;
-            last_logged_bs = cur_bs;
-        }
-    }
 }
+
 
 // Ghost management (defined in network_remote_player.c)
 extern void bkrecomp_net_manage_ghosts(void);

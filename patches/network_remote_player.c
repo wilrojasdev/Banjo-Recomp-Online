@@ -3,6 +3,11 @@
 #include "enums.h"
 #include "core2/modelRender.h"
 #include "core2/anctrl.h"
+// #include "core2/dustemitter.h" // Walking dust uses unknown rendering system
+#include "core2/commonParticle.h"
+
+extern s32 commonParticle_new(enum common_particle_e particle_id, s32 arg1);
+extern void commonParticle_add(s32 actorMarker, s32 arg1, s32 arg2);
 #include "animation.h"
 #include "transform_ids.h"
 
@@ -40,6 +45,7 @@ extern void *boneTransformList_new(void);
 extern void modelRender_setBoneTransformList(void *bone_list);
 extern void boneTransformList_interpolate(void *result, void *start, void *end, f32 t);
 extern f32 time_getDelta(void);
+extern f32 mapModel_getFloorY(f32 pos[3]);
 
 #define MAX_PLAYERS 4
 #define BLEND_DURATION 0.15f  // 150ms blend between animations
@@ -56,8 +62,9 @@ typedef struct {
     f32 anim_duration;
     f32 blend_timer;      // 0.0 = fully prev, BLEND_DURATION = fully current
     f32 ground_y;
+    u8 prev_bs_state;
     bool anim_loops;
-    bool blending;        // Currently blending between animations
+    bool blending;
     bool initialized;
 } GhostModel;
 
@@ -206,7 +213,7 @@ static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
     }
 
     if (anim != gm->current_anim) {
-        recomp_printf("[GhostAnim] BS=0x%02X anim=0x%03X dur=%.2f %s\n", bs_state, anim, duration, loops ? "LOOP" : "ONCE");
+        // recomp_printf("[GhostAnim] BS=0x%02X anim=0x%03X dur=%.2f %s\n", bs_state, anim, duration, loops ? "LOOP" : "ONCE");
 
         // Copy current bones to prev for blending
         // (bone_current has the last frame of the old animation)
@@ -252,6 +259,19 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         if (!gm->initialized) continue;
 
         ghost_sync_anim(gm, rs.bs_state);
+
+        // === Ground tracking for shadow ===
+        {
+            f32 ghost_pos[3] = {rs.x, rs.y, rs.z};
+            f32 floor_y = mapModel_getFloorY(ghost_pos);
+            bool ground_contact = (rs.y - floor_y >= -10.0f && rs.y - floor_y < 30.0f);
+            if (ground_contact) gm->ground_y = floor_y;
+        }
+        // NOTE: Walking dust uses an unknown rendering system (not particles,
+        // not dustEmitter). Both systems were disabled via patches and the
+        // walking dust persisted. This remains an open investigation.
+
+        gm->prev_bs_state = rs.bs_state;
 
         // Load current animation frame into bone_current
         void *anim_file = animBinCache_get(gm->current_anim);
