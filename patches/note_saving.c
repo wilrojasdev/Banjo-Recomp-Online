@@ -368,13 +368,50 @@ Cube *find_cube_for_prop(Prop *p) {
     return NULL;
 }
 
+// Hide a specific note by its note_index (called from network world sync).
+// Iterates cubes/props to find the note with matching extension data.
+// Uses only safe prop extension data access — avoids func_8032DE78 which can crash.
+RECOMP_EXPORT void bkrecomp_net_hide_note(u32 note_index) {
+    if (!sCubeList.cubes || sCubeList.cubeCnt <= 0) return;
+
+    s32 i, j;
+    for (i = 0; i < sCubeList.cubeCnt; i++) {
+        Cube *cube = &sCubeList.cubes[i];
+        if (!cube->prop2Ptr || cube->prop2Cnt <= 0) continue;
+
+        for (j = 0; j < cube->prop2Cnt; j++) {
+            Prop *p = &cube->prop2Ptr[j];
+            // Only check sprite props that are still visible
+            if (p->spriteProp.is_actor || p->spriteProp.is_3d || !p->spriteProp.unk8_4) continue;
+
+            // Check extension data directly — safer than calling func_8032DE78
+            NoteSavingExtensionData *note_data = (NoteSavingExtensionData*)bkrecomp_get_extended_prop_data(cube, p, note_saving_prop_extension_id);
+            if (!note_data) continue;
+
+            if (note_data->note_index == note_index) {
+                p->spriteProp.unk8_4 = FALSE;
+                set_note_collected(map_get(), level_get(), note_index);
+                return;
+            }
+        }
+    }
+}
+
+// Network bridge for note collection events
+extern u32 recomp_net_is_connected(void);
+extern void recomp_net_send_collectible(u32 type, u32 id, u32 collected, u32 map_id, u32 level_id);
+#define COLLECTIBLE_NOTE 1
+
 // @recomp Patched to track collected notes.
 RECOMP_PATCH void __baMarker_resolveMusicNoteCollision(Prop *arg0) {
+    u32 note_index_collected = 0xFFFF; // sentinel: no specific note
+
     // @recomp Set that the note was collected if this isn't demo playback.
     if (!recomp_in_demo_playback_game_mode()) {
         // Check if this is an actor prop and collect a dynamic note if so.
         if (arg0->is_actor) {
             collect_dynamic_note(map_get(), level_get());
+            note_index_collected = 0xFFFE; // dynamic note marker
         }
         // Otherwise, make sure this is a sprite prop and use the prop data.
         else if (!arg0->is_3d) {
@@ -382,8 +419,15 @@ RECOMP_PATCH void __baMarker_resolveMusicNoteCollision(Prop *arg0) {
             if (prop_cube != NULL) {
                 NoteSavingExtensionData* note_data = (NoteSavingExtensionData*)bkrecomp_get_extended_prop_data(prop_cube, arg0, note_saving_prop_extension_id);
                 set_note_collected(map_get(), level_get(), note_data->note_index);
+                note_index_collected = note_data->note_index;
             }
         }
+    }
+
+    // Broadcast note collection to network with specific note_index
+    if (recomp_net_is_connected() && note_index_collected != 0xFFFF) {
+        recomp_net_send_collectible(COLLECTIBLE_NOTE, (u32)note_index_collected, 1,
+            (u32)map_get(), (u32)level_get());
     }
 
     if (!func_802FADD4(ITEM_1B_VILE_VILE_SCORE)) {
