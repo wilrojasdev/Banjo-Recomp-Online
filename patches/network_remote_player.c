@@ -4,7 +4,6 @@
 #include "core2/modelRender.h"
 #include "core2/anctrl.h"
 #include "core2/commonParticle.h"
-#include "core2/commonParticle.h"
 
 extern s32 commonParticle_new(enum common_particle_e particle_id, s32 arg1);
 extern void commonParticle_add(s32 actorMarker, s32 arg1, s32 arg2);
@@ -29,6 +28,7 @@ typedef struct {
     f32 anim_timer, anim_duration;
     u8  anim_playback_type, health, health_total, lives, transformation, bs_state;
     u8  _pad2[2];
+    f32 horizontal_velocity;
 } RemoteState;
 
 extern void *baModelBin;
@@ -38,8 +38,15 @@ extern void func_8033A280(f32);
 extern struct5Bs *D_80363780;
 extern void func_8033A450(struct5Bs *);
 extern void baanim_80289F30(void);
+extern void func_8029DD6C(void);
+extern AnimCtrl *baanim_getAnimCtrlPtr(void);
+extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
+extern void *animcache_getCurrentTransform(Animation *this);
+extern enum asset_e baModel_getModelId(void);
+extern void bkrecomp_setup_custom_skinning(ModelSkinningData* skinning_data, u32 model_id);
 
 extern void *animBinCache_get(enum asset_e asset_id);
+// func_8033A444 declared in core2/modelRender.h — sets D_8038371C (AnimMtxList)
 extern void animationFile_getBoneTransformList(void *anim_file, f32 progress, void *bone_list);
 extern void *boneTransformList_new(void);
 extern void modelRender_setBoneTransformList(void *bone_list);
@@ -68,16 +75,28 @@ typedef struct {
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 anim_duration;
+    f32 anim_start;      // subRange start (0.0-1.0)
+    f32 anim_end;        // subRange end (0.0-1.0)
     f32 blend_timer;      // 0.0 = fully prev, BLEND_DURATION = fully current
     f32 ground_y;
+    f32 prev_y;           // Previous frame Y for descent detection
+    f32 bflap_elapsed;    // Bflap: total elapsed time in state
     u8 prev_bs_state;
     u8 dust_cooldown;
+    u8 bflap_count;       // Bflap: flap counter (0-4)
+    u8 idle_phase;        // Idle: cycle index (0-20) into sequence table
+    f32 bpeck_timer;      // Bpeck: countdown for pecking loop phase (0.5s)
+    bool bflap_released;  // Bflap: A button released (detected via fast descent)
+    bool kazooie_visible; // Whether Kazooie HEAD should be rendered (D_8037D238)
+    bool kazooie_body;    // Whether Kazooie WINGS should be rendered (D_8037D236)
+    bool kazooie_feet;    // Whether Kazooie FEET should be rendered (D_8037D235)
     bool anim_loops;
     bool blending;
     bool initialized;
 } GhostModel;
 
 static GhostModel ghost_models[MAX_PLAYERS] = {0};
+static ModelSkinningData ghost_skinning_data[MAX_PLAYERS] = {0};
 
 static f32 lerp_angle(f32 current, f32 target, f32 speed) {
     f32 diff = target - current;
@@ -87,6 +106,50 @@ static f32 lerp_angle(f32 current, f32 target, f32 speed) {
     while (current >= 360.0f) current -= 360.0f;
     while (current < 0.0f) current += 360.0f;
     return current;
+}
+
+// Ghost equivalent of func_8029DD6C — sets up model node display list indices.
+// Must be called before each ghost modelRender_draw to avoid inheriting
+// local player's node state (which can cause T-pose or wrong K visibility).
+extern void func_8033A1FC(void);  // Clears all 42 D_80383658 entries to 0
+
+static void ghost_setup_model_nodes(bool kazooie_head, bool kazooie_wings, bool kazooie_feet) {
+    // DON'T call func_8033A1FC (clear all to 0) — it destroys nodes the model
+    // needs for arm/body rendering. Instead, inherit the local player's node state
+    // and only override Kazooie-specific nodes for the ghost's K visibility.
+
+    // K head/beak (D_8037D238)
+    s32 k_h = kazooie_head ? 1 : 0;
+    func_8033A45C(1, k_h);
+    func_8033A45C(9, k_h);
+    func_8033A45C(0xC, k_h);
+    func_8033A45C(0xF, k_h);
+
+    // K wings (D_8037D236) — ONLY bTrot, bLongLeg, bShock
+    s32 k_w = kazooie_wings ? 1 : 0;
+    func_8033A45C(2, k_w);
+    func_8033A45C(0xA, k_w);
+    func_8033A45C(0xD, k_w);
+    func_8033A45C(0x10, k_w);
+
+    // K feet (D_8037D235) — ONLY bEggAss
+    s32 k_f = kazooie_feet ? 1 : 0;
+    func_8033A45C(8, k_f);
+    func_8033A45C(0xB, k_f);
+    func_8033A45C(0xE, k_f);
+    func_8033A45C(0x11, k_f);
+}
+
+// Prepare bone_prev with current pose before switching to a new animation.
+// This guarantees bone_prev has clean data for blending, preventing stale
+// data from persisting across multiple transitions.
+static void ghost_prepare_blend(GhostModel *gm) {
+    void *anim_file = animBinCache_get(gm->current_anim);
+    if (anim_file) {
+        animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_prev);
+    }
+    gm->blend_timer = 0.0f;
+    gm->blending = TRUE;
 }
 
 static void ghost_ensure_init(u32 pid) {
@@ -111,14 +174,25 @@ static void ghost_ensure_init(u32 pid) {
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
     gm->anim_duration = 5.5f;
+    gm->anim_start = 0.0f;
+    gm->anim_end = 1.0f;
     gm->ground_y = 0.0f;
+    gm->prev_y = 0.0f;
     gm->blend_timer = BLEND_DURATION;
     gm->blending = FALSE;
-    gm->anim_loops = TRUE;
+    gm->anim_loops = FALSE;  // Idle starts ONCE (advances through idle cycle phases)
     gm->initialized = TRUE;
 }
 
-static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
+// Map velocity to duration using the game's velocity map ranges (from walk.c)
+static f32 velocity_to_duration(f32 vel, f32 vel_min, f32 vel_max, f32 dur_slow, f32 dur_fast) {
+    if (vel <= vel_min) return dur_slow;
+    if (vel >= vel_max) return dur_fast;
+    f32 t = (vel - vel_min) / (vel_max - vel_min);
+    return dur_slow + (dur_fast - dur_slow) * t;
+}
+
+static void ghost_sync_anim(GhostModel *gm, u8 bs_state, f32 h_velocity) {
     if (!gm->initialized) return;
 
     u16 anim = ASSET_6F_ANIM_BSSTAND_IDLE;
@@ -126,38 +200,92 @@ static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
     bool loops = TRUE;
 
     switch (bs_state) {
+        // Idle: ONCE first cycle, then cycles through idle/kazooie-peck sequence
+        // Don't reset if already in an idle animation phase
         case BS_0_NONE: case BS_1_IDLE:
-            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; loops = TRUE; break;
+            if (gm->current_anim == ASSET_6F_ANIM_BSSTAND_IDLE
+                || gm->current_anim == ASSET_95_ANIM_BSSTAND_KAZOOIE_PECK
+                || gm->current_anim == ASSET_F6_ANIM_BSSTAND_PULL_KAZOOIE) {
+                return;
+            }
+            anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; loops = FALSE;
+            break;
         case BS_20_LANDING:
-            // Keep previous animation playing (e.g. bbuster continues during landing)
+            // Landing keeps previous animation (bsstand_landing_init doesn't change anim)
+            // BUT: if ghost is stuck in a fall/aerial animation due to network latency,
+            // force transition to landing pose to avoid arms-open freeze
+            if (gm->current_anim == ASSET_B0_ANIM_BSJUMP_FALL
+                || gm->current_anim == ASSET_68_ANIM_BSJUMP_TUMBLE
+                || gm->current_anim == ASSET_17_ANIM_BSBFLAP
+                || gm->current_anim == ASSET_18_ANIM_BSBFLAP_ENTER
+                || gm->current_anim == ASSET_4C_ANIM_BSBFLIP_HOLD
+                || gm->current_anim == ASSET_61_ANIM_BSBFLIP_EXIT) {
+                // Force to BSJUMP landing pose (same as fall near-ground transition)
+                anim = ASSET_8_ANIM_BSJUMP; duration = 2.0f; loops = FALSE;
+                break;
+            }
             return;
         case BS_D_TIMEOUT: case BS_53_TIMEOUT:
             anim = ASSET_77_ANIM_BSTIMEOUT; duration = 3.2f; loops = TRUE; break;
+        // Walk states: all LOOP, duration scaled by horizontal velocity (walk.c)
         case BS_WALK_CREEP:
-            anim = ASSET_2_ANIM_BSWALK_CREEP; duration = 1.5f; break;
+            anim = ASSET_2_ANIM_BSWALK_CREEP;
+            duration = velocity_to_duration(h_velocity, 30.0f, 80.0f, 1.8f, 1.2f);
+            break;
         case BS_2_WALK_SLOW:
-            anim = ASSET_3_ANIM_BSWALK; duration = 1.5f; break;
-        case BS_WALK:  anim = ASSET_C_ANIM_BSWALK_RUN; duration = 1.5f; break;
-        case BS_4_WALK_FAST: anim = ASSET_C_ANIM_BSWALK_RUN; duration = 0.6f; break;
-        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.3f; loops = TRUE; break;
+            anim = ASSET_3_ANIM_BSWALK;
+            duration = velocity_to_duration(h_velocity, 80.0f, 150.0f, 1.3f, 0.6f);
+            break;
+        case BS_WALK:
+            anim = ASSET_C_ANIM_BSWALK_RUN;
+            duration = velocity_to_duration(h_velocity, 150.0f, 225.0f, 0.92f, 0.58f);
+            break;
+        case BS_4_WALK_FAST:
+            anim = ASSET_C_ANIM_BSWALK_RUN;
+            duration = velocity_to_duration(h_velocity, 225.0f, 500.0f, 0.54f, 0.44f);
+            break;
+        case BS_SKID:  anim = ASSET_E_ANIM_BSTURN; duration = 0.3f; loops = FALSE; break;
         case BS_SLIDE: anim = ASSET_5A_ANIM_BSSLIDE_FRONT; duration = 1.0f; break;
         case BS_ROLL:  anim = ASSET_4F_ANIM_BSTWIRL; duration = 0.9f; loops = TRUE; break;
+        // Jump: subRange 0.3→0.5042 at 1.9f ONCE (from bs/jump.c bsjump_init)
         case BS_5_JUMP: anim = ASSET_8_ANIM_BSJUMP; duration = 1.9f; loops = FALSE; break;
-        case BS_12_BFLIP: anim = ASSET_4B_ANIM_BSBFLIP_ENTER; duration = 2.3f; loops = FALSE; break;
-        case BS_2F_FALL: anim = ASSET_8_ANIM_BSJUMP; duration = 2.0f; loops = FALSE; break;
-        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.35f; loops = TRUE; break;
-        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.3f; loops = FALSE; break;
-        case BS_F_BBUSTER: anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.9f; loops = FALSE; break;
-        case BS_BFLAP:
-            if (gm->current_anim != ASSET_18_ANIM_BSBFLAP_ENTER && gm->current_anim != ASSET_17_ANIM_BSBFLAP) {
-                anim = ASSET_18_ANIM_BSBFLAP_ENTER; duration = 0.30f; loops = FALSE;
-            } else if (gm->current_anim == ASSET_18_ANIM_BSBFLAP_ENTER && gm->ghost_timer >= 0.95f) {
-                anim = ASSET_17_ANIM_BSBFLAP; duration = 0.15f; loops = TRUE;
-            } else {
+        // Bflip (Z+A somersault): multi-phase animation
+        // Phases managed in per-frame section. Don't reset if already in a bflip phase.
+        case BS_12_BFLIP:
+            if (gm->current_anim == ASSET_4B_ANIM_BSBFLIP_ENTER
+                || gm->current_anim == ASSET_4C_ANIM_BSBFLIP_HOLD
+                || gm->current_anim == ASSET_61_ANIM_BSBFLIP_EXIT) {
                 return;
             }
+            anim = ASSET_4B_ANIM_BSBFLIP_ENTER; duration = 2.3f; loops = FALSE;
             break;
-        case BS_11_BPECK: anim = ASSET_19_ANIM_BSBPECK_ENTER; duration = 0.35f; loops = TRUE; break;
+        case BS_2F_FALL: anim = ASSET_B0_ANIM_BSJUMP_FALL; duration = 0.38f; loops = TRUE; break;
+        case BS_3D_FALL_TUMBLING: anim = ASSET_68_ANIM_BSJUMP_TUMBLE; duration = 0.35f; loops = TRUE; break;
+        case BS_CLAW:  anim = ASSET_5_ANIM_BSPUNCH; duration = 1.3f; loops = FALSE; break;
+        // Bbuster: multi-phase, managed in per-frame section
+        case BS_F_BBUSTER:
+            if (gm->current_anim == ASSET_1D_ANIM_BSBBUSTER) {
+                return; // Already in bbuster phase, don't reset
+            }
+            anim = ASSET_1D_ANIM_BSBBUSTER; duration = 1.02f; loops = FALSE;
+            break;
+        // Bflap (feathery flap, A in air): ENTER 0.3f ONCE → BSBFLAP loop (speeds up)
+        // Phases managed in per-frame section. Don't reset if already in a bflap phase.
+        case BS_BFLAP:
+            if (gm->current_anim == ASSET_18_ANIM_BSBFLAP_ENTER
+                || gm->current_anim == ASSET_17_ANIM_BSBFLAP) {
+                return;
+            }
+            anim = ASSET_18_ANIM_BSBFLAP_ENTER; duration = 0.30f; loops = FALSE;
+            break;
+        // Bpeck (A+B): BSBPECK 0.2f ONCE → at 91%: BSBPECK_ENTER loop 0.35f for 0.5s → BSBPECK retract
+        case BS_11_BPECK:
+            if (gm->current_anim == ASSET_1A_ANIM_BSBPECK
+                || gm->current_anim == ASSET_19_ANIM_BSBPECK_ENTER) {
+                return;
+            }
+            anim = ASSET_1A_ANIM_BSBPECK; duration = 0.2f; loops = FALSE;
+            break;
         case BS_BBARGE: anim = ASSET_1C_ANIM_BSBBARGE; duration = 1.0f; loops = FALSE; break;
         case BS_CROUCH: anim = ASSET_1_ANIM_BSCROUCH_ENTER; duration = 0.5f; loops = FALSE; break;
         case BS_9_EGG_HEAD: anim = ASSET_2A_ANIM_BSEGGHEAD; duration = 1.0f; loops = FALSE; break;
@@ -221,29 +349,69 @@ static void ghost_sync_anim(GhostModel *gm, u8 bs_state) {
         default: anim = ASSET_6F_ANIM_BSSTAND_IDLE; duration = 5.5f; loops = TRUE; break;
     }
 
-    if (anim != gm->current_anim) {
+    // Reset when animation changes OR when bs_state changes (even if same anim asset).
+    // Needed for: BS_20_LANDING keeps jump anim → next BS_5_JUMP must restart phase 0.
+    if (anim != gm->current_anim || bs_state != gm->prev_bs_state) {
+        // Same animation but different state (e.g. WALK↔FAST both use ASSET_C):
+        // Just update duration, keep timer position (game carries over timer in walk.c)
+        // Exception: states that MUST restart even with same anim (e.g. LANDING→JUMP)
+        if (anim == gm->current_anim && bs_state != BS_5_JUMP) {
+            gm->anim_duration = duration;
+            gm->anim_loops = loops;
+            return;
+        }
+
         // recomp_printf("[GhostAnim] BS=0x%02X anim=0x%03X dur=%.2f %s\n", bs_state, anim, duration, loops ? "LOOP" : "ONCE");
 
-        // Copy current bones to prev for blending
-        // (bone_current has the last frame of the old animation)
-        void *tmp = gm->bone_prev;
-        gm->bone_prev = gm->bone_current;
-        gm->bone_current = tmp;
+        ghost_prepare_blend(gm);
 
         gm->prev_anim = gm->current_anim;
         gm->current_anim = anim;
         gm->anim_duration = duration;
         gm->anim_loops = loops;
-        gm->blend_timer = 0.0f;
-        gm->blending = TRUE;
 
+        // Reset idle phase when entering idle
+        if ((bs_state == BS_1_IDLE || bs_state == BS_0_NONE)
+            && gm->prev_bs_state != BS_1_IDLE && gm->prev_bs_state != BS_0_NONE) {
+            gm->idle_phase = 0;
+        }
+
+        // Reset bpeck state when entering bpeck
+        if (bs_state == BS_11_BPECK && gm->prev_bs_state != BS_11_BPECK) {
+            gm->bpeck_timer = 0.0f;
+        }
+
+        // Reset bflap state when entering bflap
+        if (bs_state == BS_BFLAP && gm->prev_bs_state != BS_BFLAP) {
+            gm->bflap_count = 0;
+            gm->bflap_elapsed = 0.0f;
+            gm->bflap_released = FALSE;
+        }
+
+        // Set subRange based on game source
         if (anim == ASSET_8_ANIM_BSJUMP && bs_state == BS_5_JUMP) {
-            gm->ghost_timer = 0.35f; // Skip crouch windup for jump
-        } else if (anim == ASSET_8_ANIM_BSJUMP && bs_state == BS_2F_FALL) {
-            gm->ghost_timer = 0.7f;  // Start at falling pose for fall
-        } else if (anim == ASSET_E_ANIM_BSTURN) {
-            gm->ghost_timer = 0.4f;  // Skip arms-open start frame
+            // bs/jump.c bsjump_init: subRange 0.3→0.5042, start at 0.3
+            gm->anim_start = 0.3f;
+            gm->anim_end = 0.5042f;
+            gm->ghost_timer = 0.3f;
+        } else if (anim == ASSET_8_ANIM_BSJUMP && bs_state == BS_20_LANDING) {
+            // Landing from fall: start at landing pose (0.6667)
+            gm->anim_start = 0.0f;
+            gm->anim_end = 1.0f;
+            gm->ghost_timer = 0.6667f;
+        } else if (anim == ASSET_1D_ANIM_BSBBUSTER && bs_state == BS_F_BBUSTER) {
+            // bbuster.c bsbbuster_init: subRange 0.0→0.35, dur 1.02f
+            gm->anim_start = 0.0f;
+            gm->anim_end = 0.35f;
+            gm->ghost_timer = 0.0f;
+        } else if (anim == ASSET_4B_ANIM_BSBFLIP_ENTER && bs_state == BS_12_BFLIP) {
+            // bFlip.c bsbflip_init: subRange 0.0→0.7866, dur 2.3f
+            gm->anim_start = 0.0f;
+            gm->anim_end = 0.7866f;
+            gm->ghost_timer = 0.0f;
         } else {
+            gm->anim_start = 0.0f;
+            gm->anim_end = 1.0f;
             gm->ghost_timer = 0.0f;
         }
     }
@@ -267,7 +435,19 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         GhostModel *gm = &ghost_models[pid];
         if (!gm->initialized) continue;
 
-        ghost_sync_anim(gm, rs.bs_state);
+        ghost_sync_anim(gm, rs.bs_state, rs.horizontal_velocity);
+
+        // Continuously scale walk animation duration based on velocity (every frame)
+        // Mirrors baanim_scaleDuration() called in every walk update function
+        if (rs.bs_state == BS_WALK_CREEP) {
+            gm->anim_duration = velocity_to_duration(rs.horizontal_velocity, 30.0f, 80.0f, 1.8f, 1.2f);
+        } else if (rs.bs_state == BS_2_WALK_SLOW) {
+            gm->anim_duration = velocity_to_duration(rs.horizontal_velocity, 80.0f, 150.0f, 1.3f, 0.6f);
+        } else if (rs.bs_state == BS_WALK) {
+            gm->anim_duration = velocity_to_duration(rs.horizontal_velocity, 150.0f, 225.0f, 0.92f, 0.58f);
+        } else if (rs.bs_state == BS_4_WALK_FAST) {
+            gm->anim_duration = velocity_to_duration(rs.horizontal_velocity, 225.0f, 500.0f, 0.54f, 0.44f);
+        }
 
         // === Ground tracking + dust particles ===
         // Walking dust uses commonParticle system (type 6) via func_8029CDC0
@@ -377,35 +557,459 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         }
 
         gm->prev_bs_state = rs.bs_state;
-
-        // Load current animation frame into bone_current
-        void *anim_file = animBinCache_get(gm->current_anim);
-        if (anim_file) {
-            animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_current);
-        }
+        gm->prev_y = rs.y;
 
         // Advance animation timer
         f32 dt = time_getDelta();
         f32 speed = dt / gm->anim_duration;
         gm->ghost_timer += speed;
-        if (gm->anim_loops) {
-            if (gm->ghost_timer >= 1.0f) gm->ghost_timer -= 1.0f;
-        } else {
-            if (gm->ghost_timer >= 0.99f) gm->ghost_timer = 0.99f;
+
+        // === Per-frame phase transitions (height/timer based, mirrors game logic) ===
+
+        // Jump height-based phase transitions (mirrors bsjump_update ground detection)
+        if (gm->current_anim == ASSET_8_ANIM_BSJUMP && rs.bs_state == BS_5_JUMP) {
+            f32 height = rs.y - gm->ground_y;
+            bool descending = (rs.y < gm->prev_y - 1.0f);
+
+            if (gm->anim_end < 0.51f && descending && height < 130.0f) {
+                // Phase 0→2 direct: short jump (func_8028B254(0x82))
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->anim_duration = 1.4f;
+            } else if (gm->anim_end > 0.5f && gm->anim_end < 0.7f && height < 90.0f) {
+                // Phase 1→2: high jump approaching ground (func_8028B254(0x5A))
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->anim_duration = 2.0f;
+            }
         }
+
+        // Fall near-ground transition (mirrors bsjump_fall_update case 0)
+        // When falling and near ground: switch from BSJUMP_FALL to BSJUMP landing pose
+        // Only trigger when CROSSING the threshold (was above, now below) to avoid
+        // false triggers after bpeck (player barely left the ground)
+        if (gm->current_anim == ASSET_B0_ANIM_BSJUMP_FALL
+            && (rs.bs_state == BS_2F_FALL || rs.bs_state == BS_20_LANDING)) {
+            f32 height = rs.y - gm->ground_y;
+            f32 prev_height = gm->prev_y - gm->ground_y;
+            if (height < 90.0f && prev_height >= 90.0f) {
+                // bsjump_fall_update: anctrl_setIndex BSJUMP, start 0.6667, dur 2.0, ONCE
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_8_ANIM_BSJUMP;
+                gm->anim_duration = 2.0f;
+                gm->anim_loops = FALSE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.6667f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+            }
+        }
+
+        // Bbuster per-frame phase transitions (mirrors bsbbuster_update)
+        if (rs.bs_state == BS_F_BBUSTER && gm->current_anim == ASSET_1D_ANIM_BSBBUSTER) {
+            f32 height = rs.y - gm->ground_y;
+            f32 fall_speed = gm->prev_y - rs.y;
+            bool on_ground = (height >= -10.0f && height < 30.0f);
+
+            // Phase 0→1: wind-up done (timer reached 0.35), hold pose briefly
+            if (gm->anim_end < 0.36f && gm->ghost_timer >= gm->anim_end - 0.002f) {
+                gm->anim_duration = 0.4f;
+                // Timer stays at 0.35, subRange unchanged — pose holds
+            }
+
+            // Phase 2→3: impact (on ground while still in wind-up subRange)
+            // Extend subRange to 0.7299 for bounce+unroll animation, timer continues from ~0.35
+            // No fall_speed check: network latency means char may already be bouncing up
+            if (gm->anim_end < 0.36f && on_ground) {
+                gm->anim_start = 0.0f;
+                gm->anim_end = 0.7299f;
+                gm->anim_duration = 1.9f;
+                // ghost_timer stays at ~0.35, continues forward through bounce anim
+            }
+
+            // Phase 3→4: bounce animation done (timer reached 0.7299)
+            // Hold at 0.74 with very slow duration until landing
+            if (gm->anim_end > 0.72f && gm->anim_end < 0.74f
+                && gm->ghost_timer >= gm->anim_end - 0.002f) {
+                gm->anim_start = 0.0f;
+                gm->anim_end = 0.74f;
+                gm->anim_duration = 15.0f;
+                // Near-freeze hold
+            }
+
+            // Phase 4→landing: on ground during recovery → play full landing
+            if (gm->anim_end > 0.73f && gm->anim_end < 0.75f && on_ground) {
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->anim_duration = 1.9f;
+                // Timer at ~0.74, plays rest of animation to landing
+            }
+        }
+
+        // Bpeck per-frame phase transitions (mirrors bsbpeck_update phases 0-2)
+        // Phase 0: BSBPECK(1A) ONCE 0.2f → at 91.26% switch to Phase 1
+        // Phase 1: BSBPECK_ENTER(19) LOOP 0.35f for 0.5s → Phase 2
+        // Phase 2: BSBPECK(1A) ONCE 0.2f (retract) → when done, BS changes from network
+        if (rs.bs_state == BS_11_BPECK) {
+            // Phase 0→1: at 91.26% of initial BSBPECK lunge
+            // bpeck_timer == 0.0 means Phase 0 (initial). -1.0 means Phase 2 (retract).
+            if (gm->current_anim == ASSET_1A_ANIM_BSBPECK
+                && gm->bpeck_timer > -0.5f  // Phase 0 only (0.0), NOT Phase 2 (-1.0)
+                && gm->ghost_timer >= 0.9126f) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_19_ANIM_BSBPECK_ENTER;
+                gm->anim_duration = 0.35f;
+                gm->anim_loops = TRUE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.0f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+                gm->bpeck_timer = 0.5f;
+            }
+
+            // Phase 1: countdown pecking loop, then → Phase 2 retract
+            if (gm->current_anim == ASSET_19_ANIM_BSBPECK_ENTER && gm->bpeck_timer > 0.0f) {
+                gm->bpeck_timer -= dt;
+                if (gm->bpeck_timer <= 0.0f) {
+                    ghost_prepare_blend(gm);
+                    gm->prev_anim = gm->current_anim;
+                    gm->current_anim = ASSET_1A_ANIM_BSBPECK;
+                    gm->anim_duration = 0.2f;
+                    gm->anim_loops = FALSE;
+                    gm->anim_start = 0.0f;
+                    gm->anim_end = 1.0f;
+                    gm->ghost_timer = 0.0f;
+                    gm->blend_timer = 0.0f;
+                    gm->blending = TRUE;
+                    gm->bpeck_timer = -1.0f;  // Mark as Phase 2 retract
+                }
+            }
+        }
+
+        // Idle kazooie peck→pull transition (0x20 entries in sequence)
+        // At 37% of ASSET_95, switch to ASSET_F6 (Banjo pulls Kazooie back in)
+        if ((rs.bs_state == BS_1_IDLE || rs.bs_state == BS_0_NONE)
+            && gm->current_anim == ASSET_95_ANIM_BSSTAND_KAZOOIE_PECK
+            && gm->ghost_timer >= 0.37f) {
+            static const u8 idle_seq_check[21] = {
+                0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x20,
+                0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x10,
+                0x09, 0x0A, 0x20
+            };
+            if (idle_seq_check[gm->idle_phase] & 0x20) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_F6_ANIM_BSSTAND_PULL_KAZOOIE;
+                gm->anim_duration = 5.0f;
+                gm->anim_loops = FALSE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.0f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+            }
+        }
+
+        // Bflip per-frame checks (mirrors bsbflip_update phases 0-4)
+        if (rs.bs_state == BS_12_BFLIP) {
+            f32 height = rs.y - gm->ground_y;
+            f32 fall_speed = gm->prev_y - rs.y;  // positive = descending
+            bool on_ground = (height >= -10.0f && height < 30.0f);
+
+            // Phase 0→1: at 0.1837, speed up from 2.3f to 1.9f + launch
+            if (gm->current_anim == ASSET_4B_ANIM_BSBFLIP_ENTER
+                && gm->anim_end < 0.8f  // still in ENTER subRange phase
+                && gm->ghost_timer >= 0.1837f
+                && gm->anim_duration > 2.0f) {
+                gm->anim_duration = 1.9f;
+            }
+
+            // Phase 2 (HOLD): A released detection → EXIT
+            // Game: bakey_released(A) + baphysics_reset_terminal_velocity
+            // Terminal velocity during hold = -533.3, after release = normal (~1400)
+            // So fall speed increases significantly when A released
+            if (gm->current_anim == ASSET_4C_ANIM_BSBFLIP_HOLD && fall_speed > 15.0f) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_61_ANIM_BSBFLIP_EXIT;
+                gm->anim_duration = 0.8f;
+                gm->anim_loops = FALSE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.0f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+            }
+
+            // Phase 2 (HOLD): land directly while holding A (player_isStable, skips EXIT)
+            if (gm->current_anim == ASSET_4C_ANIM_BSBFLIP_HOLD && on_ground) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_4B_ANIM_BSBFLIP_ENTER;
+                gm->anim_duration = 2.2f;
+                gm->anim_loops = FALSE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.8566f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+            }
+
+            // Phase 3 (EXIT): when on ground → landing animation (ENTER at 0.8566)
+            if (gm->current_anim == ASSET_61_ANIM_BSBFLIP_EXIT && on_ground) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_4B_ANIM_BSBFLIP_ENTER;
+                gm->anim_duration = 2.2f;
+                gm->anim_loops = FALSE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.8566f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+            }
+        }
+
+        // Bflap per-frame checks (mirrors bsbflap_update)
+        if (rs.bs_state == BS_BFLAP) {
+            f32 fall_speed = gm->prev_y - rs.y;  // positive = descending
+            gm->bflap_elapsed += dt;
+
+            // Detect A released: if falling faster than terminal velocity with flap gravity
+            // With flap: gravity -1100, terminal -399.9 → fall speed ~400/frame_time
+            // Without flap: normal gravity → much faster fall
+            // Heuristic: if falling > 15 units/frame consistently, A was released
+            if (!gm->bflap_released && gm->bflap_elapsed > 0.4f && fall_speed > 15.0f) {
+                gm->bflap_released = TRUE;
+                // A released: animation slows to 1.0f (from bsbflap_update phase 2/3)
+                if (gm->current_anim == ASSET_17_ANIM_BSBFLAP) {
+                    gm->anim_duration = 1.0f;
+                }
+            }
+
+            // ENTER→loop transition: at 90% of ENTER animation (mirrors anctrl_isAt 0.9)
+            if (gm->current_anim == ASSET_18_ANIM_BSBFLAP_ENTER && gm->ghost_timer >= 0.9f) {
+                ghost_prepare_blend(gm);
+                gm->prev_anim = gm->current_anim;
+                gm->current_anim = ASSET_17_ANIM_BSBFLAP;
+                gm->anim_loops = TRUE;
+                gm->anim_start = 0.0f;
+                gm->anim_end = 1.0f;
+                gm->ghost_timer = 0.0f;
+                gm->blend_timer = 0.0f;
+                gm->blending = TRUE;
+                // Duration from flap count (func_802A2858)
+                gm->anim_duration = 0.15f;
+                gm->bflap_count = 0;
+            }
+
+            // Flap counter: increment when loop animation reaches 90% (mirrors func_802A2810)
+            // Then update duration (mirrors func_802A28CC → func_802A2858)
+            // Note: timer can overshoot past 1.0 before wrap, so check if timer
+            // is in 0.9-1.1 range (accounts for overshoot before clamp)
+            if (gm->current_anim == ASSET_17_ANIM_BSBFLAP && !gm->bflap_released) {
+                f32 advance = dt / gm->anim_duration;
+                f32 prev_timer = gm->ghost_timer - advance;
+                // Detect 0.9 crossing: either normal (prev<0.9, cur>=0.9)
+                // or after wrap (prev was >0.9 last cycle, wrapped, now < prev)
+                bool crossed = (prev_timer < 0.9f && gm->ghost_timer >= 0.9f)
+                             || (gm->ghost_timer < prev_timer && prev_timer < 1.0f && prev_timer >= 0.9f);
+                if (crossed) {
+                    gm->bflap_count++;
+                    // Update duration based on flap count (from func_802A2858)
+                    switch (gm->bflap_count) {
+                        case 0: gm->anim_duration = 0.15f; break;
+                        case 1: gm->anim_duration = 0.2f; break;
+                        case 2: gm->anim_duration = 0.27f; break;
+                        case 3: gm->anim_duration = 0.38f; break;
+                        default: gm->anim_duration = 0.4f; break;
+                    }
+                }
+            }
+        }
+
+        // Clamp/loop within subRange
+        if (gm->anim_loops) {
+            if (gm->ghost_timer >= gm->anim_end) {
+                gm->ghost_timer = gm->anim_start;
+            }
+        } else {
+            if (gm->ghost_timer >= gm->anim_end) {
+                // Jump timer-based phase transitions
+                if (gm->current_anim == ASSET_8_ANIM_BSJUMP && gm->anim_end < 0.51f) {
+                    // Phase 0→1: high jump, timer reached 0.5042
+                    gm->anim_start = 0.0f;
+                    gm->anim_end = 0.6667f;
+                    gm->anim_duration = 4.0f;
+                } else if (gm->current_anim == ASSET_8_ANIM_BSJUMP && gm->anim_end < 0.7f) {
+                    // Phase 1→2: timer fallback
+                    gm->anim_start = 0.0f;
+                    gm->anim_end = 1.0f;
+                    gm->anim_duration = 2.0f;
+                }
+                // Bflip ENTER done → switch to HOLD loop
+                else if (gm->current_anim == ASSET_4B_ANIM_BSBFLIP_ENTER
+                         && rs.bs_state == BS_12_BFLIP
+                         && gm->anim_end < 0.8f) {
+                    // Phase 1→2: ENTER finished → HOLD spin loop
+                    {
+                        ghost_prepare_blend(gm);
+                        gm->prev_anim = gm->current_anim;
+                        gm->current_anim = ASSET_4C_ANIM_BSBFLIP_HOLD;
+                        gm->anim_duration = 0.13f;
+                        gm->anim_loops = TRUE;
+                        gm->anim_start = 0.0f;
+                        gm->anim_end = 1.0f;
+                        gm->ghost_timer = 0.0f;
+                        gm->blend_timer = 0.0f;
+                        gm->blending = TRUE;
+                    }
+                }
+                // Idle cycle: when current idle anim finishes, advance phase
+                // Sequence table from bsstand_update D_80364D20[21]:
+                // 0x8|x = idle loop (ASSET_6F), 0x10 = kazooie peck (ASSET_95),
+                // 0x20 = kazooie peck→pull (ASSET_95 → ASSET_F6 at 0.37)
+                else if ((rs.bs_state == BS_1_IDLE || rs.bs_state == BS_0_NONE)
+                         && (gm->current_anim == ASSET_6F_ANIM_BSSTAND_IDLE
+                             || gm->current_anim == ASSET_95_ANIM_BSSTAND_KAZOOIE_PECK
+                             || gm->current_anim == ASSET_F6_ANIM_BSSTAND_PULL_KAZOOIE)) {
+                    static const u8 idle_seq[21] = {
+                        0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x20,
+                        0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x10,
+                        0x09, 0x0A, 0x20
+                    };
+                    gm->idle_phase++;
+                    if (gm->idle_phase > 20) gm->idle_phase = 0;
+                    u8 phase = idle_seq[gm->idle_phase];
+
+                    ghost_prepare_blend(gm);
+                    gm->prev_anim = gm->current_anim;
+                    gm->blend_timer = 0.0f;
+                    gm->blending = TRUE;
+
+                    if (phase & 0x10 || phase & 0x20) {
+                        // Kazooie peck animation
+                        gm->current_anim = ASSET_95_ANIM_BSSTAND_KAZOOIE_PECK;
+                        gm->anim_duration = 5.5f;
+                        gm->anim_loops = FALSE;
+                    } else {
+                        // Normal idle cycle — ONCE per 5.5s cycle, then advances counter
+                        // (game uses anctrl_isAt(0.9999) to advance, we use timer reaching end)
+                        gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
+                        gm->anim_duration = 5.5f;
+                        gm->anim_loops = FALSE;  // ONCE! Must finish to advance phase
+                    }
+                    gm->anim_start = 0.0f;
+                    gm->anim_end = 1.0f;
+                    gm->ghost_timer = 0.0f;
+                } else {
+                    // ONCE finished, no phase transition: hold last frame.
+                    // Landing arms-open is handled by BS_20_LANDING force-transition.
+                    gm->ghost_timer = gm->anim_end - 0.001f;
+                }
+            }
+        }
+
+        // Kazooie visibility — calculated AFTER all phase transitions and timer clamp.
+        // Based on EXACT game source: grep of func_8029E070/064/058 across all bs/ files.
+        // Head (D_8037D238): most K-active states + idle peeks
+        // Wings (D_8037D236): ONLY bTrot, bLongLeg, bShock
+        // Feet (D_8037D235): ONLY bEggAss
+        {
+            static const u8 idle_seq_vis[21] = {
+                0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x20,
+                0x09, 0x0A, 0x0C, 0x10, 0x09, 0x09, 0x0A, 0x09, 0x10,
+                0x09, 0x0A, 0x20
+            };
+            bool k_head = FALSE;
+            bool k_wings = FALSE;
+            bool k_feet = FALSE;
+
+            switch (rs.bs_state) {
+                // Head ON (func_8029E070(1) in init)
+                case BS_BFLAP: case BS_11_BPECK: case BS_12_BFLIP:
+                case BS_F_BBUSTER: case BS_BBARGE:
+                case BS_9_EGG_HEAD:
+                case BS_23_FLY_ENTER: case BS_24_FLY: case BS_BOMB:
+                case BS_18_FLY_KNOCKBACK: case BS_FLY_OW: case BS_58_BEAKBOMB_CRASH:
+                case BS_41_DIE: case BS_D_TIMEOUT: case BS_53_TIMEOUT:
+                case BS_44_JIG_JIGGY:
+                case BS_1A_WONDERWING_ENTER: case BS_1B_WONDERWING_IDLE:
+                case BS_1C_WONDERWING_WALK: case BS_1D_WONDERWING_JUMP:
+                case BS_1E_WONDERWING_EXIT:
+                    k_head = TRUE;
+                    break;
+
+                // Head + Wings ON (func_8029E070(1) + func_8029E064(1))
+                case BS_14_BTROT_ENTER: case BS_15_BTROT_IDLE:
+                case BS_16_BTROT_WALK: case BS_17_BTROT_EXIT:
+                case BS_8_BTROT_JUMP:
+                case BS_25_LONGLEG_ENTER: case BS_26_LONGLEG_IDLE:
+                case BS_LONGLEG_WALK: case BS_LONGLEG_JUMP: case BS_LONGLEG_EXIT:
+                    k_head = TRUE;
+                    k_wings = TRUE;
+                    break;
+
+                // Head + Feet ON (func_8029E070(1) + func_8029E058(1))
+                case BS_A_EGG_ASS:
+                    k_head = TRUE;
+                    k_feet = TRUE;
+                    break;
+
+                // Idle: head only during peek windows
+                case BS_0_NONE: case BS_1_IDLE:
+                    if (gm->current_anim == ASSET_95_ANIM_BSSTAND_KAZOOIE_PECK
+                        || gm->current_anim == ASSET_F6_ANIM_BSSTAND_PULL_KAZOOIE) {
+                        k_head = TRUE;
+                    } else if (gm->current_anim == ASSET_6F_ANIM_BSSTAND_IDLE) {
+                        u8 phase_type = idle_seq_vis[gm->idle_phase];
+                        if (phase_type & 0x04) {
+                            k_head = (gm->ghost_timer >= 0.0909f && gm->ghost_timer < 0.6818f);
+                        } else if (phase_type & 0x02) {
+                            k_head = (gm->ghost_timer >= 0.7727f);
+                        }
+                    }
+                    break;
+
+                // Talk/rest: head on
+                case BS_3C_TALK:
+                    k_head = TRUE;
+                    break;
+
+                // Everything else: all K hidden
+                default:
+                    break;
+            }
+            gm->kazooie_visible = k_head;
+            gm->kazooie_body = k_wings;  // reuse for wings
+            gm->kazooie_feet = k_feet;
+        }
+
+        // Load current animation frame into bone_current
+        // Done AFTER all phase transitions and clamp/loop so bone_current
+        // always reflects the final animation state for this frame.
+        {
+            void *anim_file = animBinCache_get(gm->current_anim);
+            if (anim_file) {
+                animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_current);
+            }
+        }
+
 
         // Determine which bone list to use for rendering
         void *render_bones = gm->bone_current;
 
         if (gm->blending) {
-            // Advance blend timer
             gm->blend_timer += dt;
             f32 blend_t = gm->blend_timer / BLEND_DURATION;
             if (blend_t >= 1.0f) {
                 blend_t = 1.0f;
                 gm->blending = FALSE;
             }
-            // Interpolate: prev → current
             boneTransformList_interpolate(gm->bone_blend, gm->bone_prev, gm->bone_current, blend_t);
             render_bones = gm->bone_blend;
         }
@@ -443,19 +1047,66 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             modelRender_draw(gfx, mtx, sp, sr, shadow_scale, 0, gm->shadow_model);
         }
 
-        // Set blended bone transforms and render
-        modelRender_setBoneTransformList(render_bones);
+        // Use the AnimCtrl's bone buffer (correct structure for renderer).
+        // 1. Call baanim_80289F30 to set up render state with local bones
+        // 2. Get the AnimCtrl's bone buffer pointer
+        // 3. Load ghost animation INTO that buffer (overwrite local data)
+        // 4. Render ghost
+        // baanim_80289F30 at end of loop restores local data in the buffer.
+        baanim_80289F30();
+        func_8029DD6C();
 
-        s32 env_color[3];
-        func_8029A47C(env_color);
-        modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
+        // Use AnimCtrl's bone buffer (correct structure for renderer).
+        // 1. baanim_80289F30 sets up render state with local bones
+        // 2. func_8029DD6C sets nodes correctly
+        // 3. Load ghost animation INTO the AnimCtrl's buffer
+        // 4. Render ghost with correct bone structure
+        // 5. baanim_80289F30 at end of loop restores local data
+        baanim_80289F30();
+        func_8029DD6C();
+
+        {
+            AnimCtrl *ac = baanim_getAnimCtrlPtr();
+            Animation *anim_ptr = anctrl_getAnimPtr(ac);
+            void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
+            if (bone_buffer) {
+                void *anim_file = animBinCache_get(gm->current_anim);
+                if (anim_file) {
+                    animationFile_getBoneTransformList(anim_file, gm->ghost_timer, bone_buffer);
+                }
+
+                if (gm->blending) {
+                    void *prev_file = animBinCache_get(gm->prev_anim);
+                    if (prev_file && gm->bone_prev) {
+                        animationFile_getBoneTransformList(prev_file, 0.0f, gm->bone_prev);
+                        f32 blend_t = gm->blend_timer / BLEND_DURATION;
+                        if (blend_t > 1.0f) blend_t = 1.0f;
+                        boneTransformList_interpolate(bone_buffer, gm->bone_prev, bone_buffer, blend_t);
+                    }
+                }
+            }
+        }
+
+        {
+            s32 env_color[3];
+            func_8029A47C(env_color);
+            modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
+        }
         func_8033A280(2.0f);
         func_8033A450(D_80363780);
         modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
+        ghost_setup_model_nodes(gm->kazooie_visible, gm->kazooie_body, gm->kazooie_feet);
+        bkrecomp_setup_custom_skinning(&ghost_skinning_data[pid], baModel_getModelId());
+
         modelRender_draw(gfx, mtx, pos, rot, baModelScale, ref, baModelBin);
     }
 
+    // Restore local player state after all ghost renders:
+    // 1. baanim_80289F30 restores modelRenderBoneTransformList to local player's bones
+    // 2. func_8033A444(NULL) forces D_8038371C rebuild on next frame from local bones
+    //    (without this, local player would use ghost's AnimMtxList on next frame)
     baanim_80289F30();
+    func_8033A444((void*)0);
 }
 
 RECOMP_EXPORT void bkrecomp_net_manage_ghosts(void) {}

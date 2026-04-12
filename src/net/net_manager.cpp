@@ -256,6 +256,7 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
     snap.health_total = pkt.health_total;
     snap.transformation = pkt.transformation;
     snap.bs_state = static_cast<uint8_t>(pkt.bs_state);
+    snap.horizontal_velocity = pkt.horizontal_velocity;
 
     interpolation_.push_full_state(pid, snap);
 }

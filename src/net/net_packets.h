@@ -114,6 +114,7 @@ struct PlayerStatePacket {
     uint16_t mumbo_tokens;
     uint8_t transformation;
     uint32_t bs_state;
+    float horizontal_velocity;
 };
 
 // --- World state packets (Phase 3) ---

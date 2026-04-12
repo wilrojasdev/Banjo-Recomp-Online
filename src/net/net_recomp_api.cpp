@@ -26,7 +26,8 @@
 // 0x2C    u8  transformation  1
 // 0x2D    u8  bs_state        1
 // 0x2E    u8  _pad[2]         2
-// Total: 0x30 (48 bytes)
+// 0x30    f32 horizontal_velocity 4
+// Total: 0x34 (52 bytes)
 
 static inline float read_f32(uint8_t* rdram, gpr addr, int offset) {
     u32 raw = MEM_W(offset, addr);
@@ -63,6 +64,7 @@ extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx) 
     snap.lives        = MEM_BU(0x2B, state_ptr);
     snap.transformation = MEM_BU(0x2C, state_ptr);
     snap.bs_state     = MEM_BU(0x2D, state_ptr);
+    snap.horizontal_velocity = read_f32(rdram, state_ptr, 0x30);
 
     bknet::NetworkManager::instance().push_local_full_state(snap);
 }
@@ -112,6 +114,7 @@ extern "C" void recomp_net_get_remote_state(uint8_t* rdram, recomp_context* ctx)
         MEM_BU(0x2B, out_ptr) = 0; // lives
         MEM_BU(0x2C, out_ptr) = state.transformation;
         MEM_BU(0x2D, out_ptr) = state.bs_state;
+        write_f32(rdram, out_ptr, 0x30, state.horizontal_velocity);
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

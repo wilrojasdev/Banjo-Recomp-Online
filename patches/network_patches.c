@@ -11,6 +11,7 @@ extern f32 anctrl_getDuration(AnimCtrl *this);
 extern enum map_e map_get(void);
 extern s32 bs_getState(void);
 extern u32 player_getTransformation(void);
+extern f32 baphysics_get_horizontal_velocity(void);
 
 // Full local player state struct passed to C++ side via pointer.
 // Must match the layout expected in net_recomp_api.cpp.
@@ -30,6 +31,7 @@ typedef struct {
     u8  transformation;
     u8  bs_state;
     u8  _pad[2]; // alignment
+    f32 horizontal_velocity;
 } NetFullState;
 
 // Networking bridge functions (registered on C++ side via REGISTER_FUNC)
@@ -60,6 +62,7 @@ static void net_sync_local_state(void) {
     state.map_id = (u32)map_get();
     state.bs_state = (u8)bs_getState();
     state.transformation = (u8)player_getTransformation();
+    state.horizontal_velocity = baphysics_get_horizontal_velocity();
 
     // Map BS state to animation asset ID
     s32 bs = bs_getState();

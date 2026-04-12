@@ -55,6 +55,7 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     out.mumbo_tokens = 0;
     out.transformation = snapshot_.transformation;
     out.bs_state = static_cast<uint32_t>(snapshot_.bs_state);
+    out.horizontal_velocity = snapshot_.horizontal_velocity;
     return true;
 }
 

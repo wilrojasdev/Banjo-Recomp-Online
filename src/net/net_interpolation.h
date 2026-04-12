@@ -25,6 +25,7 @@ struct PositionSnapshot {
     uint8_t lives = 0;
     uint8_t transformation = 0;
     uint8_t bs_state = 0;
+    float horizontal_velocity = 0.0f;
     double timestamp = 0.0;
     bool valid = false;
 };
@@ -42,6 +43,7 @@ struct InterpolatedState {
     uint8_t health = 0;
     uint8_t transformation = 0;
     uint8_t bs_state = 0;
+    float horizontal_velocity = 0.0f;
     bool active = false;
     bool animation_changed = false;
 };
