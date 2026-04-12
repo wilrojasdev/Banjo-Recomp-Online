@@ -130,19 +130,45 @@ struct MapChangePacket {
     uint32_t exit_id;
 };
 
+// Collectible types for WorldCollectiblePacket
+enum CollectibleType : uint8_t {
+    COLLECTIBLE_JIGGY       = 0,
+    COLLECTIBLE_NOTE        = 1,
+    COLLECTIBLE_JINJO       = 2,
+    COLLECTIBLE_MUMBO_TOKEN = 3,
+};
+
 struct WorldCollectiblePacket {
     PacketHeader header;
-    uint16_t collectible_type;
-    uint16_t collectible_id;
-    uint8_t collected; // 1=collected, 0=uncollected
+    uint8_t collectible_type;   // CollectibleType enum
+    uint16_t collectible_id;    // jiggy_e, note_index, jinjo bitmask, mumbotoken_e
+    uint8_t collected;          // 1=collected
+    uint32_t map_id;            // Which map (needed for notes)
+    uint8_t level_id;           // Which level (needed for notes)
 };
 
 struct WorldEnemyPacket {
     PacketHeader header;
-    uint16_t marker_type;
-    uint16_t spawn_index;
-    uint8_t alive;
+    uint16_t marker_type;       // Enemy marker type enum
+    uint16_t spawn_index;       // Which instance of this enemy type
+    uint32_t map_id;            // Which map the enemy is on
+    uint8_t alive;              // 0=dead
     uint8_t health;
+};
+
+// Flag types for WorldFlagPacket
+enum WorldFlagType : uint8_t {
+    FLAG_MAP_SPECIFIC   = 0,
+    FLAG_LEVEL_SPECIFIC = 1,
+    FLAG_FILE_PROGRESS  = 2,
+};
+
+struct WorldFlagPacket {
+    PacketHeader header;
+    uint8_t flag_type;          // WorldFlagType enum
+    uint16_t flag_index;
+    uint8_t value;
+    uint32_t map_id;            // Context: which map (for map-specific flags)
 };
 
 // --- Chat ---

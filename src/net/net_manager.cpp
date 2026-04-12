@@ -224,6 +224,27 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             }
             break;
         }
+        case PacketType::WorldCollectible: {
+            WorldCollectiblePacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_collectible_packet(pkt);
+            }
+            break;
+        }
+        case PacketType::WorldEnemy: {
+            WorldEnemyPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_enemy_packet(pkt);
+            }
+            break;
+        }
+        case PacketType::WorldObject: {
+            WorldFlagPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_flag_packet(pkt);
+            }
+            break;
+        }
         default:
             break;
     }
@@ -346,6 +367,102 @@ void NetworkManager::handle_map_change_packet(const MapChangePacket& pkt) {
 
     std::printf("[Network] Player %u changed to map %u\n", pid, pkt.new_map_id);
     // Ghost actor management will handle this via map_id changes in interpolated state
+}
+
+// === World state sync (Phase 3) ===
+
+void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id) {
+    if (!is_connected()) return;
+
+    WorldCollectiblePacket pkt{};
+    pkt.header.type = PacketType::WorldCollectible;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    pkt.collectible_type = type;
+    pkt.collectible_id = id;
+    pkt.collected = collected;
+    pkt.map_id = map_id;
+    pkt.level_id = level_id;
+
+    if (server_) {
+        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    } else if (client_) {
+        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    }
+}
+
+void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id) {
+    if (!is_connected()) return;
+
+    WorldEnemyPacket pkt{};
+    pkt.header.type = PacketType::WorldEnemy;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    pkt.marker_type = marker_type;
+    pkt.spawn_index = spawn_index;
+    pkt.map_id = map_id;
+    pkt.alive = 0;
+    pkt.health = 0;
+
+    if (server_) {
+        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    } else if (client_) {
+        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    }
+}
+
+void NetworkManager::send_flag_change(uint8_t flag_type, uint16_t flag_index, uint8_t value, uint32_t map_id) {
+    if (!is_connected()) return;
+
+    WorldFlagPacket pkt{};
+    pkt.header.type = PacketType::WorldObject;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    pkt.flag_type = flag_type;
+    pkt.flag_index = flag_index;
+    pkt.value = value;
+    pkt.map_id = map_id;
+
+    if (server_) {
+        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    } else if (client_) {
+        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    }
+}
+
+void NetworkManager::handle_collectible_packet(const WorldCollectiblePacket& pkt) {
+    if (pkt.header.player_id == local_player_id_) return;
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    WorldEvent evt{};
+    evt.type = WorldEvent::COLLECTIBLE;
+    evt.collectible = pkt;
+    world_events_.push_back(evt);
+}
+
+void NetworkManager::handle_enemy_packet(const WorldEnemyPacket& pkt) {
+    if (pkt.header.player_id == local_player_id_) return;
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    WorldEvent evt{};
+    evt.type = WorldEvent::ENEMY;
+    evt.enemy = pkt;
+    world_events_.push_back(evt);
+}
+
+void NetworkManager::handle_flag_packet(const WorldFlagPacket& pkt) {
+    if (pkt.header.player_id == local_player_id_) return;
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    WorldEvent evt{};
+    evt.type = WorldEvent::FLAG;
+    evt.flag = pkt;
+    world_events_.push_back(evt);
+}
+
+bool NetworkManager::pop_world_event(WorldEvent& out) {
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    if (world_events_.empty()) return false;
+    out = world_events_.front();
+    world_events_.pop_front();
+    return true;
 }
 
 } // namespace bknet

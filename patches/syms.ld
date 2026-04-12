@@ -60,3 +60,9 @@ recomp_net_is_connected = 0x8F0000D4;
 recomp_net_get_remote_state = 0x8F0000D8;
 recomp_net_get_remote_count = 0x8F0000DC;
 recomp_net_get_local_player_id = 0x8F0000E0;
+
+/* World state sync functions */
+recomp_net_send_collectible = 0x8F0000E4;
+recomp_net_send_enemy_death = 0x8F0000E8;
+recomp_net_send_flag_change = 0x8F0000EC;
+recomp_net_pop_world_event = 0x8F0000F0;

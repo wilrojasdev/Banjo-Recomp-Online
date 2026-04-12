@@ -76,7 +76,6 @@ static void net_sync_local_state(void) {
     state.transformation = (u8)player_getTransformation();
     state.horizontal_velocity = baphysics_get_horizontal_velocity();
 
-    // Read REAL animation state directly from AnimCtrl
     AnimCtrl *ac = baanim_getAnimCtrlPtr();
     state.animation_id = (u16)anctrl_getIndex(ac);
     state.anim_timer = anctrl_getAnimTimer(ac);
@@ -88,12 +87,10 @@ static void net_sync_local_state(void) {
     state.anim_subrange_start = sub_start;
     state.anim_subrange_end = sub_end;
 
-    // Pack kazooie visibility into flags
     state.kazooie_flags = (D_8037D238 ? 1 : 0)
                         | (D_8037D236 ? 2 : 0)
                         | (D_8037D235 ? 4 : 0);
 
-    // Items: placeholders until item access is resolved
     state.health = 0;
     state.health_total = 0;
     state.lives = 0;
@@ -104,14 +101,14 @@ static void net_sync_local_state(void) {
 
 // Ghost management (defined in network_remote_player.c)
 extern void bkrecomp_net_manage_ghosts(void);
+// World state sync (defined in network_world_sync.c)
+extern void bkrecomp_net_process_world_events(void);
 
 // @recomp Export: called from ncCamera_update each game frame.
 RECOMP_EXPORT void bkrecomp_net_sync_frame(void) {
     net_sync_local_state();
 
-    // Manage ghost actors (spawn/despawn/update)
+    bkrecomp_net_process_world_events();
     bkrecomp_net_manage_ghosts();
-
-    // Fire event for mods
     recomp_on_net_frame_update();
 }

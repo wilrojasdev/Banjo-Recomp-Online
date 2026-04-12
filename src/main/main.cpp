@@ -23,6 +23,10 @@ extern "C" void recomp_net_is_connected(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_get_remote_state(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_get_remote_count(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_get_local_player_id(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_collectible(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_enemy_death(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_flag_change(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -762,6 +766,10 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_get_remote_state);
     REGISTER_FUNC(recomp_net_get_remote_count);
     REGISTER_FUNC(recomp_net_get_local_player_id);
+    REGISTER_FUNC(recomp_net_send_collectible);
+    REGISTER_FUNC(recomp_net_send_enemy_death);
+    REGISTER_FUNC(recomp_net_send_flag_change);
+    REGISTER_FUNC(recomp_net_pop_world_event);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();

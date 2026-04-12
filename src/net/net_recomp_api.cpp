@@ -151,3 +151,76 @@ extern "C" void recomp_net_get_chat_count(uint8_t* rdram, recomp_context* ctx) {
 extern "C" void recomp_net_is_chat_active(uint8_t* rdram, recomp_context* ctx) {
     _return(ctx, bknet::ChatInput::instance().is_active() ? 1u : 0u);
 }
+
+// === World state sync (Phase 3) ===
+
+// Send collectible event: type(r4), id(r5), collected(r6), map_id(r7), level_id(stack)
+extern "C" void recomp_net_send_collectible(uint8_t* rdram, recomp_context* ctx) {
+    u32 type = static_cast<u32>(ctx->r4);
+    u32 id = static_cast<u32>(ctx->r5);
+    u32 collected = static_cast<u32>(ctx->r6);
+    u32 map_id = static_cast<u32>(ctx->r7);
+    // level_id passed via stack (5th arg in MIPS o32 ABI)
+    u32 level_id = MEM_W(0x10, ctx->r29);
+    bknet::NetworkManager::instance().send_collectible(
+        static_cast<uint8_t>(type), static_cast<uint16_t>(id),
+        static_cast<uint8_t>(collected), map_id, static_cast<uint8_t>(level_id));
+}
+
+// Send enemy death: marker_type(r4), spawn_index(r5), map_id(r6)
+extern "C" void recomp_net_send_enemy_death(uint8_t* rdram, recomp_context* ctx) {
+    u32 marker_type = static_cast<u32>(ctx->r4);
+    u32 spawn_index = static_cast<u32>(ctx->r5);
+    u32 map_id = static_cast<u32>(ctx->r6);
+    bknet::NetworkManager::instance().send_enemy_death(
+        static_cast<uint16_t>(marker_type), static_cast<uint16_t>(spawn_index), map_id);
+}
+
+// Send flag change: flag_type(r4), flag_index(r5), value(r6), map_id(r7)
+extern "C" void recomp_net_send_flag_change(uint8_t* rdram, recomp_context* ctx) {
+    u32 flag_type = static_cast<u32>(ctx->r4);
+    u32 flag_index = static_cast<u32>(ctx->r5);
+    u32 value = static_cast<u32>(ctx->r6);
+    u32 map_id = static_cast<u32>(ctx->r7);
+    bknet::NetworkManager::instance().send_flag_change(
+        static_cast<uint8_t>(flag_type), static_cast<uint16_t>(flag_index),
+        static_cast<uint8_t>(value), map_id);
+}
+
+// Pop next world event from queue. Returns 1 if event available, 0 if empty.
+// Writes event data to output struct at r4.
+// Output layout (28 bytes):
+//   0x00: u8  event_type (0=collectible, 1=enemy, 2=flag)
+//   0x04: event-specific data (up to 24 bytes, matching packet layout without header)
+extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    bknet::NetworkManager::WorldEvent evt;
+    if (bknet::NetworkManager::instance().pop_world_event(evt)) {
+        MEM_BU(0x00, out_ptr) = static_cast<u32>(evt.type);
+        switch (evt.type) {
+            case bknet::NetworkManager::WorldEvent::COLLECTIBLE:
+                MEM_BU(0x04, out_ptr) = evt.collectible.collectible_type;
+                MEM_HU(0x06, out_ptr) = evt.collectible.collectible_id;
+                MEM_BU(0x08, out_ptr) = evt.collectible.collected;
+                MEM_W(0x0C, out_ptr) = evt.collectible.map_id;
+                MEM_BU(0x10, out_ptr) = evt.collectible.level_id;
+                break;
+            case bknet::NetworkManager::WorldEvent::ENEMY:
+                MEM_HU(0x04, out_ptr) = evt.enemy.marker_type;
+                MEM_HU(0x06, out_ptr) = evt.enemy.spawn_index;
+                MEM_W(0x08, out_ptr) = evt.enemy.map_id;
+                MEM_BU(0x0C, out_ptr) = evt.enemy.alive;
+                MEM_BU(0x0D, out_ptr) = evt.enemy.health;
+                break;
+            case bknet::NetworkManager::WorldEvent::FLAG:
+                MEM_BU(0x04, out_ptr) = evt.flag.flag_type;
+                MEM_HU(0x06, out_ptr) = evt.flag.flag_index;
+                MEM_BU(0x08, out_ptr) = evt.flag.value;
+                MEM_W(0x0C, out_ptr) = evt.flag.map_id;
+                break;
+        }
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}

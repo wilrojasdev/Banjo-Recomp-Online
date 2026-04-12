@@ -377,9 +377,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             modelRender_draw(gfx, mtx, sp, sr, shadow_scale, 0, gm->shadow_model);
         }
 
-        // === Ghost render using AnimCtrl's bone buffer ===
-        // Use the AnimCtrl's bone buffer (correct format/size for BK model).
-        // Save local bones, write ghost bones, render, restore.
+        // DEBUG: ghost render with bones but WITHOUT func_8033A444 and node manipulation
         baanim_80289F30();
         func_8029DD6C();
 
@@ -388,17 +386,14 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             Animation *anim_ptr = anctrl_getAnimPtr(ac);
             void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
             if (bone_buffer) {
-                // Save local bones
                 boneTransformList_interpolate(gm->bone_save, bone_buffer, bone_buffer, 0.0f);
 
-                // Write ghost bones directly from animation file
                 void *anim_file = animBinCache_get(gm->current_anim);
                 if (anim_file) {
                     animationFile_getBoneTransformList(anim_file, gm->ghost_timer, bone_buffer);
                 }
 
-                // Force matrix recompute from ghost bones
-                func_8033A444((void*)0);
+                func_8033A444((void*)0);  // DEBUG: test if this breaks jinjo
             }
         }
 
@@ -408,14 +403,13 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
         }
         func_8033A280(2.0f);
-        func_8033A450(D_80363780);
+        // NOTE: func_8033A450 intentionally omitted — corrupts collision system.
         modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
         ghost_setup_all_model_nodes(kazooie_head, kazooie_wings, kazooie_feet);
         bkrecomp_setup_custom_skinning(&ghost_skinning_data[pid], baModel_getModelId());
-
         modelRender_draw(gfx, mtx, pos, rot, baModelScale, ref, baModelBin);
 
-        // Restore local bones immediately after ghost render
+        // Restore local bones
         {
             AnimCtrl *ac = baanim_getAnimCtrlPtr();
             Animation *anim_ptr = anctrl_getAnimPtr(ac);

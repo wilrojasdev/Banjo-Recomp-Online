@@ -48,6 +48,22 @@ public:
     // Chat
     void send_chat(const std::string& message);
 
+    // World state sync (Phase 3)
+    void send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id);
+    void send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id);
+    void send_flag_change(uint8_t flag_type, uint16_t flag_index, uint8_t value, uint32_t map_id);
+
+    // World event queue (received from network, consumed by game thread)
+    struct WorldEvent {
+        enum Type : uint8_t { COLLECTIBLE, ENEMY, FLAG } type;
+        union {
+            WorldCollectiblePacket collectible;
+            WorldEnemyPacket enemy;
+            WorldFlagPacket flag;
+        };
+    };
+    bool pop_world_event(WorldEvent& out);  // Called from game thread
+
     struct ChatEntry {
         uint8_t player_id;
         std::string message;
@@ -81,6 +97,9 @@ private:
     void handle_state_packet(const PlayerStatePacket& pkt);
     void handle_map_change_packet(const MapChangePacket& pkt);
     void handle_chat_packet(const ChatMessagePacket& pkt);
+    void handle_collectible_packet(const WorldCollectiblePacket& pkt);
+    void handle_enemy_packet(const WorldEnemyPacket& pkt);
+    void handle_flag_packet(const WorldFlagPacket& pkt);
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
@@ -101,6 +120,10 @@ private:
     mutable std::mutex chat_mutex_;
     std::deque<ChatEntry> chat_history_;
     bool new_messages_ = false;
+
+    // World event queue (network thread pushes, game thread pops)
+    mutable std::mutex world_mutex_;
+    std::deque<WorldEvent> world_events_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;
 };
