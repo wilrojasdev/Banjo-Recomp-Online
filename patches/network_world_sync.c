@@ -23,13 +23,18 @@ extern ActorArray *suBaddieActorArray;
 // Score pointers
 extern u8 *jiggyscore_getPtr(void);
 extern u8 *func_80321538(void);  // mumboscore ptr
+extern u8 *honeycombscore_get_ptr(void);
+extern bool honeycombscore_get(s32 indx);
+extern void honeycombscore_set(s32 indx, bool val);
 
 // Collectible types (shared between C and C++ via packet)
-#define COLLECTIBLE_JIGGY       0
-#define COLLECTIBLE_NOTE        1
-#define COLLECTIBLE_JINJO       2
-#define COLLECTIBLE_MUMBO_TOKEN 3
-#define COLLECTIBLE_DESPAWN_ONLY 4  // Non-shared: eggs, feathers, health, lives
+#define COLLECTIBLE_JIGGY            0
+#define COLLECTIBLE_NOTE             1
+#define COLLECTIBLE_JINJO            2
+#define COLLECTIBLE_MUMBO_TOKEN      3
+#define COLLECTIBLE_DESPAWN_ONLY     4  // Non-shared: eggs, feathers, honeycomb
+#define COLLECTIBLE_EMPTY_HONEYCOMB  5  // Shared: panel pieces (2 per world)
+#define COLLECTIBLE_EXTRA_LIFE       6  // Shared: Banjo trophy
 
 #define EVENT_COLLECTIBLE 0
 
@@ -42,10 +47,13 @@ static u8  prev_mumboscore[16] = {0};
 // Note/prop hiding (defined in note_saving.c)
 extern void bkrecomp_net_hide_note(u32 note_index);
 extern void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz);
-// Non-shared: track to detect local pickups and broadcast despawn-only
+static u8  prev_honeycombscore[3] = {0};
+static s32 prev_lives = 0;
+// Non-shared
 static s32 prev_eggs = 0;
 static s32 prev_red_feathers = 0;
 static s32 prev_gold_feathers = 0;
+static s32 prev_health = 0;
 
 // === Actor search ===
 
@@ -157,8 +165,44 @@ static void poll_shared_collectibles(void) {
         }
     }
 
-    // Notes: sent directly from note_saving.c __baMarker_resolveMusicNoteCollision
-    // with the specific note_index. No polling needed here.
+    // Notes: sent directly from note_saving.c (no polling needed)
+
+    // --- Empty honeycombs (panel pieces, 2 per world) ---
+    {
+        u8 *score = honeycombscore_get_ptr();
+        if (score) {
+            s32 i;
+            for (i = 0; i < 3; i++) {
+                u8 new_bits = score[i] & ~prev_honeycombscore[i];
+                if (new_bits) {
+                    recomp_printf("[HC-POLL] byte[%d] score=0x%X prev=0x%X new=0x%X\n", i, score[i], prev_honeycombscore[i], new_bits);
+                    s32 bit;
+                    for (bit = 0; bit < 8; bit++) {
+                        if (new_bits & (1 << bit)) {
+                            s32 hc_id = i * 8 + bit + 1;
+                            if (hc_id > 0 && hc_id < 0x19) {
+                                recomp_net_send_collectible(COLLECTIBLE_EMPTY_HONEYCOMB, (u32)hc_id, 1, cur_map, cur_level);
+                            }
+                        }
+                    }
+                }
+                prev_honeycombscore[i] = score[i];
+            }
+        }
+    }
+
+    // --- Extra life (Banjo trophy) ---
+    {
+        s32 cur = item_getCount(ITEM_16_LIFE);
+        if (cur != prev_lives) {
+            recomp_printf("[LIFE-POLL] cur=%d prev=%d diff=%d\n", cur, prev_lives, cur - prev_lives);
+            if (cur == prev_lives + 1) {
+                recomp_printf("[LIFE-SEND] sending type=%d\n", COLLECTIBLE_EXTRA_LIFE);
+                recomp_net_send_collectible(COLLECTIBLE_EXTRA_LIFE, 0, 1, cur_map, cur_level);
+            }
+        }
+        prev_lives = cur;
+    }
 }
 
 static void poll_nonshared_collectibles(void) {
@@ -193,6 +237,14 @@ static void poll_nonshared_collectibles(void) {
         }
         prev_gold_feathers = cur;
     }
+    // Honeycomb (health) — non-shared, despawn only
+    {
+        s32 cur = item_getCount(ITEM_14_HEALTH);
+        if (cur == prev_health + 1) {
+            recomp_net_send_collectible(COLLECTIBLE_DESPAWN_ONLY, 0, 1, cur_map, cur_level);
+        }
+        prev_health = cur;
+    }
 }
 
 // === RECEIVE: Apply remote collectible events ===
@@ -217,71 +269,74 @@ typedef struct {
 static void process_collectible_event(WorldEventData *evt) {
     processing_remote = TRUE;
 
-    switch (evt->coll_type) {
-        case COLLECTIBLE_JIGGY:
-            if (!jiggyscore_isCollected(evt->coll_id)) {
-                jiggyscore_setCollected(evt->coll_id, TRUE);
-                item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
-                // Update polling state
-                { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
-                // Despawn jiggy actor if on same map
-                if ((u32)map_get() == evt->coll_map_id) {
-                    despawn_actor_by_marker_id(MARKER_52_JIGGY);
-                }
-            }
-            break;
+    u8 ct = evt->coll_type;
 
-        case COLLECTIBLE_NOTE:
-            item_inc(ITEM_C_NOTE);
-            // Hide the specific note by its note_index if on same map
+    if (ct == COLLECTIBLE_JIGGY) {
+        if (!jiggyscore_isCollected(evt->coll_id)) {
+            jiggyscore_setCollected(evt->coll_id, TRUE);
+            item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+            { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
             if ((u32)map_get() == evt->coll_map_id) {
-                if (evt->coll_id == 0xFFFE) {
-                    // Dynamic note — try actor despawn
-                    despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
-                } else {
-                    // Static note — hide by note_index via prop system
-                    bkrecomp_net_hide_note(evt->coll_id);
-                }
+                despawn_actor_by_marker_id(MARKER_52_JIGGY);
+                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
             }
-            break;
-
-        case COLLECTIBLE_JINJO: {
-            item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
-            prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
-            // Despawn correct color jinjo
-            if ((u32)map_get() == evt->coll_map_id) {
-                u32 bit = evt->coll_id;
-                u32 marker_id = 0;
-                if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
-                else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
-                else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
-                else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
-                else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
-                if (marker_id) despawn_actor_by_marker_id(marker_id);
-            }
-            break;
         }
-
-        case COLLECTIBLE_MUMBO_TOKEN:
-            if (!mumboscore_get(evt->coll_id)) {
-                mumboscore_set(evt->coll_id, TRUE);
-                item_inc(ITEM_1C_MUMBO_TOKEN);
-                { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
-                if ((u32)map_get() == evt->coll_map_id) {
-                    despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
-                }
+    } else if (ct == COLLECTIBLE_NOTE) {
+        item_inc(ITEM_C_NOTE);
+        if ((u32)map_get() == evt->coll_map_id) {
+            if (evt->coll_id == 0xFFFE) {
+                despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
+            } else {
+                bkrecomp_net_hide_note(evt->coll_id);
             }
-            break;
-
-        case COLLECTIBLE_DESPAWN_ONLY:
-            // Non-shared: hide nearest sprite prop by asset_id + position.
-            // Eggs/feathers are sprite props (not actors), so we use the
-            // cube/prop system via note_saving.c's bkrecomp_net_hide_nearest_prop.
+        }
+    } else if (ct == COLLECTIBLE_JINJO) {
+        item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
+        prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+        if ((u32)map_get() == evt->coll_map_id) {
+            u32 bit = evt->coll_id;
+            u32 marker_id = 0;
+            if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
+            else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
+            else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
+            else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
+            else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
+            if (marker_id) despawn_actor_by_marker_id(marker_id);
+        }
+    } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
+        if (!mumboscore_get(evt->coll_id)) {
+            mumboscore_set(evt->coll_id, TRUE);
+            item_inc(ITEM_1C_MUMBO_TOKEN);
+            { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
             if ((u32)map_get() == evt->coll_map_id) {
-                bkrecomp_net_hide_nearest_prop(evt->coll_id,
-                    evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
+                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
             }
-            break;
+        }
+    } else if (ct == COLLECTIBLE_DESPAWN_ONLY) {
+        if ((u32)map_get() == evt->coll_map_id) {
+            bkrecomp_net_hide_nearest_prop(evt->coll_id,
+                evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+        }
+    } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
+        if (!honeycombscore_get(evt->coll_id)) {
+            honeycombscore_set(evt->coll_id, TRUE);
+            item_inc(ITEM_13_EMPTY_HONEYCOMB);
+            { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
+            if ((u32)map_get() == evt->coll_map_id) {
+                // Despawn actor AND hide sprite prop
+                despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
+                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+            }
+        }
+    } else if (ct == COLLECTIBLE_EXTRA_LIFE) {
+        item_inc(ITEM_16_LIFE);
+        prev_lives = item_getCount(ITEM_16_LIFE);
+        if ((u32)map_get() == evt->coll_map_id) {
+            // Despawn actor AND hide sprite prop (some collectibles have both)
+            despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
+            bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+        }
     }
 
     processing_remote = FALSE;
@@ -296,6 +351,7 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
 
     WorldEventData evt;
     while (recomp_net_pop_world_event(&evt)) {
+        recomp_printf("[WORLD-EVT] type=%d coll_type=%d id=%d\n", evt.event_type, evt.coll_type, evt.coll_id);
         if (evt.event_type == EVENT_COLLECTIBLE) {
             process_collectible_event(&evt);
         }

@@ -404,9 +404,10 @@ RECOMP_EXPORT void bkrecomp_net_hide_note(u32 note_index) {
 RECOMP_EXPORT void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz) {
     if (!sCubeList.cubes || sCubeList.cubeCnt <= 0) return;
 
-    f32 best_dist = 150.0f * 150.0f;  // Max search radius squared
+    f32 best_dist = 500.0f * 500.0f;  // Search radius squared (increased)
     Prop *best_prop = (Prop*)0;
     s32 i, j;
+    s32 total_props = 0;
 
     for (i = 0; i < sCubeList.cubeCnt; i++) {
         Cube *cube = &sCubeList.cubes[i];
@@ -414,10 +415,10 @@ RECOMP_EXPORT void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, 
 
         for (j = 0; j < cube->prop2Cnt; j++) {
             Prop *p = &cube->prop2Ptr[j];
-            // Only visible, non-actor sprite props
-            if (p->spriteProp.is_actor || p->spriteProp.is_3d || !p->spriteProp.unk8_4) continue;
+            // Skip already hidden props
+            if (!p->spriteProp.unk8_4) continue;
+            total_props++;
 
-            // Distance to collector
             f32 dx = (f32)p->unk4[0] - px;
             f32 dy = (f32)p->unk4[1] - py;
             f32 dz = (f32)p->unk4[2] - pz;
@@ -429,7 +430,12 @@ RECOMP_EXPORT void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, 
         }
     }
 
+    recomp_printf("[HIDE-PROP] pos=(%.0f,%.0f,%.0f) visible_props=%d best_dist=%.0f found=%d\n",
+        px, py, pz, total_props, best_dist, best_prop ? 1 : 0);
+
     if (best_prop) {
+        recomp_printf("[HIDE-PROP] hiding prop at (%d,%d,%d)\n",
+            best_prop->unk4[0], best_prop->unk4[1], best_prop->unk4[2]);
         best_prop->spriteProp.unk8_4 = FALSE;
     }
 }
