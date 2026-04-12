@@ -52,7 +52,6 @@ extern void bkrecomp_setup_custom_skinning(ModelSkinningData* skinning_data, u32
 extern void *animBinCache_get(enum asset_e asset_id);
 extern void animationFile_getBoneTransformList(void *anim_file, f32 progress, void *bone_list);
 extern void *boneTransformList_new(void);
-extern void modelRender_setBoneTransformList(void *bone_list);
 extern void boneTransformList_interpolate(void *result, void *start, void *end, f32 t);
 extern f32 time_getDelta(void);
 extern f32 mapModel_getFloorY(f32 pos[3]);
@@ -63,22 +62,16 @@ extern void func_802589E4(f32 dst[3], f32 angle, f32 magnitude);
 extern f32 mlNormalizeAngle(f32 angle);
 
 #define MAX_PLAYERS 4
-#define BLEND_DURATION 0.15f
 
 typedef struct {
     void *shadow_model;
-    void *bone_current;   // Ghost's own bone buffer
-    void *bone_prev;      // Previous pose for blending
-    void *bone_render;    // Blended result for rendering
+    void *bone_save;      // Buffer to save/restore local player's bones
     u16 current_anim;
-    u16 prev_anim;
     f32 smooth_yaw;
     f32 ghost_timer;
-    f32 blend_timer;
     f32 ground_y;
     u8 prev_bs_state;
     u8 dust_cooldown;
-    bool blending;
     bool initialized;
 } GhostModel;
 
@@ -162,39 +155,19 @@ static void ghost_setup_all_model_nodes(bool kazooie_head, bool kazooie_wings, b
     func_8033A45C(0x29, 1);
 }
 
-// Capture current pose into bone_prev for blending
-static void ghost_prepare_blend(GhostModel *gm) {
-    void *anim_file = animBinCache_get(gm->current_anim);
-    if (anim_file) {
-        animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_prev);
-    }
-    gm->blend_timer = 0.0f;
-    gm->blending = TRUE;
-}
 
 static void ghost_ensure_init(u32 pid) {
     GhostModel *gm = &ghost_models[pid];
     if (gm->initialized) return;
 
     gm->shadow_model = assetcache_get(ASSET_3BF_MODEL_PLAYER_SHADOW);
-    gm->bone_current = boneTransformList_new();
-    gm->bone_prev = boneTransformList_new();
-    gm->bone_render = boneTransformList_new();
-    if (!gm->bone_current || !gm->bone_prev || !gm->bone_render) return;
-
-    void *anim_file = animBinCache_get(ASSET_6F_ANIM_BSSTAND_IDLE);
-    if (anim_file) {
-        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_current);
-        animationFile_getBoneTransformList(anim_file, 0.0f, gm->bone_prev);
-    }
+    gm->bone_save = boneTransformList_new();
+    if (!gm->bone_save) return;
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
-    gm->prev_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
     gm->ground_y = 0.0f;
-    gm->blend_timer = BLEND_DURATION;
-    gm->blending = FALSE;
     gm->initialized = TRUE;
 }
 
@@ -222,15 +195,10 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         if (!gm->initialized) continue;
 
         // === Direct animation mirror from local player's AnimCtrl ===
-        if (rs.animation_id != gm->current_anim) {
-            recomp_printf("[Ghost%d] Anim change: 0x%03X → 0x%03X timer=%.3f bs=0x%02X\n",
-                pid, gm->current_anim, rs.animation_id, rs.anim_timer, rs.bs_state);
-            ghost_prepare_blend(gm);
-            gm->prev_anim = gm->current_anim;
-            gm->current_anim = rs.animation_id;
-            gm->blend_timer = 0.0f;
-            gm->blending = TRUE;
-        }
+        // Direct mirror: animation and timer come straight from sender's AnimCtrl.
+        // No ghost-side blending needed — the sender's AnimCtrl already handles
+        // smooth transitions (transition_duration) and the timer reflects that.
+        gm->current_anim = rs.animation_id;
         gm->ghost_timer = rs.anim_timer;
 
         // Kazooie visibility from packed flags
@@ -334,28 +302,36 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         gm->prev_bs_state = rs.bs_state;
 
-        // === Load bone_current from received animation state ===
-        {
-            void *anim_file = animBinCache_get(gm->current_anim);
-            if (anim_file) {
-                animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_current);
-            } else {
-                recomp_printf("[Ghost%d] WARNING: animBinCache_get(0x%03X) returned NULL!\n",
-                    pid, gm->current_anim);
-            }
+        // Yaw compensation: btrot and longleg use PLAYER_MODEL_DIR_KAZOOIE which
+        // flips the model 180°. The sender's yaw_get() includes this flip (+180°),
+        // but the ghost renders without baModelDirection. Undo the flip for these states.
+        f32 target_yaw = rs.yaw;
+        bool kazooie_direction = (rs.bs_state == BS_14_BTROT_ENTER
+            || rs.bs_state == BS_15_BTROT_IDLE || rs.bs_state == BS_16_BTROT_WALK
+            || rs.bs_state == BS_17_BTROT_EXIT || rs.bs_state == BS_8_BTROT_JUMP
+            || rs.bs_state == BS_25_LONGLEG_ENTER || rs.bs_state == BS_26_LONGLEG_IDLE
+            || rs.bs_state == BS_LONGLEG_WALK || rs.bs_state == BS_LONGLEG_JUMP
+            || rs.bs_state == BS_LONGLEG_EXIT);
+        if (kazooie_direction) {
+            target_yaw = mlNormalizeAngle(target_yaw - 180.0f);
         }
 
-        // Advance blend timer
-        f32 dt = time_getDelta();
-        if (gm->blending) {
-            gm->blend_timer += dt;
-            if (gm->blend_timer >= BLEND_DURATION) {
-                gm->blending = FALSE;
-            }
-        }
+        // Yaw interpolation speed.
+        // Large yaw changes (>90°) are applied instantly — game-triggered flips
+        // (bsturn_end does yaw-=180°) that should not be visually interpolated.
+        f32 yaw_diff = target_yaw - gm->smooth_yaw;
+        while (yaw_diff > 180.0f) yaw_diff -= 360.0f;
+        while (yaw_diff < -180.0f) yaw_diff += 360.0f;
+        bool large_yaw_change = (yaw_diff > 90.0f || yaw_diff < -90.0f);
 
-        // Yaw (faster during skid)
-        f32 yaw_speed = (rs.bs_state == BS_SKID) ? 0.7f : 0.25f;
+        f32 yaw_speed;
+        if (large_yaw_change) {
+            yaw_speed = 1.0f;
+        } else if (rs.bs_state == BS_SKID) {
+            yaw_speed = 0.7f;
+        } else {
+            yaw_speed = 0.25f;
+        }
 
         // Ground tracking
         bool on_ground = (rs.bs_state == BS_1_IDLE || rs.bs_state == BS_0_NONE
@@ -367,7 +343,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             || rs.bs_state == BS_20_LANDING);
         if (on_ground) gm->ground_y = rs.y;
 
-        gm->smooth_yaw = lerp_angle(gm->smooth_yaw, rs.yaw, yaw_speed);
+        gm->smooth_yaw = lerp_angle(gm->smooth_yaw, target_yaw, yaw_speed);
         f32 pos[3] = {rs.x, rs.y, rs.z};
         f32 rot[3] = {rs.pitch, gm->smooth_yaw, 0.0f};
         f32 ref[3] = {0.0f, 0.0f, 0.0f};
@@ -398,19 +374,13 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             Animation *anim_ptr = anctrl_getAnimPtr(ac);
             void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
             if (bone_buffer) {
-                // Save local bones into ghost's bone_render (used as temp save buffer)
-                boneTransformList_interpolate(gm->bone_render, bone_buffer, bone_buffer, 0.0f);
+                // Save local bones
+                boneTransformList_interpolate(gm->bone_save, bone_buffer, bone_buffer, 0.0f);
 
-                // Write ghost bones into the AnimCtrl's buffer
-                if (gm->blending) {
-                    f32 blend_t = gm->blend_timer / BLEND_DURATION;
-                    if (blend_t > 1.0f) blend_t = 1.0f;
-                    boneTransformList_interpolate(bone_buffer, gm->bone_prev, gm->bone_current, blend_t);
-                } else {
-                    void *anim_file = animBinCache_get(gm->current_anim);
-                    if (anim_file) {
-                        animationFile_getBoneTransformList(anim_file, gm->ghost_timer, bone_buffer);
-                    }
+                // Write ghost bones directly from animation file
+                void *anim_file = animBinCache_get(gm->current_anim);
+                if (anim_file) {
+                    animationFile_getBoneTransformList(anim_file, gm->ghost_timer, bone_buffer);
                 }
 
                 // Force matrix recompute from ghost bones
@@ -437,7 +407,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             Animation *anim_ptr = anctrl_getAnimPtr(ac);
             void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
             if (bone_buffer) {
-                boneTransformList_interpolate(bone_buffer, gm->bone_render, gm->bone_render, 0.0f);
+                boneTransformList_interpolate(bone_buffer, gm->bone_save, gm->bone_save, 0.0f);
             }
         }
     }
