@@ -70,8 +70,10 @@ typedef struct {
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 ground_y;
+    f32 prev_y;           // Previous frame Y for landing detection
     u8 prev_bs_state;
     u8 dust_cooldown;
+    bool bbuster_dust_done; // Prevent bbuster dust from firing twice (impact + bounce)
     bool initialized;
 } GhostModel;
 
@@ -223,7 +225,16 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
                 (gm->prev_bs_state == BS_1_IDLE || gm->prev_bs_state == BS_0_NONE
                 || gm->prev_bs_state == BS_20_LANDING));
             bool direction_change = (rs.bs_state == BS_SKID);
-            bool bbuster_land = (rs.bs_state == BS_20_LANDING && gm->prev_bs_state == BS_F_BBUSTER);
+            // Bbuster impact: fire once when ghost first touches ground during bbuster.
+            // Game triggers func_8029FB30 in bsbbuster_update case 2 on player_isStable().
+            // Reset flag when entering bbuster, fire once on ground contact.
+            if (rs.bs_state == BS_F_BBUSTER && gm->prev_bs_state != BS_F_BBUSTER) {
+                gm->bbuster_dust_done = FALSE;
+            }
+            f32 prev_height = gm->prev_y - gm->ground_y;
+            bool was_airborne = (prev_height >= 30.0f);
+            bool bbuster_land = (rs.bs_state == BS_F_BBUSTER && on_ground
+                && was_airborne && !gm->bbuster_dust_done);
             bool is_sliding = (rs.bs_state == BS_SLIDE);
             bool is_barge = (rs.bs_state == BS_BBARGE);
             bool btrot_start = (rs.bs_state == BS_16_BTROT_WALK &&
@@ -234,6 +245,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
             if (on_ground && gm->dust_cooldown == 0) {
                 if (bbuster_land) {
+                    // Mirrors func_8029FB30: 2 rings of 6 puffs each at 60° intervals
                     f32 i;
                     for (i = 0.0f; i < 359.0f; i += 60.0f) {
                         f32 vel[3];
@@ -247,6 +259,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
                         vel[1] = 40.0f;
                         func_80352CF4(dust_pos, vel, 150.0f, 10.0f);
                     }
+                    gm->bbuster_dust_done = TRUE;
                     gm->dust_cooldown = 15;
                 } else if (is_sliding) {
                     static s32 slide_phase = 0;
@@ -301,6 +314,7 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         }
 
         gm->prev_bs_state = rs.bs_state;
+        gm->prev_y = rs.y;
 
         // Yaw compensation: btrot and longleg use PLAYER_MODEL_DIR_KAZOOIE which
         // flips the model 180°. The sender's yaw_get() includes this flip (+180°),
