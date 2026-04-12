@@ -7,27 +7,30 @@
 // These functions are called from game patches (game thread) via REGISTER_FUNC.
 
 // NetFullState struct layout (must match patches/network_patches.c):
-// Offset  Field               Size
-// 0x00    f32 x               4
-// 0x04    f32 y               4
-// 0x08    f32 z               4
-// 0x0C    f32 yaw             4
-// 0x10    f32 pitch           4
-// 0x14    f32 scale           4
-// 0x18    u32 map_id          4
-// 0x1C    u16 animation_id    2
-// 0x1E    (pad)               2
-// 0x20    f32 anim_timer      4
-// 0x24    f32 anim_duration   4
-// 0x28    u8  anim_playback   1
-// 0x29    u8  health          1
-// 0x2A    u8  health_total    1
-// 0x2B    u8  lives           1
-// 0x2C    u8  transformation  1
-// 0x2D    u8  bs_state        1
-// 0x2E    u8  _pad[2]         2
-// 0x30    f32 horizontal_velocity 4
-// Total: 0x34 (52 bytes)
+// Offset  Field                    Size
+// 0x00    f32 x                    4
+// 0x04    f32 y                    4
+// 0x08    f32 z                    4
+// 0x0C    f32 yaw                  4
+// 0x10    f32 pitch                4
+// 0x14    f32 scale                4
+// 0x18    u32 map_id               4
+// 0x1C    u16 animation_id         2
+// 0x1E    (pad)                    2
+// 0x20    f32 anim_timer           4
+// 0x24    f32 anim_duration        4
+// 0x28    u8  anim_playback_type   1
+// 0x29    u8  health               1
+// 0x2A    u8  health_total         1
+// 0x2B    u8  lives                1
+// 0x2C    u8  transformation       1
+// 0x2D    u8  bs_state             1
+// 0x2E    u8  kazooie_flags        1
+// 0x2F    u8  _pad                 1
+// 0x30    f32 horizontal_velocity  4
+// 0x34    f32 anim_subrange_start  4
+// 0x38    f32 anim_subrange_end    4
+// Total: 0x3C (60 bytes)
 
 static inline float read_f32(uint8_t* rdram, gpr addr, int offset) {
     u32 raw = MEM_W(offset, addr);
@@ -64,7 +67,10 @@ extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx) 
     snap.lives        = MEM_BU(0x2B, state_ptr);
     snap.transformation = MEM_BU(0x2C, state_ptr);
     snap.bs_state     = MEM_BU(0x2D, state_ptr);
+    snap.kazooie_flags = MEM_BU(0x2E, state_ptr);
     snap.horizontal_velocity = read_f32(rdram, state_ptr, 0x30);
+    snap.anim_subrange_start = read_f32(rdram, state_ptr, 0x34);
+    snap.anim_subrange_end   = read_f32(rdram, state_ptr, 0x38);
 
     bknet::NetworkManager::instance().push_local_full_state(snap);
 }
@@ -114,7 +120,10 @@ extern "C" void recomp_net_get_remote_state(uint8_t* rdram, recomp_context* ctx)
         MEM_BU(0x2B, out_ptr) = 0; // lives
         MEM_BU(0x2C, out_ptr) = state.transformation;
         MEM_BU(0x2D, out_ptr) = state.bs_state;
+        MEM_BU(0x2E, out_ptr) = state.kazooie_flags;
         write_f32(rdram, out_ptr, 0x30, state.horizontal_velocity);
+        write_f32(rdram, out_ptr, 0x34, state.anim_subrange_start);
+        write_f32(rdram, out_ptr, 0x38, state.anim_subrange_end);
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

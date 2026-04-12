@@ -19,7 +19,10 @@ struct PositionSnapshot {
     uint16_t animation_id = 0;
     float anim_timer = 0.0f;
     float anim_duration = 1.0f;
+    float anim_subrange_start = 0.0f;
+    float anim_subrange_end = 1.0f;
     uint8_t anim_playback_type = 0;
+    uint8_t kazooie_flags = 0;
     uint8_t health = 0;
     uint8_t health_total = 0;
     uint8_t lives = 0;
@@ -39,7 +42,10 @@ struct InterpolatedState {
     uint16_t animation_id = 0;
     float anim_timer = 0.0f;
     float anim_duration = 1.0f;
+    float anim_subrange_start = 0.0f;
+    float anim_subrange_end = 1.0f;
     uint8_t anim_playback_type = 0;
+    uint8_t kazooie_flags = 0;
     uint8_t health = 0;
     uint8_t transformation = 0;
     uint8_t bs_state = 0;

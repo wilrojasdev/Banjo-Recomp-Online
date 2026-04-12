@@ -105,6 +105,11 @@ struct PlayerStatePacket {
     uint32_t map_id;
     uint16_t animation_id;
     float anim_progress;
+    float anim_duration;
+    float anim_subrange_start;
+    float anim_subrange_end;
+    uint8_t anim_playback_type;
+    uint8_t kazooie_flags;
     uint8_t health;
     uint8_t health_total;
     uint8_t lives;

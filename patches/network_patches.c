@@ -7,32 +7,44 @@
 extern AnimCtrl *baanim_getAnimCtrlPtr(void);
 extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
 extern f32 anctrl_getDuration(AnimCtrl *this);
+extern f32 anctrl_getAnimTimer(AnimCtrl *this);
+extern enum asset_e anctrl_getIndex(AnimCtrl *this);
+extern enum anctrl_playback_e anctrl_getPlaybackType(AnimCtrl *this);
+extern void anctrl_getSubRange(AnimCtrl *this, f32 *startPtr, f32 *endPtr);
 
 extern enum map_e map_get(void);
 extern s32 bs_getState(void);
 extern u32 player_getTransformation(void);
 extern f32 baphysics_get_horizontal_velocity(void);
 
+// Kazooie visibility globals (from core2/code_16C60.c)
+extern u8 D_8037D235; // Kazooie feet
+extern u8 D_8037D236; // Kazooie wings
+extern u8 D_8037D238; // Kazooie head
+
 // Full local player state struct passed to C++ side via pointer.
 // Must match the layout expected in net_recomp_api.cpp.
 typedef struct {
-    f32 x, y, z;
-    f32 yaw;
-    f32 pitch;
-    f32 scale;
-    u32 map_id;
-    u16 animation_id;
-    f32 anim_timer;
-    f32 anim_duration;
-    u8  anim_playback_type;
-    u8  health;
-    u8  health_total;
-    u8  lives;
-    u8  transformation;
-    u8  bs_state;
-    u8  _pad[2]; // alignment
-    f32 horizontal_velocity;
-} NetFullState;
+    f32 x, y, z;                // 0x00
+    f32 yaw;                    // 0x0C
+    f32 pitch;                  // 0x10
+    f32 scale;                  // 0x14
+    u32 map_id;                 // 0x18
+    u16 animation_id;           // 0x1C
+    f32 anim_timer;             // 0x20
+    f32 anim_duration;          // 0x24
+    u8  anim_playback_type;     // 0x28
+    u8  health;                 // 0x29
+    u8  health_total;           // 0x2A
+    u8  lives;                  // 0x2B
+    u8  transformation;         // 0x2C
+    u8  bs_state;               // 0x2D
+    u8  kazooie_flags;          // 0x2E — bit0=head, bit1=wings, bit2=feet
+    u8  _pad;                   // 0x2F
+    f32 horizontal_velocity;    // 0x30
+    f32 anim_subrange_start;    // 0x34
+    f32 anim_subrange_end;      // 0x38
+} NetFullState; // 0x3C (60 bytes)
 
 // Networking bridge functions (registered on C++ side via REGISTER_FUNC)
 void recomp_net_push_full_state(NetFullState* state);
@@ -57,47 +69,36 @@ static void net_sync_local_state(void) {
     state.y = pos[1];
     state.z = pos[2];
     state.yaw = yaw_get();
-    state.pitch = 0.0f; // TODO: get pitch when available
+    state.pitch = 0.0f;
     state.scale = 1.0f;
     state.map_id = (u32)map_get();
     state.bs_state = (u8)bs_getState();
     state.transformation = (u8)player_getTransformation();
     state.horizontal_velocity = baphysics_get_horizontal_velocity();
 
-    // Map BS state to animation asset ID
-    s32 bs = bs_getState();
-    u16 anim = ASSET_6F_ANIM_BSSTAND_IDLE; // default idle
-    u8 playback = 2; // ANIMCTRL_LOOP
-    switch (bs) {
-        case BS_1_IDLE:       anim = ASSET_6F_ANIM_BSSTAND_IDLE; playback = 2; break;
-        case BS_2_WALK_SLOW:  anim = ASSET_2_ANIM_BSWALK_CREEP;  playback = 2; break;
-        case BS_WALK:         anim = ASSET_3_ANIM_BSWALK;         playback = 2; break;
-        case BS_4_WALK_FAST:  anim = ASSET_C_ANIM_BSWALK_RUN;    playback = 2; break;
-        case BS_5_JUMP:       anim = ASSET_8_ANIM_BSJUMP;         playback = 1; break;
-        case BS_CLAW:         anim = ASSET_5_ANIM_BSPUNCH;        playback = 1; break;
-        case BS_CROUCH:       anim = ASSET_1_ANIM_BSCROUCH_ENTER; playback = 1; break;
-        case BS_F_BBUSTER:    anim = ASSET_1D_ANIM_BSBBUSTER;     playback = 1; break;
-        case BS_BFLAP:        anim = ASSET_17_ANIM_BSBFLAP;       playback = 2; break;
-        case BS_11_BPECK:     anim = ASSET_1A_ANIM_BSBPECK;       playback = 2; break;
-        case BS_BBARGE:       anim = ASSET_1C_ANIM_BSBBARGE;      playback = 1; break;
-        case BS_15_BTROT_IDLE: anim = ASSET_26_ANIM_BSBTROT_IDLE; playback = 2; break;
-        case BS_16_BTROT_WALK: anim = ASSET_15_ANIM_BSBTROT_WALK; playback = 2; break;
-        case BS_E_OW:         anim = ASSET_F_ANIM_BSREBOUND;      playback = 1; break;
-        default:              anim = ASSET_6F_ANIM_BSSTAND_IDLE;  playback = 2; break;
-    }
-    state.animation_id = anim;
-    state.anim_timer = 0.0f;
-    state.anim_duration = 0.5f;
-    state.anim_playback_type = playback;
+    // Read REAL animation state directly from AnimCtrl
+    AnimCtrl *ac = baanim_getAnimCtrlPtr();
+    state.animation_id = (u16)anctrl_getIndex(ac);
+    state.anim_timer = anctrl_getAnimTimer(ac);
+    state.anim_duration = anctrl_getDuration(ac);
+    state.anim_playback_type = (u8)anctrl_getPlaybackType(ac);
 
-    // Items: These require item_getCount which is a game function
-    // For now, use placeholders until item access is resolved
+    f32 sub_start = 0.0f, sub_end = 1.0f;
+    anctrl_getSubRange(ac, &sub_start, &sub_end);
+    state.anim_subrange_start = sub_start;
+    state.anim_subrange_end = sub_end;
+
+    // Pack kazooie visibility into flags
+    state.kazooie_flags = (D_8037D238 ? 1 : 0)
+                        | (D_8037D236 ? 2 : 0)
+                        | (D_8037D235 ? 4 : 0);
+
+    // Items: placeholders until item access is resolved
     state.health = 0;
     state.health_total = 0;
     state.lives = 0;
 
     recomp_net_push_full_state(&state);
-
 }
 
 
@@ -107,7 +108,6 @@ extern void bkrecomp_net_manage_ghosts(void);
 // @recomp Export: called from ncCamera_update each game frame.
 RECOMP_EXPORT void bkrecomp_net_sync_frame(void) {
     net_sync_local_state();
-
 
     // Manage ghost actors (spawn/despawn/update)
     bkrecomp_net_manage_ghosts();

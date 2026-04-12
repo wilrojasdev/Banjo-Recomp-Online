@@ -45,7 +45,10 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
         r.animation_id = s->animation_id;
         r.anim_timer = s->anim_timer;
         r.anim_duration = s->anim_duration;
+        r.anim_subrange_start = s->anim_subrange_start;
+        r.anim_subrange_end = s->anim_subrange_end;
         r.anim_playback_type = s->anim_playback_type;
+        r.kazooie_flags = s->kazooie_flags;
         r.health = s->health;
         r.transformation = s->transformation;
         r.bs_state = s->bs_state;
@@ -94,7 +97,10 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
             result.animation_id = b->animation_id;
             result.anim_timer = b->anim_timer;
             result.anim_duration = b->anim_duration;
+            result.anim_subrange_start = b->anim_subrange_start;
+            result.anim_subrange_end = b->anim_subrange_end;
             result.anim_playback_type = b->anim_playback_type;
+            result.kazooie_flags = b->kazooie_flags;
             result.health = b->health;
             result.transformation = b->transformation;
             result.bs_state = b->bs_state;

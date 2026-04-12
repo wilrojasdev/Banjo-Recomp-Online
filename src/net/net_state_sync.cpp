@@ -46,6 +46,11 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     out.map_id = snapshot_.map_id;
     out.animation_id = snapshot_.animation_id;
     out.anim_progress = snapshot_.anim_timer;
+    out.anim_duration = snapshot_.anim_duration;
+    out.anim_subrange_start = snapshot_.anim_subrange_start;
+    out.anim_subrange_end = snapshot_.anim_subrange_end;
+    out.anim_playback_type = snapshot_.anim_playback_type;
+    out.kazooie_flags = snapshot_.kazooie_flags;
     out.health = snapshot_.health;
     out.health_total = snapshot_.health_total;
     out.lives = snapshot_.lives;

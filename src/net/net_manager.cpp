@@ -250,8 +250,11 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
     snap.map_id = pkt.map_id;
     snap.animation_id = pkt.animation_id;
     snap.anim_timer = pkt.anim_progress;
-    snap.anim_duration = 1.0f;
-    snap.anim_playback_type = 2; // LOOP
+    snap.anim_duration = pkt.anim_duration;
+    snap.anim_subrange_start = pkt.anim_subrange_start;
+    snap.anim_subrange_end = pkt.anim_subrange_end;
+    snap.anim_playback_type = pkt.anim_playback_type;
+    snap.kazooie_flags = pkt.kazooie_flags;
     snap.health = pkt.health;
     snap.health_total = pkt.health_total;
     snap.transformation = pkt.transformation;
