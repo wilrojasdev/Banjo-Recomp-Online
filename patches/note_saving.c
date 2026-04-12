@@ -397,6 +397,43 @@ RECOMP_EXPORT void bkrecomp_net_hide_note(u32 note_index) {
     }
 }
 
+// Hide the nearest visible sprite prop near a given position.
+// Used for non-shared collectibles (eggs, feathers) that are sprite props.
+// Does NOT check asset ID (func_8032DE78 crashes on some props).
+// Uses tight radius (150 units) so only the item the player just touched is hidden.
+RECOMP_EXPORT void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz) {
+    if (!sCubeList.cubes || sCubeList.cubeCnt <= 0) return;
+
+    f32 best_dist = 150.0f * 150.0f;  // Max search radius squared
+    Prop *best_prop = (Prop*)0;
+    s32 i, j;
+
+    for (i = 0; i < sCubeList.cubeCnt; i++) {
+        Cube *cube = &sCubeList.cubes[i];
+        if (!cube->prop2Ptr || cube->prop2Cnt <= 0) continue;
+
+        for (j = 0; j < cube->prop2Cnt; j++) {
+            Prop *p = &cube->prop2Ptr[j];
+            // Only visible, non-actor sprite props
+            if (p->spriteProp.is_actor || p->spriteProp.is_3d || !p->spriteProp.unk8_4) continue;
+
+            // Distance to collector
+            f32 dx = (f32)p->unk4[0] - px;
+            f32 dy = (f32)p->unk4[1] - py;
+            f32 dz = (f32)p->unk4[2] - pz;
+            f32 dist = dx*dx + dy*dy + dz*dz;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_prop = p;
+            }
+        }
+    }
+
+    if (best_prop) {
+        best_prop->spriteProp.unk8_4 = FALSE;
+    }
+}
+
 // Network bridge for note collection events
 extern u32 recomp_net_is_connected(void);
 extern void recomp_net_send_collectible(u32 type, u32 id, u32 collected, u32 map_id, u32 level_id);

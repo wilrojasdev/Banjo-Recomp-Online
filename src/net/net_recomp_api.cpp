@@ -204,6 +204,9 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
                 MEM_BU(0x08, out_ptr) = evt.collectible.collected;
                 MEM_W(0x0C, out_ptr) = evt.collectible.map_id;
                 MEM_BU(0x10, out_ptr) = evt.collectible.level_id;
+                write_f32(rdram, out_ptr, 0x14, evt.collectible.pos_x);
+                write_f32(rdram, out_ptr, 0x18, evt.collectible.pos_y);
+                write_f32(rdram, out_ptr, 0x1C, evt.collectible.pos_z);
                 break;
             case bknet::NetworkManager::WorldEvent::ENEMY:
                 MEM_HU(0x04, out_ptr) = evt.enemy.marker_type;

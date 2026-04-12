@@ -143,8 +143,9 @@ struct WorldCollectiblePacket {
     uint8_t collectible_type;   // CollectibleType enum
     uint16_t collectible_id;    // jiggy_e, note_index, jinjo bitmask, mumbotoken_e
     uint8_t collected;          // 1=collected
-    uint32_t map_id;            // Which map (needed for notes)
-    uint8_t level_id;           // Which level (needed for notes)
+    uint32_t map_id;            // Which map
+    uint8_t level_id;           // Which level
+    float pos_x, pos_y, pos_z;  // Player position at time of collection (for proximity despawn)
 };
 
 struct WorldEnemyPacket {

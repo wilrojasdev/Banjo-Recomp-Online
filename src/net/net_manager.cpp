@@ -374,6 +374,9 @@ void NetworkManager::handle_map_change_packet(const MapChangePacket& pkt) {
 void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id) {
     if (!is_connected()) return;
 
+    // Get local player position for proximity-based despawn
+    auto snap = state_sync_.read_local_state();
+
     WorldCollectiblePacket pkt{};
     pkt.header.type = PacketType::WorldCollectible;
     pkt.header.player_id = local_player_id_;
@@ -383,6 +386,9 @@ void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collect
     pkt.collected = collected;
     pkt.map_id = map_id;
     pkt.level_id = level_id;
+    pkt.pos_x = snap.position[0];
+    pkt.pos_y = snap.position[1];
+    pkt.pos_z = snap.position[2];
 
     if (server_) {
         server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
