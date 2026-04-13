@@ -9,9 +9,6 @@ u32  recomp_net_pop_world_event(void *out);
 u32  recomp_net_is_connected(void);
 u32  recomp_net_is_host(void);
 u32  recomp_net_am_i_world_owner(u32 level_id);
-void recomp_net_send_owner_transfer(u32 level_id, void *killed_data, u32 count);
-u32  recomp_net_pop_owner_transfer(void *out);
-u32  recomp_net_should_resend_kills(void);
 void recomp_net_send_enemy_positions(void *buf, u32 count, u32 map_id);
 void recomp_net_get_enemy_positions(void *buf, u32 *count);
 u32  recomp_net_should_send_full_sync(u8 *out_player_id);
@@ -732,7 +729,8 @@ static void process_collectible_event(WorldEventData *evt) {
 // Enemy event layout (matches net_recomp_api.cpp ENEMY case output):
 typedef struct {
     u8  event_type;        // 0x00
-    u8  _pad[3];           // 0x01-0x03
+    u8  sender_id;         // 0x01 — 0xFF = resync (silent kill, no animation/honeycomb)
+    u8  _pad[2];           // 0x02-0x03
     u16 enemy_marker_type; // 0x04
     u16 enemy_spawn_index; // 0x06
     u32 enemy_map_id;      // 0x08
@@ -765,13 +763,8 @@ static void process_enemy_event(EnemyEventData *evt) {
 
     u16 target_marker = evt->enemy_marker_type;
     u16 target_spawn = evt->enemy_spawn_index;
-    f32 pos[3];
-    pos[0] = evt->enemy_pos_x;
-    pos[1] = evt->enemy_pos_y;
-    pos[2] = evt->enemy_pos_z;
+    bool is_resync = (evt->sender_id == 0xFF);
 
-    // Remote kill: trigger death animation via dieFunc.
-    // Suppress AI first so local state doesn't interfere with the death sequence.
     if (suBaddieActorArray) {
         s32 i;
         for (i = 0; i < suBaddieActorArray->cnt; i++) {
@@ -781,33 +774,33 @@ static void process_enemy_event(EnemyEventData *evt) {
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
             if (si != target_spawn) continue;
 
-            // Spawn 1 honeycomb at enemy position (remote side doesn't get it from collision)
-            {
-                f32 drop_pos[3];
-                drop_pos[0] = actor->position[0];
-                drop_pos[1] = actor->position[1] + 50.0f;
-                drop_pos[2] = actor->position[2];
-                bundle_setYaw(actor->yaw);
-                D_8036E564 = 1;
-                bundle_spawn_f32(BUNDLE_14__HONEYCOMB, drop_pos);
-            }
-
-            // Stop position override so death animation can play at current position
-            mark_dying(target_spawn);
-
-            // Let AI run — it will process the death state set by dieFunc,
-            // play the full death animation, and despawn the actor when done.
-
-            // Restore original dieFunc and call it
-            MarkerCollisionFunc die = actor->marker->dieFunc;
-            if (die == (MarkerCollisionFunc)net_enemy_die_proxy) {
-                die = get_saved_diefunc(target_spawn);
-            }
-            if (die) {
-                actor->marker->dieFunc = die;
-                die(actor->marker, baMarker_get());
-            } else {
+            if (is_resync) {
+                // Silent despawn — enemy was already killed, just remove on re-entry
                 marker_despawn(actor->marker);
+            } else {
+                // Real-time kill: honeycomb + death animation
+                {
+                    f32 drop_pos[3];
+                    drop_pos[0] = actor->position[0];
+                    drop_pos[1] = actor->position[1] + 50.0f;
+                    drop_pos[2] = actor->position[2];
+                    bundle_setYaw(actor->yaw);
+                    D_8036E564 = 1;
+                    bundle_spawn_f32(BUNDLE_14__HONEYCOMB, drop_pos);
+                }
+
+                mark_dying(target_spawn);
+
+                MarkerCollisionFunc die = actor->marker->dieFunc;
+                if (die == (MarkerCollisionFunc)net_enemy_die_proxy) {
+                    die = get_saved_diefunc(target_spawn);
+                }
+                if (die) {
+                    actor->marker->dieFunc = die;
+                    die(actor->marker, baMarker_get());
+                } else {
+                    marker_despawn(actor->marker);
+                }
             }
             break;
         }
@@ -1011,25 +1004,9 @@ static void check_full_sync_send(void) {
     data.lives = (u8)item_getCount(ITEM_16_LIFE);
 
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
-    recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d, killed=%d)\n",
-        target_player, data.map_id, killed_on_map_count);
-
-    // Re-send all killed enemies in current level so the new join can despawn them
-    if (killed_on_map_count > 0) {
-        s32 k;
-        for (k = 0; k < killed_on_map_count; k++) {
-            f32 pos[3];
-            pos[0] = killed_on_map[k].pos_x;
-            pos[1] = killed_on_map[k].pos_y;
-            pos[2] = killed_on_map[k].pos_z;
-            recomp_net_send_enemy_death(
-                (u32)killed_on_map[k].marker_type,
-                (u32)killed_on_map[k].spawn_index,
-                killed_on_map[k].map_id, pos);
-            recomp_printf("[STATE-SYNC] re-sent kill: marker=0x%X spawn=%d map=%d\n",
-                killed_on_map[k].marker_type, killed_on_map[k].spawn_index, killed_on_map[k].map_id);
-        }
-    }
+    recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d)\n",
+        target_player, data.map_id);
+    // Killed enemies are now sent from C++ centralized tracking (level_kills_)
 }
 
 // Join: apply received full state from host
@@ -1138,105 +1115,7 @@ static void check_full_sync_receive(void) {
     processing_remote = FALSE;
 }
 
-// Track previous level for ownership transfer detection
-static u32 prev_owner_level = 0xFFFFFFFF;
-
-// Send killed enemy data when leaving a world where we had kills.
-// Don't check current ownership — C++ transfers ownership BEFORE this runs,
-// so am_i_world_owner(prev_level) would already be false.
-// If we have killed_on_map data, we WERE the owner and should send it.
-static void check_ownership_transfer_send(void) {
-    u32 cur_level = (u32)level_get();
-    if (cur_level == prev_owner_level) return;
-
-    // Level changed — send our killed data if we have any
-    if (prev_owner_level != 0xFFFFFFFF && killed_on_map_count > 0) {
-        recomp_net_send_owner_transfer(prev_owner_level,
-            killed_on_map, (u32)killed_on_map_count);
-        recomp_printf("[OWNER-XFER] sent %d killed enemies for level %d\n",
-            killed_on_map_count, prev_owner_level);
-    }
-    prev_owner_level = cur_level;
-}
-
-// Receive ownership transfer data (we became the new owner)
-typedef struct {
-    u32 level_id;       // 0x00
-    u8  count;          // 0x04
-    u8  _pad[3];        // 0x05-0x07
-    struct {
-        u16 marker_type;  // +0x00
-        u16 spawn_index;  // +0x02
-        f32 pos_x;        // +0x04
-        f32 pos_y;        // +0x08
-        f32 pos_z;        // +0x0C
-        u32 map_id;       // +0x10
-    } entries[64];      // 0x08+, 20 bytes each
-} OwnerTransferData;
-
-static void check_ownership_transfer_receive(void) {
-    static OwnerTransferData xfer;  // static: too large for MIPS stack (1288 bytes)
-    if (!recomp_net_pop_owner_transfer(&xfer)) return;
-
-    u32 cur_level = (u32)level_get();
-    if (xfer.level_id != cur_level) {
-        recomp_printf("[OWNER-XFER] received transfer for level %d but we're on %d, ignoring\n",
-            xfer.level_id, cur_level);
-        return;
-    }
-
-    // Add ALL received kills to pending_kills for persistent despawn.
-    // Don't try to despawn immediately — enemies may not be fully loaded yet.
-    // The pending_kills system runs every frame and catches enemies as they load.
-    recomp_printf("[OWNER-XFER] received %d killed enemies for level %d\n", xfer.count, xfer.level_id);
-    s32 k;
-    for (k = 0; k < (s32)xfer.count; k++) {
-        u16 mt = xfer.entries[k].marker_type;
-        u16 si = xfer.entries[k].spawn_index;
-        u32 mid = xfer.entries[k].map_id;
-
-        // Add to killed_on_map (dedup)
-        if (killed_on_map_count < MAX_KILLED_ON_MAP) {
-            bool dup_km = FALSE;
-            s32 d;
-            for (d = 0; d < killed_on_map_count; d++) {
-                if (killed_on_map[d].marker_type == mt && killed_on_map[d].spawn_index == si) {
-                    dup_km = TRUE;
-                    break;
-                }
-            }
-            if (!dup_km) {
-                s32 idx = killed_on_map_count;
-                killed_on_map[idx].marker_type = mt;
-                killed_on_map[idx].spawn_index = si;
-                killed_on_map[idx].pos_x = xfer.entries[k].pos_x;
-                killed_on_map[idx].pos_y = xfer.entries[k].pos_y;
-                killed_on_map[idx].pos_z = xfer.entries[k].pos_z;
-                killed_on_map[idx].map_id = mid;
-                killed_on_map_count = idx + 1;
-            }
-        }
-
-        // Add to pending_kills (dedup) — will be applied every frame
-        if (pending_kill_count < MAX_PENDING_KILLS) {
-            bool dup_pk = FALSE;
-            s32 p;
-            for (p = 0; p < pending_kill_count; p++) {
-                if (pending_kills[p].marker_type == mt && pending_kills[p].spawn_index == si) {
-                    dup_pk = TRUE;
-                    break;
-                }
-            }
-            if (!dup_pk) {
-                pending_kills[pending_kill_count].marker_type = mt;
-                pending_kills[pending_kill_count].spawn_index = si;
-                pending_kills[pending_kill_count].map_id = mid;
-                pending_kill_count++;
-                recomp_printf("[OWNER-XFER] added pending kill: marker=0x%X spawn=%d map=%d\n", mt, si, mid);
-            }
-        }
-    }
-}
+// Ownership transfer send/receive REMOVED — centralized kill tracking in C++ handles this.
 
 // Track map/level changes for ALL players to reset cached state
 static u32 prev_global_level = 0xFFFFFFFF;
@@ -1260,18 +1139,7 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
         }
     }
 
-    // Ownership transfer
-    check_ownership_transfer_send();
-    check_ownership_transfer_receive();
-
-    // Kill resync: if we're the owner and another player entered our level,
-    // re-send killed enemies as a transfer packet (silent despawn, no animation/honeycomb).
-    if (recomp_net_should_resend_kills() && killed_on_map_count > 0) {
-        u32 cur_level = (u32)level_get();
-        recomp_net_send_owner_transfer(cur_level, killed_on_map, (u32)killed_on_map_count);
-        recomp_printf("[KILL-RESYNC] re-sent %d kills as owner for level %d\n",
-            killed_on_map_count, cur_level);
-    }
+    // Kill tracking is now centralized in C++ — no MIPS-side transfer/resync needed.
 
     // Full state sync (runs once when new player joins)
     check_full_sync_send();

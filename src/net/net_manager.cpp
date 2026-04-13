@@ -134,11 +134,16 @@ void NetworkManager::disconnect() {
         std::lock_guard<std::mutex> lock(ownership_mutex_);
         world_owner_.clear();
         for (int i = 0; i < MAX_PLAYERS; i++) player_levels_[i] = 0xFFFFFFFF;
-        owner_transfer_queue_.clear();
+        // owner_transfer_queue_ removed (centralized kill tracking)
     }
     {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         packet_send_queue_.clear();
+        kill_sync_queue_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(kill_mutex_);
+        level_kills_.clear();
     }
 }
 
@@ -152,6 +157,52 @@ void NetworkManager::update() {
     // Flush ALL queued packets from game thread (ENet only safe from SDL thread)
     {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
+
+        // Flush pending kill list syncs (send kill records as death events)
+        while (!kill_sync_queue_.empty()) {
+            uint32_t level_id = kill_sync_queue_.front();
+            kill_sync_queue_.pop_front();
+
+            std::vector<KillRecord> kills;
+            {
+                std::lock_guard<std::mutex> klock(kill_mutex_);
+                auto it = level_kills_.find(level_id);
+                if (it != level_kills_.end()) kills = it->second;
+            }
+
+            for (const auto& k : kills) {
+                WorldEnemyPacket pkt{};
+                pkt.header.type = PacketType::WorldEnemy;
+                pkt.header.player_id = 0xFF; // Special: resync, not from a real player
+                pkt.header.sequence = send_sequence_++;
+                pkt.marker_type = k.marker_type;
+                pkt.spawn_index = k.spawn_index;
+                pkt.map_id = k.map_id;
+                pkt.alive = 0;
+                pkt.health = 0;
+
+                // Send to remote players via network
+                if (server_) {
+                    server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+                } else if (client_) {
+                    client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+                }
+
+                // Also queue locally so the HOST's own game thread processes it
+                {
+                    std::lock_guard<std::mutex> wlock(world_mutex_);
+                    WorldEvent evt{};
+                    evt.type = WorldEvent::ENEMY;
+                    evt.enemy = pkt;
+                    world_events_.push_back(evt);
+                }
+            }
+            if (!kills.empty()) {
+                std::printf("[KillTrack] Sent %zu kills for level %u\n", kills.size(), level_id);
+            }
+        }
+
+        // Flush regular queued packets
         while (!packet_send_queue_.empty()) {
             auto& qp = packet_send_queue_.front();
             if (server_) {
@@ -303,31 +354,8 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             }
             break;
         }
-        case PacketType::WorldOwnerTransfer: {
-            // Variable-size packet — can't use deserialize (checks sizeof full struct).
-            // Minimum: header(4) + level_id(4) + count(1) + pad(3) = 12 bytes
-            if (size >= 12) {
-                WorldOwnerTransferPacket pkt{};
-                std::memcpy(&pkt.header, data, sizeof(PacketHeader));
-                std::memcpy(&pkt.level_id, data + sizeof(PacketHeader), sizeof(uint32_t));
-                pkt.killed_count = data[sizeof(PacketHeader) + 4];
-                size_t entries_offset = sizeof(PacketHeader) + 8;
-                size_t expected = entries_offset + pkt.killed_count * sizeof(KilledEnemyEntry);
-                if (size >= expected && pkt.killed_count <= MAX_KILLED_TRANSFER) {
-                    std::memcpy(pkt.killed, data + entries_offset,
-                                pkt.killed_count * sizeof(KilledEnemyEntry));
-                }
-                handle_owner_transfer_packet(pkt);
-            }
-            break;
-        }
-        case PacketType::WorldKillResync: {
-            WorldKillResyncPacket pkt;
-            if (deserialize(data, size, pkt)) {
-                handle_kill_resync_packet(pkt);
-            }
-            break;
-        }
+        // WorldOwnerTransfer and WorldKillResync — no longer used
+        // (centralized kill tracking in C++ replaces these)
         default:
             break;
     }
@@ -478,6 +506,18 @@ void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collect
 void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz) {
     if (!is_connected()) return;
 
+    // Record locally in centralized kill tracking
+    {
+        uint32_t local_level;
+        {
+            std::lock_guard<std::mutex> lock(ownership_mutex_);
+            local_level = player_levels_[local_player_id_];
+        }
+        if (local_level != 0xFFFFFFFF) {
+            record_kill(local_level, marker_type, spawn_index, map_id);
+        }
+    }
+
     WorldEnemyPacket pkt{};
     pkt.header.type = PacketType::WorldEnemy;
     pkt.header.player_id = local_player_id_;
@@ -520,6 +560,21 @@ void NetworkManager::handle_collectible_packet(const WorldCollectiblePacket& pkt
 
 void NetworkManager::handle_enemy_packet(const WorldEnemyPacket& pkt) {
     if (pkt.header.player_id == local_player_id_) return;
+
+    // Record kill in centralized tracking (HOST is source of truth)
+    // Skip resync packets (player_id 0xFF) — they're already in level_kills_
+    if (pkt.alive == 0 && pkt.header.player_id < MAX_PLAYERS) {
+        uint8_t sender = pkt.header.player_id;
+        uint32_t sender_level;
+        {
+            std::lock_guard<std::mutex> lock(ownership_mutex_);
+            sender_level = player_levels_[sender];
+        }
+        if (sender_level != 0xFFFFFFFF) {
+            record_kill(sender_level, pkt.marker_type, pkt.spawn_index, pkt.map_id);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(world_mutex_);
     WorldEvent evt{};
     evt.type = WorldEvent::ENEMY;
@@ -674,19 +729,15 @@ void NetworkManager::update_player_level(uint8_t player_id, uint32_t level_id) {
 
     // When a player enters a level, re-sync state:
     if (is_host() && level_id != 0xFFFFFFFF) {
-        // For remote players: send collectible scores + host's killed_on_map
+        // For remote players: send collectible scores
         if (player_id != local_player_id_) {
             request_full_sync(player_id);
             std::printf("[Ownership] Requested full sync for player %u entering level %u\n",
                 player_id, level_id);
         }
 
-        // For ANY player entering a level with an existing non-self owner:
-        // Ask the owner to re-broadcast their kills (owner may be on a different machine)
-        uint8_t owner = get_world_owner(level_id);
-        if (owner != 0xFF && owner != player_id) {
-            request_kill_resync(level_id);
-        }
+        // Send centralized kill list for this level (covers ALL players entering)
+        send_kill_list_for_level(level_id);
     }
 }
 
@@ -752,6 +803,9 @@ void NetworkManager::release_world_owner(uint32_t level_id, uint8_t leaving_play
 
         enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 
+        // Clear centralized kill tracking (enemies will respawn on re-entry)
+        clear_level_kills(level_id);
+
         std::printf("[Ownership] Level %u has no players — state reset\n", level_id);
     }
 }
@@ -781,96 +835,34 @@ void NetworkManager::handle_ownership_packet(const WorldOwnershipPacket& pkt) {
     }
 }
 
-void NetworkManager::handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt) {
-    // Don't process our own transfers
-    if (pkt.header.player_id == local_player_id_) return;
 
-    // Accept if: we're the new owner OR we're on the same level (kill resync)
-    bool dominated = false;
-    {
-        std::lock_guard<std::mutex> lock(ownership_mutex_);
-        auto it = world_owner_.find(pkt.level_id);
-        // Accept if we're the owner
-        if (it != world_owner_.end() && it->second == local_player_id_) {
-            dominated = true;
-        }
-        // Accept if we're on this level (resync case)
-        if (player_levels_[local_player_id_] == pkt.level_id) {
-            dominated = true;
-        }
+// === Centralized kill tracking ===
+
+void NetworkManager::record_kill(uint32_t level_id, uint16_t marker_type, uint16_t spawn_index, uint32_t map_id) {
+    std::lock_guard<std::mutex> lock(kill_mutex_);
+    auto& kills = level_kills_[level_id];
+
+    // Dedup
+    for (const auto& k : kills) {
+        if (k.marker_type == marker_type && k.spawn_index == spawn_index) return;
     }
-    if (!dominated) return;
-
-    // Queue for game thread to pick up
-    std::lock_guard<std::mutex> lock(world_mutex_);
-    owner_transfer_queue_.push_back(pkt);
-    std::printf("[Ownership] Received transfer/resync data for level %u (%u killed enemies)\n",
-        pkt.level_id, pkt.killed_count);
+    kills.push_back({marker_type, spawn_index, map_id});
+    std::printf("[KillTrack] Recorded kill: level=%u marker=0x%X spawn=%u map=%u (total=%zu)\n",
+        level_id, marker_type, spawn_index, map_id, kills.size());
 }
 
-void NetworkManager::send_owner_transfer(uint32_t level_id, const uint8_t* killed_data, size_t size) {
-    if (!is_connected()) return;
-
-    WorldOwnerTransferPacket pkt{};
-    pkt.header.type = PacketType::WorldOwnerTransfer;
-    pkt.header.player_id = local_player_id_;
-    pkt.header.sequence = 0; // set when flushed
-    pkt.level_id = level_id;
-
-    size_t entry_count = size / sizeof(KilledEnemyEntry);
-    if (entry_count > MAX_KILLED_TRANSFER) entry_count = MAX_KILLED_TRANSFER;
-    pkt.killed_count = static_cast<uint8_t>(entry_count);
-    std::memcpy(pkt.killed, killed_data, entry_count * sizeof(KilledEnemyEntry));
-
-    size_t send_size = sizeof(PacketHeader) + sizeof(uint32_t) + 4 +
-                       entry_count * sizeof(KilledEnemyEntry);
-    enqueue_packet(&pkt, send_size, CHANNEL_RELIABLE, true);
+void NetworkManager::clear_level_kills(uint32_t level_id) {
+    std::lock_guard<std::mutex> lock(kill_mutex_);
+    level_kills_.erase(level_id);
+    std::printf("[KillTrack] Cleared kills for level %u\n", level_id);
 }
 
-bool NetworkManager::pop_owner_transfer(WorldOwnerTransferPacket& out) {
-    std::lock_guard<std::mutex> lock(world_mutex_);
-    if (owner_transfer_queue_.empty()) return false;
-    out = owner_transfer_queue_.front();
-    owner_transfer_queue_.pop_front();
-    return true;
-}
-
-// === Kill resync ===
-
-void NetworkManager::request_kill_resync(uint32_t level_id) {
-    if (!is_connected()) return;
-
-    WorldKillResyncPacket pkt{};
-    pkt.header.type = PacketType::WorldKillResync;
-    pkt.header.player_id = local_player_id_;
-    pkt.header.sequence = 0;
-    pkt.level_id = level_id;
-
-    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    std::printf("[KillResync] Requested kill resync for level %u\n", level_id);
-}
-
-void NetworkManager::handle_kill_resync_packet(const WorldKillResyncPacket& pkt) {
-    if (pkt.header.player_id == local_player_id_) return;
-
-    // Only the world owner of this level should respond
-    {
-        std::lock_guard<std::mutex> lock(ownership_mutex_);
-        auto it = world_owner_.find(pkt.level_id);
-        if (it == world_owner_.end() || it->second != local_player_id_) return;
-    }
-
-    // Signal MIPS side to re-broadcast killed_on_map
-    pending_kill_resend_.store(true);
-    std::printf("[KillResync] I'm owner of level %u, will re-send kills\n", pkt.level_id);
-}
-
-bool NetworkManager::should_resend_kills() {
-    if (pending_kill_resend_.load()) {
-        pending_kill_resend_.store(false);
-        return true;
-    }
-    return false;
+void NetworkManager::send_kill_list_for_level(uint32_t level_id) {
+    // Queue the level_id for the SDL thread to send kill list
+    // (game thread cannot call ENet directly)
+    std::lock_guard<std::mutex> lock(send_queue_mutex_);
+    kill_sync_queue_.push_back(level_id);
+    std::printf("[KillTrack] Queued kill sync for level %u\n", level_id);
 }
 
 } // namespace bknet

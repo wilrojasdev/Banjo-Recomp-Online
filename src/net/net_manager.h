@@ -69,12 +69,15 @@ public:
     void update_player_level(uint8_t player_id, uint32_t level_id);
     bool am_i_world_owner(uint32_t level_id) const;
     uint8_t get_world_owner(uint32_t level_id) const;
-    void send_owner_transfer(uint32_t level_id, const uint8_t* killed_data, size_t size);
-    bool pop_owner_transfer(WorldOwnerTransferPacket& out);
 
-    // Kill resync: owner re-broadcasts kills when another player enters
-    void request_kill_resync(uint32_t level_id);
-    bool should_resend_kills();
+    // Centralized kill tracking (HOST is single source of truth)
+    struct KillRecord {
+        uint16_t marker_type;
+        uint16_t spawn_index;
+        uint32_t map_id;
+    };
+    void record_kill(uint32_t level_id, uint16_t marker_type, uint16_t spawn_index, uint32_t map_id);
+    void clear_level_kills(uint32_t level_id);
 
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
@@ -127,10 +130,9 @@ private:
     void handle_flag_packet(const WorldFlagPacket& pkt);
     void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
     void handle_ownership_packet(const WorldOwnershipPacket& pkt);
-    void handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt);
-    void handle_kill_resync_packet(const WorldKillResyncPacket& pkt);
     void assign_world_owner(uint32_t level_id, uint8_t player_id);
     void release_world_owner(uint32_t level_id, uint8_t leaving_player_id);
+    void send_kill_list_for_level(uint32_t level_id);
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
@@ -170,8 +172,11 @@ private:
     mutable std::mutex ownership_mutex_;
     std::unordered_map<uint32_t, uint8_t> world_owner_;
     uint32_t player_levels_[MAX_PLAYERS] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
-    std::deque<WorldOwnerTransferPacket> owner_transfer_queue_;
-    std::atomic<bool> pending_kill_resend_{false};
+    // Centralized kill tracking (HOST authoritative)
+    mutable std::mutex kill_mutex_;
+    std::unordered_map<uint32_t, std::vector<KillRecord>> level_kills_;
+    // Queue of level_ids that need kill lists sent (flushed in update())
+    std::deque<uint32_t> kill_sync_queue_;
 
     // Generic packet queue: game thread enqueues, SDL thread sends.
     // ENet is NOT thread-safe — all sends must go through this queue.

@@ -206,58 +206,8 @@ extern "C" void recomp_net_am_i_world_owner(uint8_t* rdram, recomp_context* ctx)
     _return(ctx, bknet::NetworkManager::instance().am_i_world_owner(level_id) ? 1u : 0u);
 }
 
-// Send owner transfer data: level_id(r4), killed_data_ptr(r5), count(r6)
-// Each entry: u16 marker_type, u16 spawn_index, f32 pos_x, f32 pos_y, f32 pos_z, u32 map_id (20 bytes)
-extern "C" void recomp_net_send_owner_transfer(uint8_t* rdram, recomp_context* ctx) {
-    u32 level_id = static_cast<u32>(ctx->r4);
-    gpr data_ptr = ctx->r5;
-    u32 count = static_cast<u32>(ctx->r6);
-
-    if (count == 0 || count > bknet::MAX_KILLED_TRANSFER) return;
-
-    std::vector<bknet::KilledEnemyEntry> entries(count);
-    for (u32 i = 0; i < count; i++) {
-        gpr entry_addr = data_ptr + i * 20;
-        entries[i].marker_type = static_cast<uint16_t>(MEM_HU(0x00, entry_addr));
-        entries[i].spawn_index = static_cast<uint16_t>(MEM_HU(0x02, entry_addr));
-        entries[i].pos_x = read_f32(rdram, entry_addr, 0x04);
-        entries[i].pos_y = read_f32(rdram, entry_addr, 0x08);
-        entries[i].pos_z = read_f32(rdram, entry_addr, 0x0C);
-        entries[i].map_id = MEM_W(0x10, entry_addr);
-    }
-
-    bknet::NetworkManager::instance().send_owner_transfer(level_id,
-        reinterpret_cast<const uint8_t*>(entries.data()),
-        count * sizeof(bknet::KilledEnemyEntry));
-}
-
-// Pop owner transfer data. Returns 1 if available. Args: out_ptr(r4)
-// Writes: u32 level_id, u8 count, then array of killed entries
-extern "C" void recomp_net_pop_owner_transfer(uint8_t* rdram, recomp_context* ctx) {
-    gpr out_ptr = ctx->r4;
-    bknet::WorldOwnerTransferPacket pkt;
-    if (bknet::NetworkManager::instance().pop_owner_transfer(pkt)) {
-        MEM_W(0x00, out_ptr) = pkt.level_id;
-        MEM_BU(0x04, out_ptr) = pkt.killed_count;
-        for (u32 i = 0; i < pkt.killed_count && i < bknet::MAX_KILLED_TRANSFER; i++) {
-            gpr entry_addr = out_ptr + 8 + i * 20;
-            MEM_HU(0x00, entry_addr) = pkt.killed[i].marker_type;
-            MEM_HU(0x02, entry_addr) = pkt.killed[i].spawn_index;
-            write_f32(rdram, entry_addr, 0x04, pkt.killed[i].pos_x);
-            write_f32(rdram, entry_addr, 0x08, pkt.killed[i].pos_y);
-            write_f32(rdram, entry_addr, 0x0C, pkt.killed[i].pos_z);
-            MEM_W(0x10, entry_addr) = pkt.killed[i].map_id;
-        }
-        _return(ctx, 1u);
-    } else {
-        _return(ctx, 0u);
-    }
-}
-
-// Check if we (as world owner) should re-send killed enemies
-extern "C" void recomp_net_should_resend_kills(uint8_t* rdram, recomp_context* ctx) {
-    _return(ctx, bknet::NetworkManager::instance().should_resend_kills() ? 1u : 0u);
-}
+// recomp_net_send_owner_transfer, recomp_net_pop_owner_transfer,
+// recomp_net_should_resend_kills — REMOVED (centralized kill tracking in C++)
 
 // === Enemy position sync ===
 
@@ -399,6 +349,7 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
                 write_f32(rdram, out_ptr, 0x1C, evt.collectible.pos_z);
                 break;
             case bknet::NetworkManager::WorldEvent::ENEMY:
+                MEM_BU(0x01, out_ptr) = evt.enemy.header.player_id; // 0xFF = resync (silent)
                 MEM_HU(0x04, out_ptr) = evt.enemy.marker_type;
                 MEM_HU(0x06, out_ptr) = evt.enemy.spawn_index;
                 MEM_W(0x08, out_ptr) = evt.enemy.map_id;
