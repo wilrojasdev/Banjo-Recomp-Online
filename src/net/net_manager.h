@@ -79,6 +79,15 @@ public:
     void record_kill(uint32_t level_id, uint16_t marker_type, uint16_t spawn_index, uint32_t map_id);
     void clear_level_kills(uint32_t level_id);
 
+    // Centralized collectible tracking (HOST is single source of truth)
+    struct CollectibleRecord {
+        uint8_t type;        // COLLECTIBLE_JIGGY, _JINJO, _MUMBO_TOKEN, etc.
+        uint16_t id;         // jiggy_id, jinjo bitmask, token_id, etc.
+        uint32_t map_id;     // map where it was collected
+    };
+    void record_collectible(uint32_t level_id, uint8_t type, uint16_t id, uint32_t map_id);
+    void clear_level_collectibles(uint32_t level_id);
+
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
         enum Type : uint8_t { COLLECTIBLE, ENEMY, FLAG } type;
@@ -172,11 +181,13 @@ private:
     mutable std::mutex ownership_mutex_;
     std::unordered_map<uint32_t, uint8_t> world_owner_;
     uint32_t player_levels_[MAX_PLAYERS] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
-    // Centralized kill tracking (HOST authoritative)
+    // Centralized state tracking (HOST authoritative)
     mutable std::mutex kill_mutex_;
     std::unordered_map<uint32_t, std::vector<KillRecord>> level_kills_;
-    // Queue of level_ids that need kill lists sent (flushed in update())
+    std::unordered_map<uint32_t, std::vector<CollectibleRecord>> level_collectibles_;
+    // Queue of level_ids that need state lists sent (flushed in update())
     std::deque<uint32_t> kill_sync_queue_;
+    std::deque<uint32_t> collectible_sync_queue_;
 
     // Generic packet queue: game thread enqueues, SDL thread sends.
     // ENet is NOT thread-safe — all sends must go through this queue.

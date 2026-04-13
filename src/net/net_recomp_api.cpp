@@ -339,6 +339,7 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
         MEM_BU(0x00, out_ptr) = static_cast<u32>(evt.type);
         switch (evt.type) {
             case bknet::NetworkManager::WorldEvent::COLLECTIBLE:
+                MEM_BU(0x01, out_ptr) = evt.collectible.header.player_id; // 0xFE = resync
                 MEM_BU(0x04, out_ptr) = evt.collectible.collectible_type;
                 MEM_HU(0x06, out_ptr) = evt.collectible.collectible_id;
                 MEM_BU(0x08, out_ptr) = evt.collectible.collected;

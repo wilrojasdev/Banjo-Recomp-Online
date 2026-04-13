@@ -140,10 +140,12 @@ void NetworkManager::disconnect() {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         packet_send_queue_.clear();
         kill_sync_queue_.clear();
+        collectible_sync_queue_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(kill_mutex_);
         level_kills_.clear();
+        level_collectibles_.clear();
     }
 }
 
@@ -199,6 +201,53 @@ void NetworkManager::update() {
             }
             if (!kills.empty()) {
                 std::printf("[KillTrack] Sent %zu kills for level %u\n", kills.size(), level_id);
+            }
+        }
+
+        // Flush pending collectible list syncs
+        while (!collectible_sync_queue_.empty()) {
+            uint32_t level_id = collectible_sync_queue_.front();
+            collectible_sync_queue_.pop_front();
+
+            std::vector<CollectibleRecord> colls;
+            {
+                std::lock_guard<std::mutex> klock(kill_mutex_);
+                auto it = level_collectibles_.find(level_id);
+                if (it != level_collectibles_.end()) colls = it->second;
+            }
+
+            for (const auto& c : colls) {
+                WorldCollectiblePacket pkt{};
+                pkt.header.type = PacketType::WorldCollectible;
+                pkt.header.player_id = 0xFE; // Special: resync (silent despawn)
+                pkt.header.sequence = send_sequence_++;
+                pkt.collectible_type = c.type;
+                pkt.collectible_id = c.id;
+                pkt.collected = 1;
+                pkt.map_id = c.map_id;
+                pkt.level_id = static_cast<uint8_t>(level_id);
+                pkt.pos_x = 0.0f;
+                pkt.pos_y = 0.0f;
+                pkt.pos_z = 0.0f;
+
+                // Send to remote players
+                if (server_) {
+                    server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+                } else if (client_) {
+                    client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+                }
+
+                // Also queue locally (HOST needs it too)
+                {
+                    std::lock_guard<std::mutex> wlock(world_mutex_);
+                    WorldEvent evt{};
+                    evt.type = WorldEvent::COLLECTIBLE;
+                    evt.collectible = pkt;
+                    world_events_.push_back(evt);
+                }
+            }
+            if (!colls.empty()) {
+                std::printf("[CollTrack] Sent %zu collectibles for level %u\n", colls.size(), level_id);
             }
         }
 
@@ -484,6 +533,11 @@ void NetworkManager::handle_map_change_packet(const MapChangePacket& pkt) {
 void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id) {
     if (!is_connected()) return;
 
+    // Record in centralized tracking
+    if (collected) {
+        record_collectible(static_cast<uint32_t>(level_id), type, id, map_id);
+    }
+
     // Get local player position for proximity-based despawn
     auto snap = state_sync_.read_local_state();
 
@@ -551,6 +605,13 @@ void NetworkManager::send_flag_change(uint8_t flag_type, uint16_t flag_index, ui
 
 void NetworkManager::handle_collectible_packet(const WorldCollectiblePacket& pkt) {
     if (pkt.header.player_id == local_player_id_) return;
+
+    // Record in centralized tracking (resync packets use player_id 0xFE)
+    if (pkt.collected && pkt.header.player_id < MAX_PLAYERS) {
+        record_collectible(static_cast<uint32_t>(pkt.level_id),
+                           pkt.collectible_type, pkt.collectible_id, pkt.map_id);
+    }
+
     std::lock_guard<std::mutex> lock(world_mutex_);
     WorldEvent evt{};
     evt.type = WorldEvent::COLLECTIBLE;
@@ -736,8 +797,14 @@ void NetworkManager::update_player_level(uint8_t player_id, uint32_t level_id) {
                 player_id, level_id);
         }
 
-        // Send centralized kill list for this level (covers ALL players entering)
+        // Send centralized kill + collectible lists for this level
         send_kill_list_for_level(level_id);
+
+        // Queue collectible resync
+        {
+            std::lock_guard<std::mutex> lock(send_queue_mutex_);
+            collectible_sync_queue_.push_back(level_id);
+        }
     }
 }
 
@@ -863,6 +930,26 @@ void NetworkManager::send_kill_list_for_level(uint32_t level_id) {
     std::lock_guard<std::mutex> lock(send_queue_mutex_);
     kill_sync_queue_.push_back(level_id);
     std::printf("[KillTrack] Queued kill sync for level %u\n", level_id);
+}
+
+// === Centralized collectible tracking ===
+
+void NetworkManager::record_collectible(uint32_t level_id, uint8_t type, uint16_t id, uint32_t map_id) {
+    std::lock_guard<std::mutex> lock(kill_mutex_); // reuse same mutex
+    auto& colls = level_collectibles_[level_id];
+
+    // Dedup by type+id
+    for (const auto& c : colls) {
+        if (c.type == type && c.id == id) return;
+    }
+    colls.push_back({type, id, map_id});
+    std::printf("[CollTrack] Recorded: level=%u type=%u id=%u map=%u (total=%zu)\n",
+        level_id, type, id, map_id, colls.size());
+}
+
+void NetworkManager::clear_level_collectibles(uint32_t level_id) {
+    std::lock_guard<std::mutex> lock(kill_mutex_);
+    level_collectibles_.erase(level_id);
 }
 
 } // namespace bknet

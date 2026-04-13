@@ -635,7 +635,8 @@ static void poll_enemy_deaths(void) {
 
 typedef struct {
     u8  event_type;       // 0x00
-    u8  _pad[3];          // 0x01-0x03
+    u8  sender_id;        // 0x01 — 0xFE = resync (silent), else real-time collect
+    u8  _pad[2];          // 0x02-0x03
     // Collectible data starts at 0x04:
     u8  coll_type;        // 0x04
     u8  _cp;              // 0x05
@@ -654,72 +655,163 @@ static void process_collectible_event(WorldEventData *evt) {
     processing_remote = TRUE;
 
     u8 ct = evt->coll_type;
+    bool is_resync = (evt->sender_id == 0xFE);
 
-    if (ct == COLLECTIBLE_JIGGY) {
-        if (!jiggyscore_isCollected(evt->coll_id)) {
-            jiggyscore_setCollected(evt->coll_id, TRUE);
-            item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
-            { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
-            if ((u32)map_get() == evt->coll_map_id) {
-                despawn_actor_by_marker_id(MARKER_52_JIGGY);
-                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+    // Resync: silently apply scores + despawn actors, no HUD effects
+    if (is_resync) {
+        u32 cur_map = (u32)map_get();
+
+        if (ct == COLLECTIBLE_JINJO) {
+            // Apply jinjo bits silently
+            s32 cur = item_getCount(ITEM_12_JINJOS);
+            s32 new_bits = (s32)evt->coll_id & ~cur;
+            if (new_bits > 0) {
+                item_adjustByDiffWithoutHud(ITEM_12_JINJOS, new_bits);
             }
-        }
-    } else if (ct == COLLECTIBLE_NOTE) {
-        item_inc(ITEM_C_NOTE);
-        if ((u32)map_get() == evt->coll_map_id) {
-            if (evt->coll_id == 0xFFFE) {
-                despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
-            } else {
-                bkrecomp_net_hide_note(evt->coll_id);
+            prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+            // Despawn jinjo actor
+            if (cur_map == evt->coll_map_id) {
+                u32 bit = evt->coll_id;
+                u32 marker_id = 0;
+                if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
+                else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
+                else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
+                else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
+                else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
+                if (marker_id) despawn_actor_by_marker_id(marker_id);
             }
-        }
-    } else if (ct == COLLECTIBLE_JINJO) {
-        item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
-        prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
-        if ((u32)map_get() == evt->coll_map_id) {
-            u32 bit = evt->coll_id;
-            u32 marker_id = 0;
-            if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
-            else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
-            else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
-            else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
-            else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
-            if (marker_id) despawn_actor_by_marker_id(marker_id);
-        }
-    } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
-        if (!mumboscore_get(evt->coll_id)) {
-            mumboscore_set(evt->coll_id, TRUE);
-            item_inc(ITEM_1C_MUMBO_TOKEN);
-            { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
-            if ((u32)map_get() == evt->coll_map_id) {
+        } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
+            if (!mumboscore_get(evt->coll_id)) {
+                mumboscore_set(evt->coll_id, TRUE);
+                item_adjustByDiffWithoutHud(ITEM_1C_MUMBO_TOKEN, 1);
+                { u8 *s = func_80321538(); if (s) { s32 i; for(i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
+            }
+            if (cur_map == evt->coll_map_id) {
                 despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
-                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
             }
-        }
-    } else if (ct == COLLECTIBLE_DESPAWN_ONLY) {
-        if ((u32)map_get() == evt->coll_map_id) {
-            bkrecomp_net_hide_nearest_prop(evt->coll_id,
-                evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
-        }
-    } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
-        if (!honeycombscore_get(evt->coll_id)) {
-            honeycombscore_set(evt->coll_id, TRUE);
-            item_inc(ITEM_13_EMPTY_HONEYCOMB);
-            { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
-            if ((u32)map_get() == evt->coll_map_id) {
-                // Despawn actor AND hide sprite prop
+        } else if (ct == COLLECTIBLE_JIGGY) {
+            if (!jiggyscore_isCollected(evt->coll_id)) {
+                jiggyscore_setCollected(evt->coll_id, TRUE);
+                item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+                { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for(i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
+            }
+            if (cur_map == evt->coll_map_id) {
+                despawn_actor_by_marker_id(MARKER_52_JIGGY);
+            }
+        } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
+            if (!honeycombscore_get(evt->coll_id)) {
+                honeycombscore_set(evt->coll_id, TRUE);
+                item_adjustByDiffWithoutHud(ITEM_13_EMPTY_HONEYCOMB, 1);
+                { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
+            }
+            if (cur_map == evt->coll_map_id) {
                 despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
-                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+            }
+        } else if (ct == COLLECTIBLE_EXTRA_LIFE) {
+            // Don't adjust lives on resync — just despawn
+            if (cur_map == evt->coll_map_id) {
+                despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
             }
         }
-    } else if (ct == COLLECTIBLE_EXTRA_LIFE) {
-        item_inc(ITEM_16_LIFE);
-        prev_lives = item_getCount(ITEM_16_LIFE);
-        if ((u32)map_get() == evt->coll_map_id) {
-            // Despawn actor AND hide sprite prop (some collectibles have both)
-            despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
-            bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+
+        processing_remote = FALSE;
+        return;
+    }
+
+    // Real-time collectible event
+    // For remote events: only set global bitfields (save file).
+    // Don't call item_inc/item_adjustByDiff for level-tracked items — these use
+    // level_get() internally and would assign stats to the RECEIVER's current level
+    // instead of the SENDER's level. Counters recalculate from bitfields on level entry.
+    // Use WithHud only when on the same map (player can see the collection).
+    {
+        u32 cur_map = (u32)map_get();
+        u32 cur_lvl = (u32)level_get();
+        bool same_map = (cur_map == evt->coll_map_id);
+        bool same_level = (cur_lvl == (u32)evt->coll_level_id);
+
+        if (ct == COLLECTIBLE_JIGGY) {
+            if (!jiggyscore_isCollected(evt->coll_id)) {
+                jiggyscore_setCollected(evt->coll_id, TRUE);
+                // Jiggy total is global — always adjust.
+                // Show HUD counter when on same level, silent when different.
+                if (same_level) {
+                    item_adjustByDiffWithHud(ITEM_26_JIGGY_TOTAL, 1);
+                } else {
+                    item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+                }
+                { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
+                if (same_map) {
+                    despawn_actor_by_marker_id(MARKER_52_JIGGY);
+                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                }
+            }
+        } else if (ct == COLLECTIBLE_NOTE) {
+            // Notes are per-level, only apply if on the same level
+            if (same_level) {
+                item_inc(ITEM_C_NOTE);
+            }
+            if (same_map) {
+                if (evt->coll_id == 0xFFFE) {
+                    despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
+                } else {
+                    bkrecomp_net_hide_note(evt->coll_id);
+                }
+            }
+        } else if (ct == COLLECTIBLE_JINJO) {
+            // Jinjos are per-level — ONLY apply if on the same level.
+            if (same_level) {
+                item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
+                prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+            }
+            if (same_map) {
+                u32 bit = evt->coll_id;
+                u32 marker_id = 0;
+                if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
+                else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
+                else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
+                else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
+                else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
+                if (marker_id) despawn_actor_by_marker_id(marker_id);
+            }
+        } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
+            // Mumbo tokens: global bitfield always, HUD counter on same level
+            if (!mumboscore_get(evt->coll_id)) {
+                mumboscore_set(evt->coll_id, TRUE);
+                if (same_level) {
+                    item_inc(ITEM_1C_MUMBO_TOKEN);
+                }
+                { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
+                if (same_map) {
+                    despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
+                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                }
+            }
+        } else if (ct == COLLECTIBLE_DESPAWN_ONLY) {
+            if (same_map) {
+                bkrecomp_net_hide_nearest_prop(evt->coll_id,
+                    evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+            }
+        } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
+            // Empty honeycombs: global bitfield always, HUD counter on same level
+            if (!honeycombscore_get(evt->coll_id)) {
+                honeycombscore_set(evt->coll_id, TRUE);
+                if (same_level) {
+                    item_inc(ITEM_13_EMPTY_HONEYCOMB);
+                }
+                { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
+                if (same_map) {
+                    despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
+                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                }
+            }
+        } else if (ct == COLLECTIBLE_EXTRA_LIFE) {
+            item_inc(ITEM_16_LIFE);
+            prev_lives = item_getCount(ITEM_16_LIFE);
+            if (same_map) {
+                despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
+                bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+            }
         }
     }
 
@@ -999,8 +1091,10 @@ static void check_full_sync_send(void) {
     if (hs) { s32 i; for (i = 0; i < 3; i++) data.honeycomb_score[i] = hs[i]; }
     else { s32 i; for (i = 0; i < 3; i++) data.honeycomb_score[i] = 0; }
 
-    data.jinjo_bits = (u8)item_getCount(ITEM_12_JINJOS);
-    data.note_count = (u16)item_getCount(ITEM_C_NOTE);
+    // Jinjos and notes are per-level — DON'T include in global full sync.
+    // They sync via centralized collectible tracking per-level.
+    data.jinjo_bits = 0;  // per-level, handled by collectible resync
+    data.note_count = 0;  // per-level, handled by collectible resync
     data.lives = (u8)item_getCount(ITEM_16_LIFE);
 
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
@@ -1136,6 +1230,8 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
             dying_count = 0;
             prev_global_level = cur_level;
             prev_global_map = cur_map;
+            // Reset per-level polling state to match game's level reset
+            prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
         }
     }
 
