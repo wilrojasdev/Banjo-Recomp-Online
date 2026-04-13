@@ -32,12 +32,20 @@ RECOMP_PATCH enum map_e getDefaultBootMap(void) {
 extern void gameSelect_update(Actor *this);
 extern void gameFile_8033CE40(void);
 
-static bool online_autoload_triggered = FALSE;
+static bool online_autoload_done_for_map = FALSE;
+static s32 last_autoload_map = -1;
 
 RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
-    // Online mode: skip file select, auto-load save and warp
-    if (recomp_net_is_online_mode() && !online_autoload_triggered) {
-        online_autoload_triggered = TRUE;
+    // Online mode: skip file select, auto-load save and warp.
+    // Reset the flag if the map changed (e.g. returning to file select after stop_game).
+    enum map_e cur_map = map_get();
+    if (cur_map != last_autoload_map) {
+        online_autoload_done_for_map = FALSE;
+        last_autoload_map = cur_map;
+    }
+
+    if (recomp_net_is_online_mode() && !online_autoload_done_for_map) {
+        online_autoload_done_for_map = TRUE;
 
         gameFile_8033CE40();
 

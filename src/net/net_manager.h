@@ -114,6 +114,10 @@ public:
     void clear_new_message_flag();
     double get_chat_time() const { return get_time(); }
 
+    // Disconnect detection (set by client disconnect callback, polled by UI thread)
+    bool was_unexpectedly_disconnected() const { return unexpected_disconnect_.load(); }
+    void clear_disconnect_flag() { unexpected_disconnect_.store(false); }
+
     // Accessors
     bool is_connected() const { return state_ == ConnectionState::Hosting || state_ == ConnectionState::Connected; }
     bool is_host() const { return state_ == ConnectionState::Hosting; }
@@ -157,6 +161,7 @@ private:
     static constexpr uint32_t SEND_INTERVAL_FRAMES = 3; // ~20Hz at 60fps
 
     bool initialized_ = false;
+    std::atomic<bool> unexpected_disconnect_{false};
 
     // Chat state
     mutable std::mutex chat_mutex_;

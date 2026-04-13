@@ -97,6 +97,7 @@ bool NetworkManager::join_game() {
     client_->set_disconnect_callback([this]() {
         state_ = ConnectionState::Disconnected;
         interpolation_.reset();
+        unexpected_disconnect_.store(true);
         std::printf("[Network] Lost connection to server\n");
     });
 

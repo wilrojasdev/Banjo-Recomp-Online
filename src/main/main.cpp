@@ -9,6 +9,13 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <spawn.h>
+extern char **environ;
+#endif
 #include <stdexcept>
 #include <cinttypes>
 #include <cstdlib>
@@ -232,7 +239,44 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 #endif
 }
 
+// --- Return to launcher: relaunch the process ---
+// The N64 emulation engine has no way to cleanly stop game threads and return
+// to the launcher. The reliable approach is to spawn a new instance and exit.
+static std::string g_executable_path;
+static std::atomic<bool> return_to_launcher_requested{false};
+
+static void return_to_launcher() {
+    return_to_launcher_requested.store(true);
+}
+
+static void process_return_to_launcher() {
+    if (!return_to_launcher_requested.load()) return;
+    return_to_launcher_requested.store(false);
+
+    // Disconnect network first
+    bknet::NetworkManager::instance().disconnect();
+
+    // Relaunch the app
+    if (!g_executable_path.empty()) {
+#ifdef _WIN32
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        CreateProcessA(g_executable_path.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+#else
+        pid_t pid;
+        char* args[] = { const_cast<char*>(g_executable_path.c_str()), nullptr };
+        posix_spawn(&pid, g_executable_path.c_str(), nullptr, nullptr, args, environ);
+#endif
+    }
+    ultramodern::quit();
+}
+
 void update_gfx(void*) {
+    // Process return-to-launcher if requested (must run outside UI callbacks)
+    process_return_to_launcher();
+
     // Poll chat input BEFORE game input so we can steal keyboard events
     bknet::ChatInput::instance().poll_events();
 
@@ -242,6 +286,19 @@ void update_gfx(void*) {
     auto& net = bknet::NetworkManager::instance();
     if (net.is_connected()) {
         net.update();
+    }
+
+    // Detect unexpected disconnection (host left, network lost, etc.)
+    if (net.was_unexpectedly_disconnected()) {
+        net.clear_disconnect_flag();
+        net.disconnect();
+        recompui::open_info_prompt(
+            "Disconnected",
+            "Lost connection to the host.",
+            "OK",
+            []() { return_to_launcher(); },
+            recompui::ButtonStyle::Primary
+        );
     }
 
     // Update chat overlay UI
@@ -837,6 +894,7 @@ static void start_host_game() {
     bknet::set_mode(bknet::NetworkMode::Host);
     bknet::get_config().save_slot = selected_save_slot;
     bknet::NetworkManager::instance().host_game();
+    recompui::set_online_session(true);
     recompui::update_game_mod_id(supported_games[0].mod_game_id);
     recomp::start_game(supported_games[0].game_id, {});
     recompui::hide_all_contexts();
@@ -1023,6 +1081,7 @@ static void update_join_state() {
     else if (state == static_cast<int>(JoinState::Connected)) {
         join_state.store(static_cast<int>(JoinState::Idle));
         // Start the game
+        recompui::set_online_session(true);
         recompui::update_game_mod_id(supported_games[0].mod_game_id);
         recomp::start_game(supported_games[0].game_id, {});
         recompui::hide_all_contexts();
@@ -1195,8 +1254,9 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
 #define REGISTER_FUNC(name) recomp::overlays::register_base_export(#name, name)
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    if (argc > 0 && argv[0]) {
+        g_executable_path = argv[0];
+    }
     recomp::Version project_version{};
     if (!recomp::Version::from_string(version_string, project_version)) {
         ultramodern::error_handling::message_box(("Invalid version string: " + version_string).c_str());
@@ -1354,6 +1414,7 @@ int main(int argc, char** argv) {
     bknet::ChatInput::instance().init();
 
     recompui::register_launcher_init_callback(on_launcher_init);
+    recompui::set_quit_to_launcher_callback([]() { return_to_launcher(); });
     recompui::register_launcher_update_callback([](recompui::LauncherMenu* menu) {
         refresh_host_slots();
         update_join_state();
