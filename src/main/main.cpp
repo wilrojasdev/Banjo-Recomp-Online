@@ -35,6 +35,7 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
 extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_am_i_world_owner(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_is_online_mode(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -620,7 +621,31 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
         recompui::GameOptionsMenuLayout::Center
     );
 
-    game_options_menu->add_default_options();
+    // Online menu: Host, Join, Settings, Exit
+    // Use add_start_game_or_load_rom_option for "Host" — handles ROM validation + file dialog
+    game_options_menu->add_start_game_or_load_rom_option("Load ROM", "Host");
+    // Wrap callback to set host mode before the original logic runs
+    if (auto* host_opt = game_options_menu->get_start_game_option()) {
+        auto original_cb = [game_options_menu]() {
+            // This replicates the start game logic from add_start_game_or_load_rom_option
+            recompui::update_game_mod_id(supported_games[0].mod_game_id);
+            recomp::start_game(supported_games[0].game_id, {});
+            recompui::hide_all_contexts();
+        };
+        host_opt->set_callback([original_cb]() {
+            bknet::set_mode(bknet::NetworkMode::Host);
+            original_cb();
+        });
+    }
+
+    game_options_menu->add_option("Join", []() {
+        bknet::set_mode(bknet::NetworkMode::Join);
+        recompui::update_game_mod_id(supported_games[0].mod_game_id);
+        recomp::start_game(supported_games[0].game_id, {});
+        recompui::hide_all_contexts();
+    });
+    game_options_menu->add_settings_option();
+    game_options_menu->add_exit_option();
     game_options_menu->set_width(30, recompui::Unit::Percent);
 
     for (auto option : game_options_menu->get_options()) {
@@ -786,6 +811,7 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_pop_full_state);
     REGISTER_FUNC(recomp_net_am_i_world_owner);
     REGISTER_FUNC(recomp_net_push_level_id);
+    REGISTER_FUNC(recomp_net_is_online_mode);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();

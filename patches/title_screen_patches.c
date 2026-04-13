@@ -2,6 +2,16 @@
 
 #include "enums.h"
 
+extern u32 recomp_net_is_online_mode(void);
+
+// @recomp Skip intro cutscenes when online mode is configured — boot directly to file select.
+RECOMP_PATCH enum map_e getDefaultBootMap(void) {
+    if (recomp_net_is_online_mode()) {
+        return MAP_91_FILE_SELECT;
+    }
+    return MAP_1F_CS_START_RAREWARE;
+}
+
 struct Struct_core2_9B180_1;
 typedef struct Struct_core2_9B180_1 Struct_core2_9B180_1;
 struct struct_core2_9B180_s;

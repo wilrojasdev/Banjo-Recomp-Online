@@ -100,6 +100,12 @@ extern "C" void recomp_net_is_connected(uint8_t* rdram, recomp_context* ctx) {
     _return(ctx, bknet::NetworkManager::instance().is_connected() ? 1u : 0u);
 }
 
+// Returns 1 if online mode is configured (BK_NET_MODE is set), 0 otherwise.
+// Available at boot time, before networking is initialized.
+extern "C" void recomp_net_is_online_mode(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, bknet::get_config().mode != bknet::NetworkMode::Off ? 1u : 0u);
+}
+
 // Get remote player's interpolated state.
 // Args: u32 player_id, NetFullState* out
 // Returns: u32 (1 if active, 0 if not)
