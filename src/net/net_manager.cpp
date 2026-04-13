@@ -304,9 +304,27 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             break;
         }
         case PacketType::WorldOwnerTransfer: {
-            WorldOwnerTransferPacket pkt;
-            if (deserialize(data, size, pkt)) {
+            // Variable-size packet — can't use deserialize (checks sizeof full struct).
+            // Minimum: header(4) + level_id(4) + count(1) + pad(3) = 12 bytes
+            if (size >= 12) {
+                WorldOwnerTransferPacket pkt{};
+                std::memcpy(&pkt.header, data, sizeof(PacketHeader));
+                std::memcpy(&pkt.level_id, data + sizeof(PacketHeader), sizeof(uint32_t));
+                pkt.killed_count = data[sizeof(PacketHeader) + 4];
+                size_t entries_offset = sizeof(PacketHeader) + 8;
+                size_t expected = entries_offset + pkt.killed_count * sizeof(KilledEnemyEntry);
+                if (size >= expected && pkt.killed_count <= MAX_KILLED_TRANSFER) {
+                    std::memcpy(pkt.killed, data + entries_offset,
+                                pkt.killed_count * sizeof(KilledEnemyEntry));
+                }
                 handle_owner_transfer_packet(pkt);
+            }
+            break;
+        }
+        case PacketType::WorldKillResync: {
+            WorldKillResyncPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_kill_resync_packet(pkt);
             }
             break;
         }
@@ -654,13 +672,21 @@ void NetworkManager::update_player_level(uint8_t player_id, uint32_t level_id) {
         assign_world_owner(level_id, player_id);
     }
 
-    // When a remote player enters a level, re-sync killed enemies + collectibles.
-    // This handles the case where a player leaves and re-enters a level —
-    // the game reloads all enemies fresh, so we need to re-send the kill list.
-    if (is_host() && player_id != local_player_id_ && level_id != 0xFFFFFFFF) {
-        request_full_sync(player_id);
-        std::printf("[Ownership] Requested full sync for player %u entering level %u\n",
-            player_id, level_id);
+    // When a player enters a level, re-sync state:
+    if (is_host() && level_id != 0xFFFFFFFF) {
+        // For remote players: send collectible scores + host's killed_on_map
+        if (player_id != local_player_id_) {
+            request_full_sync(player_id);
+            std::printf("[Ownership] Requested full sync for player %u entering level %u\n",
+                player_id, level_id);
+        }
+
+        // For ANY player entering a level with an existing non-self owner:
+        // Ask the owner to re-broadcast their kills (owner may be on a different machine)
+        uint8_t owner = get_world_owner(level_id);
+        if (owner != 0xFF && owner != player_id) {
+            request_kill_resync(level_id);
+        }
     }
 }
 
@@ -756,17 +782,29 @@ void NetworkManager::handle_ownership_packet(const WorldOwnershipPacket& pkt) {
 }
 
 void NetworkManager::handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt) {
-    // Only the new owner should process this
+    // Don't process our own transfers
     if (pkt.header.player_id == local_player_id_) return;
+
+    // Accept if: we're the new owner OR we're on the same level (kill resync)
+    bool dominated = false;
     {
         std::lock_guard<std::mutex> lock(ownership_mutex_);
         auto it = world_owner_.find(pkt.level_id);
-        if (it == world_owner_.end() || it->second != local_player_id_) return;
+        // Accept if we're the owner
+        if (it != world_owner_.end() && it->second == local_player_id_) {
+            dominated = true;
+        }
+        // Accept if we're on this level (resync case)
+        if (player_levels_[local_player_id_] == pkt.level_id) {
+            dominated = true;
+        }
     }
+    if (!dominated) return;
+
     // Queue for game thread to pick up
     std::lock_guard<std::mutex> lock(world_mutex_);
     owner_transfer_queue_.push_back(pkt);
-    std::printf("[Ownership] Received transfer data for level %u (%u killed enemies)\n",
+    std::printf("[Ownership] Received transfer/resync data for level %u (%u killed enemies)\n",
         pkt.level_id, pkt.killed_count);
 }
 
@@ -795,6 +833,44 @@ bool NetworkManager::pop_owner_transfer(WorldOwnerTransferPacket& out) {
     out = owner_transfer_queue_.front();
     owner_transfer_queue_.pop_front();
     return true;
+}
+
+// === Kill resync ===
+
+void NetworkManager::request_kill_resync(uint32_t level_id) {
+    if (!is_connected()) return;
+
+    WorldKillResyncPacket pkt{};
+    pkt.header.type = PacketType::WorldKillResync;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = 0;
+    pkt.level_id = level_id;
+
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    std::printf("[KillResync] Requested kill resync for level %u\n", level_id);
+}
+
+void NetworkManager::handle_kill_resync_packet(const WorldKillResyncPacket& pkt) {
+    if (pkt.header.player_id == local_player_id_) return;
+
+    // Only the world owner of this level should respond
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        auto it = world_owner_.find(pkt.level_id);
+        if (it == world_owner_.end() || it->second != local_player_id_) return;
+    }
+
+    // Signal MIPS side to re-broadcast killed_on_map
+    pending_kill_resend_.store(true);
+    std::printf("[KillResync] I'm owner of level %u, will re-send kills\n", pkt.level_id);
+}
+
+bool NetworkManager::should_resend_kills() {
+    if (pending_kill_resend_.load()) {
+        pending_kill_resend_.store(false);
+        return true;
+    }
+    return false;
 }
 
 } // namespace bknet

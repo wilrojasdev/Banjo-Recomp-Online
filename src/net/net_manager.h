@@ -72,6 +72,10 @@ public:
     void send_owner_transfer(uint32_t level_id, const uint8_t* killed_data, size_t size);
     bool pop_owner_transfer(WorldOwnerTransferPacket& out);
 
+    // Kill resync: owner re-broadcasts kills when another player enters
+    void request_kill_resync(uint32_t level_id);
+    bool should_resend_kills();
+
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
         enum Type : uint8_t { COLLECTIBLE, ENEMY, FLAG } type;
@@ -124,6 +128,7 @@ private:
     void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
     void handle_ownership_packet(const WorldOwnershipPacket& pkt);
     void handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt);
+    void handle_kill_resync_packet(const WorldKillResyncPacket& pkt);
     void assign_world_owner(uint32_t level_id, uint8_t player_id);
     void release_world_owner(uint32_t level_id, uint8_t leaving_player_id);
 
@@ -166,6 +171,7 @@ private:
     std::unordered_map<uint32_t, uint8_t> world_owner_;
     uint32_t player_levels_[MAX_PLAYERS] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
     std::deque<WorldOwnerTransferPacket> owner_transfer_queue_;
+    std::atomic<bool> pending_kill_resend_{false};
 
     // Generic packet queue: game thread enqueues, SDL thread sends.
     // ENet is NOT thread-safe — all sends must go through this queue.

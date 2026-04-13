@@ -11,6 +11,7 @@ u32  recomp_net_is_host(void);
 u32  recomp_net_am_i_world_owner(u32 level_id);
 void recomp_net_send_owner_transfer(u32 level_id, void *killed_data, u32 count);
 u32  recomp_net_pop_owner_transfer(void *out);
+u32  recomp_net_should_resend_kills(void);
 void recomp_net_send_enemy_positions(void *buf, u32 count, u32 map_id);
 void recomp_net_get_enemy_positions(void *buf, u32 *count);
 u32  recomp_net_should_send_full_sync(u8 *out_player_id);
@@ -1140,20 +1141,20 @@ static void check_full_sync_receive(void) {
 // Track previous level for ownership transfer detection
 static u32 prev_owner_level = 0xFFFFFFFF;
 
-// Send killed enemy data when leaving a world we owned
+// Send killed enemy data when leaving a world where we had kills.
+// Don't check current ownership — C++ transfers ownership BEFORE this runs,
+// so am_i_world_owner(prev_level) would already be false.
+// If we have killed_on_map data, we WERE the owner and should send it.
 static void check_ownership_transfer_send(void) {
     u32 cur_level = (u32)level_get();
     if (cur_level == prev_owner_level) return;
 
-    // Level changed — if we were the owner of the old level, send our killed data
+    // Level changed — send our killed data if we have any
     if (prev_owner_level != 0xFFFFFFFF && killed_on_map_count > 0) {
-        if (recomp_net_am_i_world_owner(prev_owner_level)) {
-            // killed_on_map matches KilledEnemyEntry layout: u16+u16+f32+f32+f32 = 16 bytes
-            recomp_net_send_owner_transfer(prev_owner_level,
-                killed_on_map, (u32)killed_on_map_count);
-            recomp_printf("[OWNER-XFER] sent %d killed enemies for level %d\n",
-                killed_on_map_count, prev_owner_level);
-        }
+        recomp_net_send_owner_transfer(prev_owner_level,
+            killed_on_map, (u32)killed_on_map_count);
+        recomp_printf("[OWNER-XFER] sent %d killed enemies for level %d\n",
+            killed_on_map_count, prev_owner_level);
     }
     prev_owner_level = cur_level;
 }
@@ -1184,32 +1185,56 @@ static void check_ownership_transfer_receive(void) {
         return;
     }
 
-    // Apply: merge received kills into our killed_on_map
+    // Add ALL received kills to pending_kills for persistent despawn.
+    // Don't try to despawn immediately — enemies may not be fully loaded yet.
+    // The pending_kills system runs every frame and catches enemies as they load.
     recomp_printf("[OWNER-XFER] received %d killed enemies for level %d\n", xfer.count, xfer.level_id);
     s32 k;
-    for (k = 0; k < (s32)xfer.count && killed_on_map_count < MAX_KILLED_ON_MAP; k++) {
+    for (k = 0; k < (s32)xfer.count; k++) {
         u16 mt = xfer.entries[k].marker_type;
         u16 si = xfer.entries[k].spawn_index;
+        u32 mid = xfer.entries[k].map_id;
 
-        // Check for duplicates
-        bool dup = FALSE;
-        s32 d;
-        for (d = 0; d < killed_on_map_count; d++) {
-            if (killed_on_map[d].marker_type == mt && killed_on_map[d].spawn_index == si) {
-                dup = TRUE;
-                break;
+        // Add to killed_on_map (dedup)
+        if (killed_on_map_count < MAX_KILLED_ON_MAP) {
+            bool dup_km = FALSE;
+            s32 d;
+            for (d = 0; d < killed_on_map_count; d++) {
+                if (killed_on_map[d].marker_type == mt && killed_on_map[d].spawn_index == si) {
+                    dup_km = TRUE;
+                    break;
+                }
+            }
+            if (!dup_km) {
+                s32 idx = killed_on_map_count;
+                killed_on_map[idx].marker_type = mt;
+                killed_on_map[idx].spawn_index = si;
+                killed_on_map[idx].pos_x = xfer.entries[k].pos_x;
+                killed_on_map[idx].pos_y = xfer.entries[k].pos_y;
+                killed_on_map[idx].pos_z = xfer.entries[k].pos_z;
+                killed_on_map[idx].map_id = mid;
+                killed_on_map_count = idx + 1;
             }
         }
-        if (dup) continue;
 
-        s32 idx = killed_on_map_count;
-        killed_on_map[idx].marker_type = mt;
-        killed_on_map[idx].spawn_index = si;
-        killed_on_map[idx].pos_x = xfer.entries[k].pos_x;
-        killed_on_map[idx].pos_y = xfer.entries[k].pos_y;
-        killed_on_map[idx].pos_z = xfer.entries[k].pos_z;
-        killed_on_map[idx].map_id = xfer.entries[k].map_id;
-        killed_on_map_count = idx + 1;
+        // Add to pending_kills (dedup) — will be applied every frame
+        if (pending_kill_count < MAX_PENDING_KILLS) {
+            bool dup_pk = FALSE;
+            s32 p;
+            for (p = 0; p < pending_kill_count; p++) {
+                if (pending_kills[p].marker_type == mt && pending_kills[p].spawn_index == si) {
+                    dup_pk = TRUE;
+                    break;
+                }
+            }
+            if (!dup_pk) {
+                pending_kills[pending_kill_count].marker_type = mt;
+                pending_kills[pending_kill_count].spawn_index = si;
+                pending_kills[pending_kill_count].map_id = mid;
+                pending_kill_count++;
+                recomp_printf("[OWNER-XFER] added pending kill: marker=0x%X spawn=%d map=%d\n", mt, si, mid);
+            }
+        }
     }
 }
 
@@ -1238,6 +1263,15 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     // Ownership transfer
     check_ownership_transfer_send();
     check_ownership_transfer_receive();
+
+    // Kill resync: if we're the owner and another player entered our level,
+    // re-send killed enemies as a transfer packet (silent despawn, no animation/honeycomb).
+    if (recomp_net_should_resend_kills() && killed_on_map_count > 0) {
+        u32 cur_level = (u32)level_get();
+        recomp_net_send_owner_transfer(cur_level, killed_on_map, (u32)killed_on_map_count);
+        recomp_printf("[KILL-RESYNC] re-sent %d kills as owner for level %d\n",
+            killed_on_map_count, cur_level);
+    }
 
     // Full state sync (runs once when new player joins)
     check_full_sync_send();

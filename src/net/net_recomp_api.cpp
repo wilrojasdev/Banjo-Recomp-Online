@@ -254,6 +254,11 @@ extern "C" void recomp_net_pop_owner_transfer(uint8_t* rdram, recomp_context* ct
     }
 }
 
+// Check if we (as world owner) should re-send killed enemies
+extern "C" void recomp_net_should_resend_kills(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, bknet::NetworkManager::instance().should_resend_kills() ? 1u : 0u);
+}
+
 // === Enemy position sync ===
 
 // Returns 1 if hosting, 0 otherwise

@@ -82,3 +82,4 @@ recomp_net_am_i_world_owner = 0x8F00010C;
 recomp_net_send_owner_transfer = 0x8F000110;
 recomp_net_pop_owner_transfer = 0x8F000114;
 recomp_net_push_level_id = 0x8F000118;
+recomp_net_should_resend_kills = 0x8F00011C;

@@ -39,6 +39,7 @@ enum class PacketType : uint8_t {
     EnemyPositionBulk = 0x34,  // Unreliable, ~20Hz from world owner
     WorldOwnership   = 0x35,  // Host broadcasts ownership assignments
     WorldOwnerTransfer = 0x36, // State handoff when owner leaves world
+    WorldKillResync  = 0x37,  // Request owner to re-broadcast killed enemies
     WorldStateFull   = 0x3F,
 };
 
@@ -226,6 +227,13 @@ struct WorldOwnerTransferPacket {
     uint8_t killed_count;
     uint8_t _pad[3];
     KilledEnemyEntry killed[MAX_KILLED_TRANSFER];
+};
+
+// --- Kill resync request (ask owner to re-broadcast kills) ---
+
+struct WorldKillResyncPacket {
+    PacketHeader header;
+    uint32_t level_id;
 };
 
 // --- Full world state sync (sent to joiner) ---

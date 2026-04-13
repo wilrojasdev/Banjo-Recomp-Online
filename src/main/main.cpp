@@ -37,6 +37,7 @@ extern "C" void recomp_net_am_i_world_owner(uint8_t* rdram, recomp_context* ctx)
 extern "C" void recomp_net_send_owner_transfer(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_pop_owner_transfer(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_should_resend_kills(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -790,6 +791,7 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_send_owner_transfer);
     REGISTER_FUNC(recomp_net_pop_owner_transfer);
     REGISTER_FUNC(recomp_net_push_level_id);
+    REGISTER_FUNC(recomp_net_should_resend_kills);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();
