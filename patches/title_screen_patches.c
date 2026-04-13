@@ -17,6 +17,8 @@ extern void warp_lairEnterLairFromSMLevel(s32, s32);
 extern void warp_smExitBanjosHouse(s32, s32);
 extern void func_80335110(s32);
 extern void chBottlesBonus_resetCompleted(void);
+extern void ability_setLearned(enum ability_e ability, bool hasLearned);
+extern void fileProgressFlag_set(enum file_progress_e flag, bool value);
 
 // @recomp Skip intro cutscenes when online mode is configured — boot directly to file select.
 RECOMP_PATCH enum map_e getDefaultBootMap(void) {
@@ -55,6 +57,23 @@ RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
             } else {
                 timedFunc_set_2(0.0f, (void*)warp_smExitBanjosHouse, 0, 0);
             }
+            timedFunc_set_1(0.0f, (void*)func_80335110, 1);
+        } else {
+            // Empty slot — unlock all Spiral Mountain abilities and warp to Lair
+            chBottlesBonus_resetCompleted();
+
+            ability_setLearned(ABILITY_0_BARGE, TRUE);
+            ability_setLearned(ABILITY_4_CLAW_SWIPE, TRUE);
+            ability_setLearned(ABILITY_5_CLIMB, TRUE);
+            ability_setLearned(ABILITY_7_FEATHERY_FLAP, TRUE);
+            ability_setLearned(ABILITY_8_FLAP_FLIP, TRUE);
+            ability_setLearned(ABILITY_A_HOLD_A_JUMP_HIGHER, TRUE);
+            ability_setLearned(ABILITY_B_RATATAT_RAP, TRUE);
+            ability_setLearned(ABILITY_C_ROLL, TRUE);
+            ability_setLearned(ABILITY_F_DIVE, TRUE);
+            fileProgressFlag_set(FILEPROG_BD_ENTER_LAIR_CUTSCENE, TRUE);
+
+            timedFunc_set_2(0.0f, (void*)warp_lairEnterLairFromSMLevel, 0, 0);
             timedFunc_set_1(0.0f, (void*)func_80335110, 1);
         }
         return;

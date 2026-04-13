@@ -4,7 +4,11 @@
 #include <vector>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
+#include <atomic>
+#include <thread>
+#include <chrono>
 #include <stdexcept>
 #include <cinttypes>
 #include <cstdlib>
@@ -61,6 +65,8 @@ extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx);
 #include "recompui/program_config.h"
 #include "recompui/renderer.h"
 #include "recompui/config.h"
+#include "elements/ui_text_input.h"
+#include "elements/ui_select.h"
 #include "util/file.h"
 #include "recompinput/input_events.h"
 #include "recompinput/recompinput.h"
@@ -614,93 +620,282 @@ void reorder_texture_pack(recomp::mods::ModContext&) {
     recompui::renderer::trigger_texture_pack_update();
 }
 
-// --- Host submenu panel ---
+// --- Multiplayer submenu panels ---
 static recompui::Element* host_panel = nullptr;
+static recompui::Element* join_panel = nullptr;
 static recompui::GameOptionsMenu* g_game_options_menu = nullptr;
+static recompui::LauncherMenu* g_launcher_menu = nullptr;
 static int selected_save_slot = 0;
+static bool host_slots_dirty = false;
 
-static void ensure_host_panel(recompui::GameOptionsMenu* game_menu);
+// --- Save data parsing (read from disk without running game) ---
 
-static void show_host_panel() {
-    ensure_host_panel(g_game_options_menu);
-    if (host_panel) {
-        host_panel->display_show();
-        g_game_options_menu->display_hide();
+struct SlotInfo {
+    bool valid;
+    int jiggies;
+    int notes;
+};
+
+// BK EEPROM layout: SaveData = 120 bytes per slot (magic, slotIndex, data[0x70], padding[2], checksum)
+// data[0x70] internal layout (from savedata_init / code_B5040.c):
+//   jiggyOffset     = 2   (13 bytes, bitmap: 1 bit per jiggy, IDs 1-100)
+//   honeycombOffset = 15  (3 bytes, ((25-1+7)&~7)/8 = 3)
+//   mumbotokenOffset= 18  (16 bytes, ((126-1+7)&~7)/8 = 16)
+//   notescoresOffset= 34  (8 bytes, 9 levels x 7-bit packed into u64 big-endian)
+static constexpr int SAVE_SLOT_SIZE   = 120;  // sizeof(SaveData)
+static constexpr int JIGGY_OFFSET     = 2;    // within save slot
+static constexpr int JIGGY_SIZE       = 13;   // 0x0D
+static constexpr int HONEYCOMB_SIZE   = 3;    // ((25-1+7)&~7)/8 = 3
+static constexpr int MUMBO_SIZE       = 16;   // ((126-1+7)&~7)/8 = 16
+static constexpr int NOTES_OFFSET     = JIGGY_OFFSET + JIGGY_SIZE + HONEYCOMB_SIZE + MUMBO_SIZE; // 2+13+3+16 = 34
+static constexpr int NOTES_SIZE       = 8;
+
+static int popcount_bytes(const uint8_t* data, int num_bytes) {
+    int count = 0;
+    for (int i = 0; i < num_bytes; i++) {
+        uint8_t b = data[i];
+        while (b) { count += (b & 1); b >>= 1; }
+    }
+    return count;
+}
+
+static int unpack_notes_total(const uint8_t* data8) {
+    // Notes are packed as 9 levels x 7 bits into a big-endian u64
+    // Levels 1-10, skipping level 6 → 9 values
+    uint64_t packed = 0;
+    for (int i = 0; i < 8; i++) {
+        packed = (packed << 8) | data8[i];
+    }
+    int total = 0;
+    for (int i = 0; i < 9; i++) {
+        total += (int)(packed & 0x7F);
+        packed >>= 7;
+    }
+    return total;
+}
+
+// BK stores 4 physical SaveData blocks in EEPROM. Each has a slotIndex field (1-based)
+// that maps it to a game slot (0-2). The physical order can differ from the game slot order.
+// We scan all 4 physical blocks to find the one matching the requested game slot.
+static SlotInfo read_save_slot(int game_slot) {
+    SlotInfo info = { false, 0, 0 };
+    // Use game_id from supported_games directly — current_game_id() is not available before start_game()
+    std::filesystem::path save_path = recomp::get_config_path() / u8"saves" / (supported_games[0].game_id + u8".bin");
+
+    std::ifstream f(save_path, std::ios::binary);
+    if (!f.good()) return info;
+
+    f.seekg(0, std::ios::end);
+    auto file_size = f.tellg();
+
+    // Scan all 4 physical slots to find the one with matching slotIndex
+    for (int phys = 0; phys < 4; phys++) {
+        int slot_start = phys * SAVE_SLOT_SIZE;
+        if (file_size < slot_start + SAVE_SLOT_SIZE) continue;
+
+        uint8_t slot_data[SAVE_SLOT_SIZE];
+        f.seekg(slot_start);
+        f.read(reinterpret_cast<char*>(slot_data), SAVE_SLOT_SIZE);
+
+        // slot_data[0] = magic, slot_data[1] = slotIndex (1-based)
+        if (slot_data[0] == 0x00) continue;
+        int stored_slot = slot_data[1] - 1; // convert to 0-based
+        if (stored_slot != game_slot) continue;
+
+        info.valid = true;
+        info.jiggies = popcount_bytes(&slot_data[JIGGY_OFFSET], JIGGY_SIZE);
+        info.notes = unpack_notes_total(&slot_data[NOTES_OFFSET]);
+        printf("[Save] Game slot %d → phys block %d: magic=0x%02X slotIdx=%d jiggies=%d notes=%d\n",
+               game_slot, phys, slot_data[0], slot_data[1], info.jiggies, info.notes);
+        return info;
+    }
+
+    return info;
+}
+
+// --- Helper: create a full-screen backdrop + centered dialog card ---
+static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(recompui::ContextId& context) {
+    // Backdrop — parented to launcher root so it covers the entire viewport
+    auto backdrop = context.create_element<recompui::Element>(static_cast<recompui::Element*>(g_launcher_menu));
+    backdrop->set_display(recompui::Display::Flex);
+    backdrop->set_flex_direction(recompui::FlexDirection::Column);
+    backdrop->set_align_items(recompui::AlignItems::Center);
+    backdrop->set_justify_content(recompui::JustifyContent::Center);
+    backdrop->set_position(recompui::Position::Absolute);
+    backdrop->set_left(0.0f);
+    backdrop->set_top(0.0f);
+    backdrop->set_width(100.0f, recompui::Unit::Percent);
+    backdrop->set_height(100.0f, recompui::Unit::Percent);
+    backdrop->set_padding_left(25.0f);
+    backdrop->set_padding_right(25.0f);
+    backdrop->set_background_color(recompui::Color{0, 0, 0, 180});
+    backdrop->display_hide();
+
+    // Card
+    auto card = context.create_element<recompui::Element>(backdrop);
+    card->set_display(recompui::Display::Flex);
+    card->set_flex_direction(recompui::FlexDirection::Column);
+    card->set_align_items(recompui::AlignItems::FlexStart);
+    card->set_gap(12.0f);
+    card->set_padding_top(44.0f);
+    card->set_padding_bottom(44.0f);
+    card->set_padding_left(64.0f);
+    card->set_padding_right(64.0f);
+    card->set_width(100.0f, recompui::Unit::Percent);
+    card->set_max_width(700.0f);
+    card->set_background_color(recompui::Color{14, 18, 30, 250});
+    card->set_border_radius(16.0f);
+
+    return {backdrop, card};
+}
+
+// --- Helper: create a labeled section inside a card (label + content grouped) ---
+static recompui::Element* create_section(recompui::ContextId& context, recompui::Element* card, const char* title) {
+    auto section = context.create_element<recompui::Element>(card);
+    section->set_display(recompui::Display::Flex);
+    section->set_flex_direction(recompui::FlexDirection::Column);
+    section->set_align_items(recompui::AlignItems::FlexStart);
+    section->set_gap(8.0f);
+    section->set_width(100.0f, recompui::Unit::Percent);
+    section->set_margin_top(12.0f);
+
+    context.create_element<recompui::Label>(section, title, recompui::theme::Typography::LabelMD);
+    return section;
+}
+
+// --- Refresh slot button labels ---
+static std::string make_slot_label(int slot_index);
+static recompui::Button* slot_buttons[3] = {};
+
+// Called every frame by the launcher update callback
+static void refresh_host_slots() {
+    if (!host_slots_dirty) return;
+    host_slots_dirty = false;
+    for (int k = 0; k < 3; k++) {
+        if (slot_buttons[k]) {
+            slot_buttons[k]->set_text(make_slot_label(k));
+        }
     }
 }
 
-static void hide_host_panel() {
-    if (host_panel) {
-        host_panel->display_hide();
-        g_game_options_menu->display_show();
-    }
+// --- Show/hide a panel ---
+static void show_panel(recompui::Element* panel) {
+    if (panel) panel->display_show();
 }
+static void hide_panel(recompui::Element* panel) {
+    if (panel) panel->display_hide();
+}
+
+// --- Erase a save slot on disk (find physical block by slotIndex) ---
+static void erase_save_slot(int game_slot) {
+    std::filesystem::path save_path = recomp::get_config_path() / u8"saves" / (supported_games[0].game_id + u8".bin");
+    std::fstream f(save_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!f.good()) return;
+
+    f.seekg(0, std::ios::end);
+    auto file_size = f.tellg();
+
+    for (int phys = 0; phys < 4; phys++) {
+        int slot_start = phys * SAVE_SLOT_SIZE;
+        if (file_size < slot_start + SAVE_SLOT_SIZE) continue;
+
+        uint8_t header[2];
+        f.seekg(slot_start);
+        f.read(reinterpret_cast<char*>(header), 2);
+
+        if (header[0] == 0x00) continue;
+        int stored_slot = header[1] - 1;
+        if (stored_slot != game_slot) continue;
+
+        // Found it — zero out the entire physical block
+        f.seekp(slot_start);
+        uint8_t zeros[SAVE_SLOT_SIZE] = {};
+        f.write(reinterpret_cast<char*>(zeros), SAVE_SLOT_SIZE);
+        f.flush();
+        printf("[Save] Erased game slot %d (physical block %d)\n", game_slot + 1, phys);
+        return;
+    }
+    printf("[Save] Game slot %d not found in save file\n", game_slot + 1);
+}
+
+// --- Build a slot label from save data ---
+static std::string make_slot_label(int slot_index) {
+    SlotInfo info = read_save_slot(slot_index);
+    if (info.valid) {
+        return "Save " + std::to_string(slot_index + 1) + "  -  " +
+               std::to_string(info.jiggies) + " Jiggies / " +
+               std::to_string(info.notes) + " Notes";
+    }
+    return "Save " + std::to_string(slot_index + 1) + "  -  Empty";
+}
+
+// ===================== HOST PANEL =====================
+
+static void ensure_host_panel();
 
 static void start_host_game() {
     bknet::set_mode(bknet::NetworkMode::Host);
     bknet::get_config().save_slot = selected_save_slot;
+    bknet::NetworkManager::instance().host_game();
     recompui::update_game_mod_id(supported_games[0].mod_game_id);
     recomp::start_game(supported_games[0].game_id, {});
     recompui::hide_all_contexts();
 }
 
-static void build_host_panel(recompui::LauncherMenu* menu) {
-    // Host submenu is built lazily on first show to avoid context issues at init
-    (void)menu;
-}
-
-static void ensure_host_panel(recompui::GameOptionsMenu* game_menu) {
+static void ensure_host_panel() {
     if (host_panel != nullptr) return;
 
     auto context = recompui::get_launcher_context_id();
+    auto [backdrop, card] = create_dialog_pair(context);
+    host_panel = backdrop;
 
-    // Get the menu container as parent for the overlay
-    host_panel = context.create_element<recompui::Element>(static_cast<recompui::Element*>(game_menu));
-    host_panel->set_display(recompui::Display::Flex);
-    host_panel->set_flex_direction(recompui::FlexDirection::Column);
-    host_panel->set_align_items(recompui::AlignItems::Center);
-    host_panel->set_justify_content(recompui::JustifyContent::Center);
-    host_panel->set_position(recompui::Position::Absolute);
-    host_panel->set_left(0.0f);
-    host_panel->set_top(0.0f);
-    host_panel->set_width(100.0f, recompui::Unit::Percent);
-    host_panel->set_height(100.0f, recompui::Unit::Percent);
-    host_panel->set_background_color(recompui::theme::color::ModalOverlay);
+    // --- Title (centered) ---
+    auto title_row = context.create_element<recompui::Element>(card);
+    title_row->set_display(recompui::Display::Flex);
+    title_row->set_justify_content(recompui::JustifyContent::Center);
+    title_row->set_width(100.0f, recompui::Unit::Percent);
+    title_row->set_margin_bottom(8.0f);
+    context.create_element<recompui::Label>(title_row, "Host Game", recompui::theme::Typography::Header2);
 
-    auto wrapper = context.create_element<recompui::Element>(host_panel);
-    wrapper->set_display(recompui::Display::Flex);
-    wrapper->set_flex_direction(recompui::FlexDirection::Column);
-    wrapper->set_align_items(recompui::AlignItems::Center);
-    wrapper->set_gap(20.0f);
-    wrapper->set_padding(40.0f);
+    // --- Connection mode section ---
+    auto conn_section = create_section(context, card, "Connection Mode");
+    auto mode_select = context.create_element<recompui::Select>(
+        conn_section,
+        std::vector<recompui::SelectOption>{
+            {"Direct (LAN)", "lan"},
+            {"Online (WAN)", "wan"},
+        },
+        "lan"
+    );
+    mode_select->set_width(100.0f, recompui::Unit::Percent);
+    mode_select->add_change_callback([](recompui::SelectOption& opt, int) {
+        if (opt.value == "wan") {
+            printf("[Network] WAN mode selected (not yet implemented, using LAN)\n");
+        }
+    });
+    context.create_element<recompui::Label>(conn_section, "Port: 7777", recompui::theme::Typography::LabelXS);
 
-    // Title
-    context.create_element<recompui::Label>(wrapper, "Host Game", recompui::theme::Typography::Header3);
+    // --- Save slot section ---
+    auto slots_section = create_section(context, card, "Select Save Slot");
 
-    // Connection info
-    context.create_element<recompui::Label>(wrapper, "Connection: Direct (LAN)", recompui::theme::Typography::Body);
+    static recompui::Button* erase_buttons[3] = {};
 
-    // Save slots
-    context.create_element<recompui::Label>(wrapper, "Select Save Slot", recompui::theme::Typography::LabelLG);
-
-    auto slots_row = context.create_element<recompui::Element>(wrapper);
-    slots_row->set_display(recompui::Display::Flex);
-    slots_row->set_flex_direction(recompui::FlexDirection::Row);
-    slots_row->set_gap(16.0f);
-    slots_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
-
-    // Store button pointers in static array (must survive callback lifetime)
-    static recompui::Button* slot_buttons[3] = {};
     for (int i = 0; i < 3; i++) {
-        std::string label = "Save " + std::to_string(i + 1);
+        // Row: [slot button] [erase button]
+        auto slot_row = context.create_element<recompui::Element>(slots_section);
+        slot_row->set_display(recompui::Display::Flex);
+        slot_row->set_flex_direction(recompui::FlexDirection::Row);
+        slot_row->set_gap(8.0f);
+        slot_row->set_width(100.0f, recompui::Unit::Percent);
+        slot_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
         slot_buttons[i] = context.create_element<recompui::Button>(
-            slots_row, label,
+            slot_row, make_slot_label(i),
             recompui::ButtonStyle::Secondary,
             recompui::ButtonSize::Large
         );
-        slot_buttons[i]->set_width(160.0f);
-        if (i == 0) slot_buttons[i]->set_opacity(1.0f);
-        else slot_buttons[i]->set_opacity(0.5f);
+        slot_buttons[i]->set_width(100.0f, recompui::Unit::Percent);
+        slot_buttons[i]->set_opacity(i == 0 ? 1.0f : 0.5f);
 
         slot_buttons[i]->add_pressed_callback([i]() {
             selected_save_slot = i;
@@ -708,24 +903,237 @@ static void ensure_host_panel(recompui::GameOptionsMenu* game_menu) {
                 slot_buttons[j]->set_opacity(j == i ? 1.0f : 0.5f);
             }
         });
+
+        erase_buttons[i] = context.create_element<recompui::Button>(
+            slot_row, "Erase",
+            recompui::ButtonStyle::Danger,
+            recompui::ButtonSize::Large
+        );
+        erase_buttons[i]->set_min_width(120.0f);
+        erase_buttons[i]->set_overflow(recompui::Overflow::Visible);
+
+        erase_buttons[i]->add_pressed_callback([i]() {
+            recompui::open_choice_prompt(
+                "Erase Save " + std::to_string(i + 1),
+                "All progress in this slot will be permanently deleted.",
+                "Erase", "Cancel",
+                [i]() {
+                    erase_save_slot(i);
+                    host_slots_dirty = true;
+                },
+                []() {},
+                recompui::ButtonStyle::Danger,
+                recompui::ButtonStyle::Secondary,
+                true
+            );
+        });
     }
 
-    // Action buttons
-    auto buttons_row = context.create_element<recompui::Element>(wrapper);
+    // --- Action buttons ---
+    auto buttons_row = context.create_element<recompui::Element>(card);
     buttons_row->set_display(recompui::Display::Flex);
     buttons_row->set_flex_direction(recompui::FlexDirection::Row);
-    buttons_row->set_gap(16.0f);
+    buttons_row->set_gap(20.0f);
+    buttons_row->set_justify_content(recompui::JustifyContent::Center);
+    buttons_row->set_width(100.0f, recompui::Unit::Percent);
+    buttons_row->set_margin_top(16.0f);
     buttons_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
     auto back_btn = context.create_element<recompui::Button>(
-        buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
+        buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    back_btn->add_pressed_callback([]() { hide_host_panel(); });
+    back_btn->set_min_width(160.0f);
+    back_btn->set_overflow(recompui::Overflow::Visible);
+    back_btn->add_pressed_callback([]() { hide_panel(host_panel); });
 
     auto start_btn = context.create_element<recompui::Button>(
-        buttons_row, "Start", recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
+        buttons_row, "Start", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
+    start_btn->set_min_width(160.0f);
+    start_btn->set_overflow(recompui::Overflow::Visible);
     start_btn->add_pressed_callback([]() { start_host_game(); });
+}
+
+// ===================== JOIN PANEL =====================
+
+// Async join state machine
+enum class JoinState : int { Idle = 0, Connecting = 1, Connected = 2, Failed = 3 };
+static std::atomic<int> join_state{0};
+static std::string join_target_ip;
+static std::chrono::steady_clock::time_point join_start_time;
+
+// Join panel UI elements (need per-frame access)
+static recompui::Element* join_form = nullptr;      // the form card content
+static recompui::Element* join_status_view = nullptr; // connecting/result screen
+static recompui::Label* join_status_label = nullptr;
+static recompui::Label* join_timer_label = nullptr;
+static recompui::Button* join_cancel_btn = nullptr;
+static recompui::Button* join_retry_btn = nullptr;
+static recompui::TextInput* ip_input = nullptr;
+
+static void ensure_join_panel();
+
+static void join_show_form() {
+    if (join_form) join_form->display_show();
+    if (join_status_view) join_status_view->display_hide();
+}
+
+static void join_show_status() {
+    if (join_form) join_form->display_hide();
+    if (join_status_view) join_status_view->display_show();
+}
+
+static void begin_join(const std::string& ip) {
+    join_target_ip = ip.empty() ? "127.0.0.1" : ip;
+    join_state.store(static_cast<int>(JoinState::Connecting));
+    join_start_time = std::chrono::steady_clock::now();
+
+    if (join_status_label) join_status_label->set_text("Connecting to " + join_target_ip + "...");
+    if (join_timer_label) join_timer_label->set_text("0s");
+    if (join_cancel_btn) join_cancel_btn->display_show();
+    if (join_retry_btn) join_retry_btn->display_hide();
+    join_show_status();
+
+    // Spawn async connection thread
+    std::thread([]() {
+        bknet::set_mode(bknet::NetworkMode::Join);
+        bknet::set_join_ip(join_target_ip);
+        bool ok = bknet::NetworkManager::instance().join_game();
+        int expected = static_cast<int>(JoinState::Connecting);
+        if (ok) {
+            join_state.compare_exchange_strong(expected, static_cast<int>(JoinState::Connected));
+        } else {
+            join_state.compare_exchange_strong(expected, static_cast<int>(JoinState::Failed));
+        }
+    }).detach();
+}
+
+// Called every frame from launcher update callback
+static void update_join_state() {
+    int state = join_state.load();
+
+    if (state == static_cast<int>(JoinState::Connecting)) {
+        // Update elapsed timer
+        auto elapsed = std::chrono::steady_clock::now() - join_start_time;
+        int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        if (join_timer_label) {
+            join_timer_label->set_text(std::to_string(secs) + "s");
+        }
+    }
+    else if (state == static_cast<int>(JoinState::Connected)) {
+        join_state.store(static_cast<int>(JoinState::Idle));
+        // Start the game
+        recompui::update_game_mod_id(supported_games[0].mod_game_id);
+        recomp::start_game(supported_games[0].game_id, {});
+        recompui::hide_all_contexts();
+    }
+    else if (state == static_cast<int>(JoinState::Failed)) {
+        join_state.store(static_cast<int>(JoinState::Idle));
+        // Show failure
+        if (join_status_label) join_status_label->set_text("Connection failed");
+        if (join_timer_label) join_timer_label->set_text("Host not found or not responding.");
+        if (join_cancel_btn) join_cancel_btn->display_hide();
+        if (join_retry_btn) join_retry_btn->display_show();
+    }
+}
+
+static void ensure_join_panel() {
+    if (join_panel != nullptr) return;
+
+    auto context = recompui::get_launcher_context_id();
+    auto [backdrop, card] = create_dialog_pair(context);
+    join_panel = backdrop;
+
+    // ========== FORM VIEW ==========
+    join_form = context.create_element<recompui::Element>(card);
+    join_form->set_display(recompui::Display::Flex);
+    join_form->set_flex_direction(recompui::FlexDirection::Column);
+    join_form->set_align_items(recompui::AlignItems::FlexStart);
+    join_form->set_gap(12.0f);
+    join_form->set_width(100.0f, recompui::Unit::Percent);
+
+    // Title (centered)
+    auto title_row = context.create_element<recompui::Element>(join_form);
+    title_row->set_display(recompui::Display::Flex);
+    title_row->set_justify_content(recompui::JustifyContent::Center);
+    title_row->set_width(100.0f, recompui::Unit::Percent);
+    title_row->set_margin_bottom(8.0f);
+    context.create_element<recompui::Label>(title_row, "Join Game", recompui::theme::Typography::Header2);
+
+    // Connection section
+    auto conn_section = create_section(context, join_form, "Host IP Address");
+    ip_input = context.create_element<recompui::TextInput>(conn_section);
+    ip_input->set_text("127.0.0.1");
+    ip_input->set_width(100.0f, recompui::Unit::Percent);
+    context.create_element<recompui::Label>(conn_section, "Port: 7777", recompui::theme::Typography::LabelXS);
+
+    // Action buttons
+    auto buttons_row = context.create_element<recompui::Element>(join_form);
+    buttons_row->set_display(recompui::Display::Flex);
+    buttons_row->set_flex_direction(recompui::FlexDirection::Row);
+    buttons_row->set_gap(20.0f);
+    buttons_row->set_justify_content(recompui::JustifyContent::Center);
+    buttons_row->set_width(100.0f, recompui::Unit::Percent);
+    buttons_row->set_margin_top(16.0f);
+    buttons_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
+    auto back_btn = context.create_element<recompui::Button>(
+        buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    back_btn->set_min_width(160.0f);
+    back_btn->set_overflow(recompui::Overflow::Visible);
+    back_btn->add_pressed_callback([]() { hide_panel(join_panel); });
+
+    auto connect_btn = context.create_element<recompui::Button>(
+        buttons_row, "Connect", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
+    );
+    connect_btn->set_min_width(160.0f);
+    connect_btn->set_overflow(recompui::Overflow::Visible);
+    connect_btn->add_pressed_callback([]() {
+        begin_join(ip_input->get_text());
+    });
+
+    // ========== STATUS VIEW (hidden by default) ==========
+    join_status_view = context.create_element<recompui::Element>(card);
+    join_status_view->set_display(recompui::Display::Flex);
+    join_status_view->set_flex_direction(recompui::FlexDirection::Column);
+    join_status_view->set_align_items(recompui::AlignItems::Center);
+    join_status_view->set_justify_content(recompui::JustifyContent::Center);
+    join_status_view->set_gap(20.0f);
+    join_status_view->set_width(100.0f, recompui::Unit::Percent);
+    join_status_view->set_min_height(200.0f);
+    join_status_view->display_hide();
+
+    join_status_label = context.create_element<recompui::Label>(
+        join_status_view, "Connecting...", recompui::theme::Typography::Header3
+    );
+
+    join_timer_label = context.create_element<recompui::Label>(
+        join_status_view, "0s", recompui::theme::Typography::Body
+    );
+
+    // Cancel button (shown during connecting)
+    join_cancel_btn = context.create_element<recompui::Button>(
+        join_status_view, "Cancel", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    join_cancel_btn->set_min_width(160.0f);
+    join_cancel_btn->set_overflow(recompui::Overflow::Visible);
+    join_cancel_btn->add_pressed_callback([]() {
+        // Set state to idle so thread result is ignored
+        join_state.store(static_cast<int>(JoinState::Idle));
+        join_show_form();
+    });
+
+    // Retry/Back button (shown on failure)
+    join_retry_btn = context.create_element<recompui::Button>(
+        join_status_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    join_retry_btn->set_min_width(160.0f);
+    join_retry_btn->set_overflow(recompui::Overflow::Visible);
+    join_retry_btn->display_hide();
+    join_retry_btn->add_pressed_callback([]() {
+        join_show_form();
+    });
 }
 
 void on_launcher_init(recompui::LauncherMenu *menu) {
@@ -737,25 +1145,20 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
         recompui::GameOptionsMenuLayout::Center
     );
     g_game_options_menu = game_options_menu;
+    g_launcher_menu = menu;
 
     // Online menu: Host, Join, Settings, Exit
     game_options_menu->add_start_game_or_load_rom_option("Load ROM", "Host");
     if (auto* host_opt = game_options_menu->get_start_game_option()) {
         host_opt->set_callback([]() {
-            bknet::set_mode(bknet::NetworkMode::Host);
-            bknet::NetworkManager::instance().host_game();
-            recompui::update_game_mod_id(supported_games[0].mod_game_id);
-            recomp::start_game(supported_games[0].game_id, {});
-            recompui::hide_all_contexts();
+            ensure_host_panel();
+            show_panel(host_panel);
         });
     }
 
     game_options_menu->add_option("Join", []() {
-        bknet::set_mode(bknet::NetworkMode::Join);
-        bknet::NetworkManager::instance().join_game();
-        recompui::update_game_mod_id(supported_games[0].mod_game_id);
-        recomp::start_game(supported_games[0].game_id, {});
-        recompui::hide_all_contexts();
+        ensure_join_panel();
+        show_panel(join_panel);
     });
     game_options_menu->add_settings_option();
     game_options_menu->add_exit_option();
@@ -951,7 +1354,11 @@ int main(int argc, char** argv) {
     bknet::ChatInput::instance().init();
 
     recompui::register_launcher_init_callback(on_launcher_init);
-    recompui::register_launcher_update_callback(banjo::launcher_animation_update);
+    recompui::register_launcher_update_callback([](recompui::LauncherMenu* menu) {
+        refresh_host_slots();
+        update_join_state();
+        banjo::launcher_animation_update(menu);
+    });
 
     recomp::rsp::callbacks_t rsp_callbacks{
         .get_rsp_microcode = get_rsp_microcode,
