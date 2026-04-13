@@ -8,6 +8,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 
 #include "net_packets.h"
 #include "net_server.h"
@@ -63,6 +64,14 @@ public:
     bool should_send_full_sync(uint8_t& out_player_id);
     void send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player);
 
+    // World ownership
+    void set_local_level_id(uint32_t level_id);
+    void update_player_level(uint8_t player_id, uint32_t level_id);
+    bool am_i_world_owner(uint32_t level_id) const;
+    uint8_t get_world_owner(uint32_t level_id) const;
+    void send_owner_transfer(uint32_t level_id, const uint8_t* killed_data, size_t size);
+    bool pop_owner_transfer(WorldOwnerTransferPacket& out);
+
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
         enum Type : uint8_t { COLLECTIBLE, ENEMY, FLAG } type;
@@ -113,6 +122,10 @@ private:
     void handle_enemy_position_packet(const uint8_t* data, size_t size);
     void handle_flag_packet(const WorldFlagPacket& pkt);
     void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
+    void handle_ownership_packet(const WorldOwnershipPacket& pkt);
+    void handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt);
+    void assign_world_owner(uint32_t level_id, uint8_t player_id);
+    void release_world_owner(uint32_t level_id, uint8_t leaving_player_id);
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
@@ -147,6 +160,25 @@ private:
     std::deque<WorldStateFullPacket> full_state_queue_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;
+
+    // World ownership: level_id -> owner player_id
+    mutable std::mutex ownership_mutex_;
+    std::unordered_map<uint32_t, uint8_t> world_owner_;
+    uint32_t player_levels_[MAX_PLAYERS] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+    std::deque<WorldOwnerTransferPacket> owner_transfer_queue_;
+
+    // Generic packet queue: game thread enqueues, SDL thread sends.
+    // ENet is NOT thread-safe — all sends must go through this queue.
+    struct QueuedPacket {
+        std::vector<uint8_t> data;
+        uint8_t channel;
+        bool reliable;
+    };
+    mutable std::mutex send_queue_mutex_;
+    std::deque<QueuedPacket> packet_send_queue_;
+
+    // Thread-safe enqueue (called from game thread)
+    void enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable);
 };
 
 } // namespace bknet

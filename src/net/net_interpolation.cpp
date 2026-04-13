@@ -42,6 +42,7 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
         r.pitch = s->pitch;
         r.scale = s->scale;
         r.map_id = s->map_id;
+        r.level_id = s->level_id;
         r.animation_id = s->animation_id;
         r.anim_timer = s->anim_timer;
         r.anim_duration = s->anim_duration;
@@ -94,6 +95,7 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
 
             // Non-interpolated fields: use target snapshot
             result.map_id = b->map_id;
+            result.level_id = b->level_id;
             result.animation_id = b->animation_id;
             result.anim_timer = b->anim_timer;
             result.anim_duration = b->anim_duration;

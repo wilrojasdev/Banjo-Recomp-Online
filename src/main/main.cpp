@@ -33,6 +33,10 @@ extern "C" void recomp_net_get_enemy_positions(uint8_t* rdram, recomp_context* c
 extern "C" void recomp_net_should_send_full_sync(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_am_i_world_owner(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_owner_transfer(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_pop_owner_transfer(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -782,6 +786,10 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_should_send_full_sync);
     REGISTER_FUNC(recomp_net_send_world_state_full);
     REGISTER_FUNC(recomp_net_pop_full_state);
+    REGISTER_FUNC(recomp_net_am_i_world_owner);
+    REGISTER_FUNC(recomp_net_send_owner_transfer);
+    REGISTER_FUNC(recomp_net_pop_owner_transfer);
+    REGISTER_FUNC(recomp_net_push_level_id);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();

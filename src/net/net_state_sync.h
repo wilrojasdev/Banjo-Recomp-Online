@@ -15,6 +15,7 @@ struct LocalPlayerSnapshot {
     float pitch;
     float scale;
     uint32_t map_id;
+    uint32_t level_id;
     uint16_t animation_id;
     float anim_timer;
     float anim_duration;
@@ -47,6 +48,7 @@ public:
     bool build_state_packet(uint8_t player_id, uint16_t sequence, PlayerStatePacket& out) const;
 
     uint32_t get_local_map_id() const;
+    void set_level_id(uint32_t level_id);
 
 private:
     mutable std::mutex mutex_;

@@ -8,6 +8,9 @@ void recomp_net_send_enemy_death(u32 marker_type, u32 spawn_index, u32 map_id, f
 u32  recomp_net_pop_world_event(void *out);
 u32  recomp_net_is_connected(void);
 u32  recomp_net_is_host(void);
+u32  recomp_net_am_i_world_owner(u32 level_id);
+void recomp_net_send_owner_transfer(u32 level_id, void *killed_data, u32 count);
+u32  recomp_net_pop_owner_transfer(void *out);
 void recomp_net_send_enemy_positions(void *buf, u32 count, u32 map_id);
 void recomp_net_get_enemy_positions(void *buf, u32 *count);
 u32  recomp_net_should_send_full_sync(u8 *out_player_id);
@@ -91,15 +94,16 @@ static struct {
 } pending_kills[MAX_PENDING_KILLS];
 static s32 pending_kill_count = 0;
 
-// Host: track killed enemies on current map to re-send to late joiners
+// World owner: track killed enemies in current level to re-send to late joiners
 #define MAX_KILLED_ON_MAP 64
 static struct {
     u16 marker_type;
     u16 spawn_index;
     f32 pos_x, pos_y, pos_z;
+    u32 map_id;    // Which specific map this enemy was on
 } killed_on_map[MAX_KILLED_ON_MAP];
 static s32 killed_on_map_count = 0;
-static u32 killed_on_map_id = 0xFFFFFFFF;
+static u32 killed_on_level_id = 0xFFFFFFFF;
 
 typedef struct {
     u16 marker_id;
@@ -127,24 +131,32 @@ static void mark_dying(u16 spawn_index) {
     }
 }
 
-// --- Join dieFunc proxy ---
-// Saves original dieFuncs. Proxy sends event to host + calls original for local death.
+// --- Non-owner saved functions ---
+// Saves original callbacks for enemy AI suppression.
+// Restored when enemy dies so death animation can play.
 #define MAX_SAVED_DIEFUNCS 64
 static struct {
     u16 spawn_index;
-    MarkerCollisionFunc original;
+    MarkerCollisionFunc original_die;
+    MarkerCollisionFunc original_collision;
+    ActorUpdateFunc original_update;
 } saved_diefuncs[MAX_SAVED_DIEFUNCS];
 static s32 saved_diefunc_count = 0;
 
-static void save_diefunc(u16 spawn_index, MarkerCollisionFunc func) {
-    if (func == (MarkerCollisionFunc)net_enemy_die_proxy || !func) return;
+static void net_enemy_hit_proxy(ActorMarker *self_marker, ActorMarker *other_marker);
+
+static void save_enemy_funcs(u16 spawn_index, MarkerCollisionFunc die_func,
+                              MarkerCollisionFunc coll_func, ActorUpdateFunc update_func) {
+    if (die_func == (MarkerCollisionFunc)net_enemy_die_proxy || !die_func) return;
     s32 i;
     for (i = 0; i < saved_diefunc_count; i++) {
         if (saved_diefuncs[i].spawn_index == spawn_index) return; // already saved
     }
     if (saved_diefunc_count < MAX_SAVED_DIEFUNCS) {
         saved_diefuncs[saved_diefunc_count].spawn_index = spawn_index;
-        saved_diefuncs[saved_diefunc_count].original = func;
+        saved_diefuncs[saved_diefunc_count].original_die = die_func;
+        saved_diefuncs[saved_diefunc_count].original_collision = coll_func;
+        saved_diefuncs[saved_diefunc_count].original_update = update_func;
         saved_diefunc_count++;
     }
 }
@@ -153,15 +165,50 @@ static MarkerCollisionFunc get_saved_diefunc(u16 spawn_index) {
     s32 i;
     for (i = 0; i < saved_diefunc_count; i++) {
         if (saved_diefuncs[i].spawn_index == spawn_index)
-            return saved_diefuncs[i].original;
+            return saved_diefuncs[i].original_die;
     }
     return (MarkerCollisionFunc)0;
+}
+
+static ActorUpdateFunc get_saved_updatefunc(u16 spawn_index) {
+    s32 i;
+    for (i = 0; i < saved_diefunc_count; i++) {
+        if (saved_diefuncs[i].spawn_index == spawn_index)
+            return saved_diefuncs[i].original_update;
+    }
+    return (ActorUpdateFunc)0;
+}
+
+static MarkerCollisionFunc get_saved_collisionfunc(u16 spawn_index) {
+    s32 i;
+    for (i = 0; i < saved_diefunc_count; i++) {
+        if (saved_diefuncs[i].spawn_index == spawn_index)
+            return saved_diefuncs[i].original_collision;
+    }
+    return (MarkerCollisionFunc)0;
+}
+
+// Collision hit proxy: when non-owner player hits an enemy, force-kill it.
+// Most BK enemies die in 1 hit, so treating any hit as a kill is acceptable.
+static void net_enemy_hit_proxy(ActorMarker *self_marker, ActorMarker *other_marker) {
+    if (!self_marker) return;
+
+    // Delegate to the die proxy which handles kill tracking + death sequence
+    net_enemy_die_proxy(self_marker, other_marker);
 }
 
 static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_marker) {
     if (!self_marker || !suBaddieActorArray) return;
 
-    Actor *actor = &suBaddieActorArray->data[self_marker->actrArrayIdx];
+    // Bounds check on actrArrayIdx before accessing data array
+    s32 arr_idx = self_marker->actrArrayIdx;
+    if (arr_idx < 0 || arr_idx >= suBaddieActorArray->cnt) {
+        // Index out of range — just despawn safely
+        marker_despawn(self_marker);
+        return;
+    }
+
+    Actor *actor = &suBaddieActorArray->data[arr_idx];
     u16 spawn_index = (u16)bkrecomp_get_marker_spawn_index(self_marker);
     u16 marker_id = (u16)self_marker->id;
 
@@ -178,16 +225,25 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
         killed_on_map[ki].pos_x = pos[0];
         killed_on_map[ki].pos_y = pos[1];
         killed_on_map[ki].pos_z = pos[2];
+        killed_on_map[ki].map_id = (u32)map_get();
         killed_on_map_count = ki + 1;
     }
 
-    // If join: send kill event to host
-    if (!recomp_net_is_host()) {
-        recomp_net_send_enemy_death((u32)marker_id, (u32)spawn_index, (u32)map_get(), pos);
-    }
+    // Send kill event to all other players immediately (both owner and non-owner)
+    recomp_net_send_enemy_death((u32)marker_id, (u32)spawn_index, (u32)map_get(), pos);
 
     // Stop position override so death animation plays
     mark_dying(spawn_index);
+
+    // Restore ALL original functions so death animation state machine runs
+    ActorUpdateFunc upd = get_saved_updatefunc(spawn_index);
+    if (upd) {
+        self_marker->actorUpdateFunc = upd;
+    }
+    MarkerCollisionFunc coll = get_saved_collisionfunc(spawn_index);
+    if (coll) {
+        self_marker->collisionFunc = coll;
+    }
 
     // Restore + call original dieFunc for natural death sequence
     MarkerCollisionFunc orig = get_saved_diefunc(spawn_index);
@@ -201,7 +257,8 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
 
 static TrackedEnemy prev_enemies[MAX_TRACKED_ENEMIES];
 static s32 prev_enemy_count = 0;
-static u32 prev_enemy_map = 0xFFFFFFFF;
+static u32 prev_enemy_level = 0xFFFFFFFF;  // Track by level_id (stable across sub-areas)
+static u32 prev_enemy_map = 0xFFFFFFFF;    // Track map_id to rebuild snapshot on sub-area change
 
 // Returns TRUE for marker types already handled by collectible sync
 static bool is_collectible_marker(u32 id) {
@@ -439,20 +496,24 @@ static void poll_nonshared_collectibles(void) {
 
 static void poll_enemy_deaths(void) {
     if (!recomp_net_is_connected() || processing_remote) return;
-    // Only host polls — join detects kills via state change in sync_enemy_positions
-    if (!recomp_net_is_host()) return;
     if (!suBaddieActorArray) return;
 
     u32 cur_map = (u32)map_get();
+    u32 cur_level = (u32)level_get();
 
-    // Reset tracking on map change (avoids false positives from level unloading)
-    if (cur_map != prev_enemy_map) {
+    // Only world owner polls — others receive via sync_enemy_positions
+    if (!recomp_net_am_i_world_owner(cur_level)) return;
+
+    // Reset tracking only on LEVEL change (not sub-area map transitions).
+    // level_get() stays constant when entering interiors/sub-areas within the same world.
+    if (cur_level != prev_enemy_level) {
         prev_enemy_count = 0;
+        prev_enemy_level = cur_level;
         prev_enemy_map = cur_map;
         saved_diefunc_count = 0;
         dying_count = 0;
         killed_on_map_count = 0;
-        killed_on_map_id = cur_map;
+        killed_on_level_id = cur_level;
         // Build initial snapshot without sending events
         s32 count = 0;
         s32 i;
@@ -462,6 +523,29 @@ static void poll_enemy_deaths(void) {
             if (!is_killable_enemy(actor)) continue;
             u32 mid = actor->marker->id;
             prev_enemies[count].marker_id = (u16)mid;
+            prev_enemies[count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            prev_enemies[count].pos_x = actor->position[0];
+            prev_enemies[count].pos_y = actor->position[1];
+            prev_enemies[count].pos_z = actor->position[2];
+            count++;
+        }
+        prev_enemy_count = count;
+        return;
+    }
+
+    // Sub-area change within same level: rebuild snapshot without sending death events
+    // or resetting killed_on_map (enemies killed in the main area stay tracked).
+    if (cur_map != prev_enemy_map) {
+        prev_enemy_map = cur_map;
+        saved_diefunc_count = 0;
+        dying_count = 0;
+        s32 count = 0;
+        s32 i;
+        for (i = 0; i < suBaddieActorArray->cnt && count < MAX_TRACKED_ENEMIES; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            if (!is_killable_enemy(actor)) continue;
+            prev_enemies[count].marker_id = (u16)actor->marker->id;
             prev_enemies[count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
             prev_enemies[count].pos_x = actor->position[0];
             prev_enemies[count].pos_y = actor->position[1];
@@ -524,6 +608,7 @@ static void poll_enemy_deaths(void) {
                         killed_on_map[ki].pos_x = pos[0];
                         killed_on_map[ki].pos_y = pos[1];
                         killed_on_map[ki].pos_z = pos[2];
+                        killed_on_map[ki].map_id = cur_map;
                         killed_on_map_count = ki + 1;
                     }
                 }
@@ -684,8 +769,8 @@ static void process_enemy_event(EnemyEventData *evt) {
     pos[1] = evt->enemy_pos_y;
     pos[2] = evt->enemy_pos_z;
 
-    // Simple and safe: just despawn the enemy.
-    // The killer already got their honeycomb from the game's collision handler.
+    // Remote kill: trigger death animation via dieFunc.
+    // Suppress AI first so local state doesn't interfere with the death sequence.
     if (suBaddieActorArray) {
         s32 i;
         for (i = 0; i < suBaddieActorArray->cnt; i++) {
@@ -695,13 +780,39 @@ static void process_enemy_event(EnemyEventData *evt) {
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
             if (si != target_spawn) continue;
 
-            marker_despawn(actor->marker);
-            recomp_printf("[ENEMY-EVT] despawned: marker=0x%X spawn=%d\n", target_marker, target_spawn);
+            // Spawn 1 honeycomb at enemy position (remote side doesn't get it from collision)
+            {
+                f32 drop_pos[3];
+                drop_pos[0] = actor->position[0];
+                drop_pos[1] = actor->position[1] + 50.0f;
+                drop_pos[2] = actor->position[2];
+                bundle_setYaw(actor->yaw);
+                D_8036E564 = 1;
+                bundle_spawn_f32(BUNDLE_14__HONEYCOMB, drop_pos);
+            }
+
+            // Stop position override so death animation can play at current position
+            mark_dying(target_spawn);
+
+            // Let AI run — it will process the death state set by dieFunc,
+            // play the full death animation, and despawn the actor when done.
+
+            // Restore original dieFunc and call it
+            MarkerCollisionFunc die = actor->marker->dieFunc;
+            if (die == (MarkerCollisionFunc)net_enemy_die_proxy) {
+                die = get_saved_diefunc(target_spawn);
+            }
+            if (die) {
+                actor->marker->dieFunc = die;
+                die(actor->marker, baMarker_get());
+            } else {
+                marker_despawn(actor->marker);
+            }
             break;
         }
     }
-    // If host: remove from prev_enemies so poll doesn't re-detect
-    if (recomp_net_is_host()) {
+    // If world owner: remove from prev_enemies so poll doesn't re-detect
+    if (recomp_net_am_i_world_owner((u32)level_get())) {
         s32 p;
         for (p = 0; p < prev_enemy_count; p++) {
             if (prev_enemies[p].marker_id == target_marker &&
@@ -742,9 +853,10 @@ static void sync_enemy_positions(void) {
     if (!suBaddieActorArray) return;
 
     u32 cur_map = (u32)map_get();
+    u32 cur_level = (u32)level_get();
 
-    if (recomp_net_is_host()) {
-        // HOST: collect enemy positions and send to network
+    if (recomp_net_am_i_world_owner(cur_level)) {
+        // WORLD OWNER: collect enemy positions and send to network
         EnemyPosEntry buf[MAX_ENEMY_POS_ENTRIES];
         s32 count = 0;
         s32 i;
@@ -755,6 +867,16 @@ static void sync_enemy_positions(void) {
             if (!is_killable_enemy(actor)) continue;
 
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+
+            // Install dieFunc proxy on owner too — sends death event immediately
+            // when enemy dies, instead of waiting for poll_enemy_deaths detection.
+            // AI is NOT suppressed on owner side.
+            if (actor->marker->dieFunc && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
+                save_enemy_funcs(si, actor->marker->dieFunc,
+                                 actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
+                actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
+            }
+
             buf[count].spawn_index = si;
             buf[count].marker_id = (u16)actor->marker->id;
             buf[count].x = actor->position[0];
@@ -812,17 +934,12 @@ static void sync_enemy_positions(void) {
                     anctrl_setAnimTimer(actor->anctrl, buf[e].anim_timer);
                 }
 
-                // Zero velocity to prevent physics drift
-                actor->velocity[0] = 0.0f;
-                actor->velocity[1] = 0.0f;
-                actor->velocity[2] = 0.0f;
-
-                // Suppress local AI — host controls position + animation.
-                actor->marker->actorUpdateFunc = (ActorUpdateFunc)0;
-
-                // Install dieFunc proxy only on actors with a real dieFunc (enemies)
+                // Install dieFunc proxy to track kills from non-owner side.
+                // AI is NOT suppressed — enemy processes damage and dies naturally.
+                // Position + animation are overridden from host data each frame.
                 if (actor->marker->dieFunc && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
-                    save_diefunc(target_spawn, actor->marker->dieFunc);
+                    save_enemy_funcs(target_spawn, actor->marker->dieFunc,
+                                     actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
                     actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
                 }
 
@@ -896,7 +1013,7 @@ static void check_full_sync_send(void) {
     recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d, killed=%d)\n",
         target_player, data.map_id, killed_on_map_count);
 
-    // Re-send all killed enemies on current map so the new join can despawn them
+    // Re-send all killed enemies in current level so the new join can despawn them
     if (killed_on_map_count > 0) {
         s32 k;
         for (k = 0; k < killed_on_map_count; k++) {
@@ -907,9 +1024,9 @@ static void check_full_sync_send(void) {
             recomp_net_send_enemy_death(
                 (u32)killed_on_map[k].marker_type,
                 (u32)killed_on_map[k].spawn_index,
-                (u32)map_get(), pos);
-            recomp_printf("[STATE-SYNC] re-sent kill: marker=0x%X spawn=%d\n",
-                killed_on_map[k].marker_type, killed_on_map[k].spawn_index);
+                killed_on_map[k].map_id, pos);
+            recomp_printf("[STATE-SYNC] re-sent kill: marker=0x%X spawn=%d map=%d\n",
+                killed_on_map[k].marker_type, killed_on_map[k].spawn_index, killed_on_map[k].map_id);
         }
     }
 }
@@ -1020,22 +1137,124 @@ static void check_full_sync_receive(void) {
     processing_remote = FALSE;
 }
 
+// Track previous level for ownership transfer detection
+static u32 prev_owner_level = 0xFFFFFFFF;
+
+// Send killed enemy data when leaving a world we owned
+static void check_ownership_transfer_send(void) {
+    u32 cur_level = (u32)level_get();
+    if (cur_level == prev_owner_level) return;
+
+    // Level changed — if we were the owner of the old level, send our killed data
+    if (prev_owner_level != 0xFFFFFFFF && killed_on_map_count > 0) {
+        if (recomp_net_am_i_world_owner(prev_owner_level)) {
+            // killed_on_map matches KilledEnemyEntry layout: u16+u16+f32+f32+f32 = 16 bytes
+            recomp_net_send_owner_transfer(prev_owner_level,
+                killed_on_map, (u32)killed_on_map_count);
+            recomp_printf("[OWNER-XFER] sent %d killed enemies for level %d\n",
+                killed_on_map_count, prev_owner_level);
+        }
+    }
+    prev_owner_level = cur_level;
+}
+
+// Receive ownership transfer data (we became the new owner)
+typedef struct {
+    u32 level_id;       // 0x00
+    u8  count;          // 0x04
+    u8  _pad[3];        // 0x05-0x07
+    struct {
+        u16 marker_type;  // +0x00
+        u16 spawn_index;  // +0x02
+        f32 pos_x;        // +0x04
+        f32 pos_y;        // +0x08
+        f32 pos_z;        // +0x0C
+        u32 map_id;       // +0x10
+    } entries[64];      // 0x08+, 20 bytes each
+} OwnerTransferData;
+
+static void check_ownership_transfer_receive(void) {
+    static OwnerTransferData xfer;  // static: too large for MIPS stack (1288 bytes)
+    if (!recomp_net_pop_owner_transfer(&xfer)) return;
+
+    u32 cur_level = (u32)level_get();
+    if (xfer.level_id != cur_level) {
+        recomp_printf("[OWNER-XFER] received transfer for level %d but we're on %d, ignoring\n",
+            xfer.level_id, cur_level);
+        return;
+    }
+
+    // Apply: merge received kills into our killed_on_map
+    recomp_printf("[OWNER-XFER] received %d killed enemies for level %d\n", xfer.count, xfer.level_id);
+    s32 k;
+    for (k = 0; k < (s32)xfer.count && killed_on_map_count < MAX_KILLED_ON_MAP; k++) {
+        u16 mt = xfer.entries[k].marker_type;
+        u16 si = xfer.entries[k].spawn_index;
+
+        // Check for duplicates
+        bool dup = FALSE;
+        s32 d;
+        for (d = 0; d < killed_on_map_count; d++) {
+            if (killed_on_map[d].marker_type == mt && killed_on_map[d].spawn_index == si) {
+                dup = TRUE;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        s32 idx = killed_on_map_count;
+        killed_on_map[idx].marker_type = mt;
+        killed_on_map[idx].spawn_index = si;
+        killed_on_map[idx].pos_x = xfer.entries[k].pos_x;
+        killed_on_map[idx].pos_y = xfer.entries[k].pos_y;
+        killed_on_map[idx].pos_z = xfer.entries[k].pos_z;
+        killed_on_map[idx].map_id = xfer.entries[k].map_id;
+        killed_on_map_count = idx + 1;
+    }
+}
+
+// Track map/level changes for ALL players to reset cached state
+static u32 prev_global_level = 0xFFFFFFFF;
+static u32 prev_global_map = 0xFFFFFFFF;
+
 // Called every frame
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     if (!recomp_net_is_connected()) return;
+
+    // Reset cached enemy functions on ANY map or level change (ALL players).
+    // Enemies are map-specific — when map changes, all saved function pointers
+    // become stale and must be cleared to prevent bus errors.
+    {
+        u32 cur_level = (u32)level_get();
+        u32 cur_map = (u32)map_get();
+        if (cur_level != prev_global_level || cur_map != prev_global_map) {
+            saved_diefunc_count = 0;
+            dying_count = 0;
+            prev_global_level = cur_level;
+            prev_global_map = cur_map;
+        }
+    }
+
+    // Ownership transfer
+    check_ownership_transfer_send();
+    check_ownership_transfer_receive();
 
     // Full state sync (runs once when new player joins)
     check_full_sync_send();
     check_full_sync_receive();
 
     // Process pending kills for current map (from late-join sync).
-    // Kept persistent — re-applied when join re-enters the map.
+    // Remove entries once successfully applied to prevent repeated despawn attempts.
     if (pending_kill_count > 0 && suBaddieActorArray) {
         u32 cur_map = (u32)map_get();
-        s32 k;
-        for (k = 0; k < pending_kill_count; k++) {
-            if (pending_kills[k].map_id != cur_map) continue;
+        s32 k = 0;
+        while (k < pending_kill_count) {
+            if (pending_kills[k].map_id != cur_map) {
+                k++;
+                continue;
+            }
 
+            bool applied = FALSE;
             s32 i;
             for (i = 0; i < suBaddieActorArray->cnt; i++) {
                 Actor *actor = &suBaddieActorArray->data[i];
@@ -1045,7 +1264,19 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
                 if (si != pending_kills[k].spawn_index) continue;
 
                 marker_despawn(actor->marker);
+                applied = TRUE;
                 break;
+            }
+
+            if (applied) {
+                // Remove this entry by swapping with last
+                pending_kills[k].marker_type = pending_kills[pending_kill_count - 1].marker_type;
+                pending_kills[k].spawn_index = pending_kills[pending_kill_count - 1].spawn_index;
+                pending_kills[k].map_id = pending_kills[pending_kill_count - 1].map_id;
+                pending_kill_count--;
+                // Don't increment k — check the swapped entry
+            } else {
+                k++;
             }
         }
     }

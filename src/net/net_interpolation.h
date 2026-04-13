@@ -17,6 +17,7 @@ struct PositionSnapshot {
     float pitch = 0.0f;
     float scale = 1.0f;
     uint32_t map_id = 0;
+    uint32_t level_id = 0;
     uint16_t animation_id = 0;
     float anim_timer = 0.0f;
     float anim_duration = 1.0f;
@@ -40,6 +41,7 @@ struct InterpolatedState {
     float pitch = 0.0f;
     float scale = 1.0f;
     uint32_t map_id = 0;
+    uint32_t level_id = 0;
     uint16_t animation_id = 0;
     float anim_timer = 0.0f;
     float anim_duration = 1.0f;

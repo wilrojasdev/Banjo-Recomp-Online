@@ -36,7 +36,9 @@ enum class PacketType : uint8_t {
     WorldEnemy       = 0x31,
     WorldObject      = 0x32,
     MapChange        = 0x33,
-    EnemyPositionBulk = 0x34,  // Unreliable, ~20Hz from host
+    EnemyPositionBulk = 0x34,  // Unreliable, ~20Hz from world owner
+    WorldOwnership   = 0x35,  // Host broadcasts ownership assignments
+    WorldOwnerTransfer = 0x36, // State handoff when owner leaves world
     WorldStateFull   = 0x3F,
 };
 
@@ -104,6 +106,7 @@ struct PlayerStatePacket {
     float x, y, z;
     float yaw, pitch, roll;
     uint32_t map_id;
+    uint32_t level_id;
     uint16_t animation_id;
     float anim_progress;
     float anim_duration;
@@ -195,6 +198,34 @@ struct WorldFlagPacket {
     uint16_t flag_index;
     uint8_t value;
     uint32_t map_id;            // Context: which map (for map-specific flags)
+};
+
+// --- World ownership (host broadcasts to all) ---
+
+struct WorldOwnershipPacket {
+    PacketHeader header;
+    uint32_t level_id;          // Which level (stable across sub-areas)
+    uint8_t owner_player_id;    // Who owns this world (0xFF = no owner / reset)
+    uint8_t _pad[3];
+};
+
+// --- World owner transfer (state handoff when owner leaves) ---
+
+constexpr uint8_t MAX_KILLED_TRANSFER = 64;
+
+struct KilledEnemyEntry {
+    uint16_t marker_type;
+    uint16_t spawn_index;
+    float pos_x, pos_y, pos_z;
+    uint32_t map_id;
+};  // 20 bytes
+
+struct WorldOwnerTransferPacket {
+    PacketHeader header;
+    uint32_t level_id;
+    uint8_t killed_count;
+    uint8_t _pad[3];
+    KilledEnemyEntry killed[MAX_KILLED_TRANSFER];
 };
 
 // --- Full world state sync (sent to joiner) ---

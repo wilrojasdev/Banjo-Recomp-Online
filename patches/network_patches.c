@@ -13,6 +13,7 @@ extern enum anctrl_playback_e anctrl_getPlaybackType(AnimCtrl *this);
 extern void anctrl_getSubRange(AnimCtrl *this, f32 *startPtr, f32 *endPtr);
 
 extern enum map_e map_get(void);
+extern enum level_e level_get(void);
 extern s32 bs_getState(void);
 extern u32 player_getTransformation(void);
 extern f32 baphysics_get_horizontal_velocity(void);
@@ -31,6 +32,7 @@ typedef struct {
     f32 scale;                  // 0x14
     u32 map_id;                 // 0x18
     u16 animation_id;           // 0x1C
+    u16 _pad1;                  // 0x1E
     f32 anim_timer;             // 0x20
     f32 anim_duration;          // 0x24
     u8  anim_playback_type;     // 0x28
@@ -44,10 +46,11 @@ typedef struct {
     f32 horizontal_velocity;    // 0x30
     f32 anim_subrange_start;    // 0x34
     f32 anim_subrange_end;      // 0x38
-} NetFullState; // 0x3C (60 bytes)
+} NetFullState; // 0x3C (60 bytes) — ORIGINAL LAYOUT, do NOT change
 
 // Networking bridge functions (registered on C++ side via REGISTER_FUNC)
 void recomp_net_push_full_state(NetFullState* state);
+void recomp_net_push_level_id(u32 level_id);
 u32 recomp_net_is_connected(void);
 u32 recomp_net_get_remote_state(u32 player_id, NetFullState* out);
 u32 recomp_net_get_remote_count(void);
@@ -96,6 +99,8 @@ static void net_sync_local_state(void) {
     state.lives = 0;
 
     recomp_net_push_full_state(&state);
+    // Push level_id separately (not in NetFullState to preserve struct layout)
+    recomp_net_push_level_id((u32)level_get());
 }
 
 

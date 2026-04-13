@@ -75,6 +75,12 @@ extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx) 
     bknet::NetworkManager::instance().push_local_full_state(snap);
 }
 
+// Push level_id separately (called after push_full_state, avoids changing MIPS struct layout)
+extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx) {
+    u32 level_id = static_cast<u32>(ctx->r4);
+    bknet::NetworkManager::instance().set_local_level_id(level_id);
+}
+
 // Backwards-compat: position-only push (Phase 1)
 extern "C" void recomp_net_push_local_state(uint8_t* rdram, recomp_context* ctx) {
     gpr state_ptr = ctx->r4;
@@ -190,6 +196,62 @@ extern "C" void recomp_net_send_flag_change(uint8_t* rdram, recomp_context* ctx)
     bknet::NetworkManager::instance().send_flag_change(
         static_cast<uint8_t>(flag_type), static_cast<uint16_t>(flag_index),
         static_cast<uint8_t>(value), map_id);
+}
+
+// === World ownership ===
+
+// Returns 1 if local player owns the given level, 0 otherwise. Args: level_id(r4)
+extern "C" void recomp_net_am_i_world_owner(uint8_t* rdram, recomp_context* ctx) {
+    u32 level_id = static_cast<u32>(ctx->r4);
+    _return(ctx, bknet::NetworkManager::instance().am_i_world_owner(level_id) ? 1u : 0u);
+}
+
+// Send owner transfer data: level_id(r4), killed_data_ptr(r5), count(r6)
+// Each entry: u16 marker_type, u16 spawn_index, f32 pos_x, f32 pos_y, f32 pos_z, u32 map_id (20 bytes)
+extern "C" void recomp_net_send_owner_transfer(uint8_t* rdram, recomp_context* ctx) {
+    u32 level_id = static_cast<u32>(ctx->r4);
+    gpr data_ptr = ctx->r5;
+    u32 count = static_cast<u32>(ctx->r6);
+
+    if (count == 0 || count > bknet::MAX_KILLED_TRANSFER) return;
+
+    std::vector<bknet::KilledEnemyEntry> entries(count);
+    for (u32 i = 0; i < count; i++) {
+        gpr entry_addr = data_ptr + i * 20;
+        entries[i].marker_type = static_cast<uint16_t>(MEM_HU(0x00, entry_addr));
+        entries[i].spawn_index = static_cast<uint16_t>(MEM_HU(0x02, entry_addr));
+        entries[i].pos_x = read_f32(rdram, entry_addr, 0x04);
+        entries[i].pos_y = read_f32(rdram, entry_addr, 0x08);
+        entries[i].pos_z = read_f32(rdram, entry_addr, 0x0C);
+        entries[i].map_id = MEM_W(0x10, entry_addr);
+    }
+
+    bknet::NetworkManager::instance().send_owner_transfer(level_id,
+        reinterpret_cast<const uint8_t*>(entries.data()),
+        count * sizeof(bknet::KilledEnemyEntry));
+}
+
+// Pop owner transfer data. Returns 1 if available. Args: out_ptr(r4)
+// Writes: u32 level_id, u8 count, then array of killed entries
+extern "C" void recomp_net_pop_owner_transfer(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    bknet::WorldOwnerTransferPacket pkt;
+    if (bknet::NetworkManager::instance().pop_owner_transfer(pkt)) {
+        MEM_W(0x00, out_ptr) = pkt.level_id;
+        MEM_BU(0x04, out_ptr) = pkt.killed_count;
+        for (u32 i = 0; i < pkt.killed_count && i < bknet::MAX_KILLED_TRANSFER; i++) {
+            gpr entry_addr = out_ptr + 8 + i * 20;
+            MEM_HU(0x00, entry_addr) = pkt.killed[i].marker_type;
+            MEM_HU(0x02, entry_addr) = pkt.killed[i].spawn_index;
+            write_f32(rdram, entry_addr, 0x04, pkt.killed[i].pos_x);
+            write_f32(rdram, entry_addr, 0x08, pkt.killed[i].pos_y);
+            write_f32(rdram, entry_addr, 0x0C, pkt.killed[i].pos_z);
+            MEM_W(0x10, entry_addr) = pkt.killed[i].map_id;
+        }
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
 }
 
 // === Enemy position sync ===

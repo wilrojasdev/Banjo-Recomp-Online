@@ -53,6 +53,16 @@ bool NetworkManager::host_game() {
     server_->set_disconnect_callback([this](uint8_t player_id) {
         std::printf("[Network] Player %u left the game\n", player_id);
         interpolation_.remove_player(player_id);
+        // Release world ownership for this player's level
+        uint32_t level;
+        {
+            std::lock_guard<std::mutex> lock(ownership_mutex_);
+            level = player_levels_[player_id];
+            player_levels_[player_id] = 0xFFFFFFFF;
+        }
+        if (level != 0xFFFFFFFF) {
+            release_world_owner(level, player_id);
+        }
     });
 
     if (!server_->start(config.port)) {
@@ -120,6 +130,16 @@ void NetworkManager::disconnect() {
     local_player_id_ = 0;
     interpolation_.reset();
     frame_counter_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        world_owner_.clear();
+        for (int i = 0; i < MAX_PLAYERS; i++) player_levels_[i] = 0xFFFFFFFF;
+        owner_transfer_queue_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex_);
+        packet_send_queue_.clear();
+    }
 }
 
 void NetworkManager::update() {
@@ -128,6 +148,20 @@ void NetworkManager::update() {
     // Pump ENet events
     if (server_) server_->update();
     if (client_) client_->update();
+
+    // Flush ALL queued packets from game thread (ENet only safe from SDL thread)
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex_);
+        while (!packet_send_queue_.empty()) {
+            auto& qp = packet_send_queue_.front();
+            if (server_) {
+                server_->broadcast(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
+            } else if (client_) {
+                client_->send(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
+            }
+            packet_send_queue_.pop_front();
+        }
+    }
 
     // Send local state at ~20Hz
     frame_counter_++;
@@ -148,6 +182,11 @@ void NetworkManager::push_local_state(float x, float y, float z, float yaw, uint
 
 void NetworkManager::push_local_full_state(const LocalPlayerSnapshot& snap) {
     state_sync_.write_local_state(snap);
+}
+
+void NetworkManager::set_local_level_id(uint32_t level_id) {
+    state_sync_.set_level_id(level_id);
+    update_player_level(local_player_id_, level_id);
 }
 
 InterpolatedState NetworkManager::get_remote_player(uint8_t player_id) const {
@@ -257,6 +296,20 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             handle_enemy_position_packet(data, size);
             break;
         }
+        case PacketType::WorldOwnership: {
+            WorldOwnershipPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_ownership_packet(pkt);
+            }
+            break;
+        }
+        case PacketType::WorldOwnerTransfer: {
+            WorldOwnerTransferPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_owner_transfer_packet(pkt);
+            }
+            break;
+        }
         default:
             break;
     }
@@ -273,6 +326,8 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
     uint8_t pid = pkt.header.player_id;
     if (pid == local_player_id_ || pid >= MAX_PLAYERS) return;
 
+    update_player_level(pid, pkt.level_id);
+
     PositionSnapshot snap;
     snap.x = pkt.x;
     snap.y = pkt.y;
@@ -281,6 +336,7 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
     snap.pitch = pkt.pitch;
     snap.scale = 1.0f;
     snap.map_id = pkt.map_id;
+    snap.level_id = pkt.level_id;
     snap.animation_id = pkt.animation_id;
     snap.anim_timer = pkt.anim_progress;
     snap.anim_duration = pkt.anim_duration;
@@ -317,11 +373,7 @@ void NetworkManager::send_chat(const std::string& message) {
     }
 
     size_t send_size = sizeof(PacketHeader) + 1 + pkt.msg_length + 1;
-    if (server_) {
-        server_->broadcast(&pkt, send_size, CHANNEL_RELIABLE, true);
-    } else if (client_) {
-        client_->send(&pkt, send_size, CHANNEL_RELIABLE, true);
-    }
+    enqueue_packet(&pkt, send_size, CHANNEL_RELIABLE, true);
 
     std::printf("[Chat] P%u: %s\n", local_player_id_, message.c_str());
 }
@@ -402,11 +454,7 @@ void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collect
     pkt.pos_y = snap.position[1];
     pkt.pos_z = snap.position[2];
 
-    if (server_) {
-        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    } else if (client_) {
-        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    }
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 }
 
 void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz) {
@@ -425,11 +473,7 @@ void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index
     pkt.pos_y = py;
     pkt.pos_z = pz;
 
-    if (server_) {
-        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    } else if (client_) {
-        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    }
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 }
 
 void NetworkManager::send_flag_change(uint8_t flag_type, uint16_t flag_index, uint8_t value, uint32_t map_id) {
@@ -444,11 +488,7 @@ void NetworkManager::send_flag_change(uint8_t flag_type, uint16_t flag_index, ui
     pkt.value = value;
     pkt.map_id = map_id;
 
-    if (server_) {
-        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    } else if (client_) {
-        client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    }
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 }
 
 void NetworkManager::handle_collectible_packet(const WorldCollectiblePacket& pkt) {
@@ -501,11 +541,7 @@ void NetworkManager::send_enemy_positions(const EnemyPositionEntry* entries, uin
     pkt.enemy_count = count;
     std::memcpy(pkt.enemies, entries, count * sizeof(EnemyPositionEntry));
 
-    if (server_) {
-        server_->broadcast(&pkt, payload_size, CHANNEL_UNRELIABLE, false);
-    } else if (client_) {
-        client_->send(&pkt, payload_size, CHANNEL_UNRELIABLE, false);
-    }
+    enqueue_packet(&pkt, payload_size, CHANNEL_UNRELIABLE, false);
 }
 
 void NetworkManager::handle_enemy_position_packet(const uint8_t* data, size_t size) {
@@ -552,9 +588,9 @@ bool NetworkManager::should_send_full_sync(uint8_t& out_player_id) {
 void NetworkManager::send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player) {
     if (!is_connected() || !server_) return;
 
-    // Send to specific player only
-    server_->send_to(target_player, data, size, CHANNEL_RELIABLE, true);
-    std::printf("[Network] Sent WorldStateFull (%zu bytes) to player %u\n", size, target_player);
+    // Enqueue for SDL thread (game thread cannot call ENet directly)
+    enqueue_packet(data, size, CHANNEL_RELIABLE, true);
+    std::printf("[Network] Queued WorldStateFull (%zu bytes) for player %u\n", size, target_player);
 }
 
 void NetworkManager::handle_world_state_full_packet(const WorldStateFullPacket& pkt) {
@@ -569,6 +605,195 @@ bool NetworkManager::pop_full_state(WorldStateFullPacket& out) {
     if (full_state_queue_.empty()) return false;
     out = full_state_queue_.front();
     full_state_queue_.pop_front();
+    return true;
+}
+
+// === Thread-safe packet sending ===
+
+void NetworkManager::enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable) {
+    std::lock_guard<std::mutex> lock(send_queue_mutex_);
+    QueuedPacket qp;
+    qp.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    qp.channel = channel;
+    qp.reliable = reliable;
+    packet_send_queue_.push_back(std::move(qp));
+}
+
+// === World ownership ===
+
+void NetworkManager::update_player_level(uint8_t player_id, uint32_t level_id) {
+    if (!is_connected() || player_id >= MAX_PLAYERS) return;
+
+    uint32_t old_level;
+    bool needs_release = false;
+    bool needs_assign = false;
+
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        old_level = player_levels_[player_id];
+        if (old_level == level_id) return; // No change
+        player_levels_[player_id] = level_id;
+
+        if (!is_host()) return;
+
+        // Check what ownership actions are needed (but don't call them under lock)
+        if (old_level != 0xFFFFFFFF) {
+            auto it = world_owner_.find(old_level);
+            needs_release = (it != world_owner_.end() && it->second == player_id);
+        }
+        if (level_id != 0xFFFFFFFF) {
+            needs_assign = (world_owner_.find(level_id) == world_owner_.end());
+        }
+    }
+    // Now call outside the lock to avoid deadlock
+
+    if (needs_release) {
+        release_world_owner(old_level, player_id);
+    }
+    if (needs_assign) {
+        assign_world_owner(level_id, player_id);
+    }
+
+    // When a remote player enters a level, re-sync killed enemies + collectibles.
+    // This handles the case where a player leaves and re-enters a level —
+    // the game reloads all enemies fresh, so we need to re-send the kill list.
+    if (is_host() && player_id != local_player_id_ && level_id != 0xFFFFFFFF) {
+        request_full_sync(player_id);
+        std::printf("[Ownership] Requested full sync for player %u entering level %u\n",
+            player_id, level_id);
+    }
+}
+
+void NetworkManager::assign_world_owner(uint32_t level_id, uint8_t player_id) {
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        world_owner_[level_id] = player_id;
+    }
+
+    std::printf("[Ownership] Player %u is now owner of level %u\n", player_id, level_id);
+
+    WorldOwnershipPacket pkt{};
+    pkt.header.type = PacketType::WorldOwnership;
+    pkt.header.player_id = 0;
+    pkt.header.sequence = 0;
+    pkt.level_id = level_id;
+    pkt.owner_player_id = player_id;
+
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+}
+
+void NetworkManager::release_world_owner(uint32_t level_id, uint8_t leaving_player_id) {
+    uint8_t current_owner;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        auto it = world_owner_.find(level_id);
+        if (it == world_owner_.end()) return;
+        current_owner = it->second;
+        if (current_owner != leaving_player_id) return; // Not the owner, nothing to do
+    }
+
+    // Find another player on the same level
+    uint8_t new_owner = 0xFF;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
+            if (i == leaving_player_id) continue;
+            if (player_levels_[i] == level_id) {
+                new_owner = i;
+                break;
+            }
+        }
+    }
+
+    if (new_owner != 0xFF) {
+        // Transfer ownership
+        assign_world_owner(level_id, new_owner);
+        std::printf("[Ownership] Transferred level %u from player %u to player %u\n",
+            level_id, leaving_player_id, new_owner);
+    } else {
+        // No one left — remove ownership (world state resets)
+        {
+            std::lock_guard<std::mutex> lock(ownership_mutex_);
+            world_owner_.erase(level_id);
+        }
+
+        WorldOwnershipPacket pkt{};
+        pkt.header.type = PacketType::WorldOwnership;
+        pkt.header.player_id = 0;
+        pkt.header.sequence = 0;
+        pkt.level_id = level_id;
+        pkt.owner_player_id = 0xFF; // No owner
+
+        enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+
+        std::printf("[Ownership] Level %u has no players — state reset\n", level_id);
+    }
+}
+
+bool NetworkManager::am_i_world_owner(uint32_t level_id) const {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
+    auto it = world_owner_.find(level_id);
+    if (it == world_owner_.end()) return false;
+    return it->second == local_player_id_;
+}
+
+uint8_t NetworkManager::get_world_owner(uint32_t level_id) const {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
+    auto it = world_owner_.find(level_id);
+    if (it == world_owner_.end()) return 0xFF;
+    return it->second;
+}
+
+void NetworkManager::handle_ownership_packet(const WorldOwnershipPacket& pkt) {
+    std::lock_guard<std::mutex> lock(ownership_mutex_);
+    if (pkt.owner_player_id == 0xFF) {
+        world_owner_.erase(pkt.level_id);
+        std::printf("[Ownership] Level %u owner cleared\n", pkt.level_id);
+    } else {
+        world_owner_[pkt.level_id] = pkt.owner_player_id;
+        std::printf("[Ownership] Level %u owner set to player %u\n", pkt.level_id, pkt.owner_player_id);
+    }
+}
+
+void NetworkManager::handle_owner_transfer_packet(const WorldOwnerTransferPacket& pkt) {
+    // Only the new owner should process this
+    if (pkt.header.player_id == local_player_id_) return;
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        auto it = world_owner_.find(pkt.level_id);
+        if (it == world_owner_.end() || it->second != local_player_id_) return;
+    }
+    // Queue for game thread to pick up
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    owner_transfer_queue_.push_back(pkt);
+    std::printf("[Ownership] Received transfer data for level %u (%u killed enemies)\n",
+        pkt.level_id, pkt.killed_count);
+}
+
+void NetworkManager::send_owner_transfer(uint32_t level_id, const uint8_t* killed_data, size_t size) {
+    if (!is_connected()) return;
+
+    WorldOwnerTransferPacket pkt{};
+    pkt.header.type = PacketType::WorldOwnerTransfer;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = 0; // set when flushed
+    pkt.level_id = level_id;
+
+    size_t entry_count = size / sizeof(KilledEnemyEntry);
+    if (entry_count > MAX_KILLED_TRANSFER) entry_count = MAX_KILLED_TRANSFER;
+    pkt.killed_count = static_cast<uint8_t>(entry_count);
+    std::memcpy(pkt.killed, killed_data, entry_count * sizeof(KilledEnemyEntry));
+
+    size_t send_size = sizeof(PacketHeader) + sizeof(uint32_t) + 4 +
+                       entry_count * sizeof(KilledEnemyEntry);
+    enqueue_packet(&pkt, send_size, CHANNEL_RELIABLE, true);
+}
+
+bool NetworkManager::pop_owner_transfer(WorldOwnerTransferPacket& out) {
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    if (owner_transfer_queue_.empty()) return false;
+    out = owner_transfer_queue_.front();
+    owner_transfer_queue_.pop_front();
     return true;
 }
 

@@ -44,6 +44,7 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     out.pitch = snapshot_.pitch;
     out.roll = 0.0f;
     out.map_id = snapshot_.map_id;
+    out.level_id = snapshot_.level_id;
     out.animation_id = snapshot_.animation_id;
     out.anim_progress = snapshot_.anim_timer;
     out.anim_duration = snapshot_.anim_duration;
@@ -68,5 +69,11 @@ uint32_t StateSync::get_local_map_id() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return snapshot_.map_id;
 }
+
+void StateSync::set_level_id(uint32_t level_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.level_id = level_id;
+}
+
 
 } // namespace bknet
