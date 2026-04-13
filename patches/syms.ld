@@ -71,3 +71,8 @@ recomp_net_pop_world_event = 0x8F0000F0;
 recomp_net_is_host = 0x8F0000F4;
 recomp_net_send_enemy_positions = 0x8F0000F8;
 recomp_net_get_enemy_positions = 0x8F0000FC;
+
+/* Full state sync */
+recomp_net_should_send_full_sync = 0x8F000100;
+recomp_net_send_world_state_full = 0x8F000104;
+recomp_net_pop_full_state = 0x8F000108;

@@ -248,6 +248,68 @@ extern "C" void recomp_net_get_enemy_positions(uint8_t* rdram, recomp_context* c
     MEM_W(0x00, count_ptr) = static_cast<u32>(count);
 }
 
+// === Full state sync ===
+
+// Check if host needs to send full sync. Returns 1 + writes player_id to r4 ptr.
+extern "C" void recomp_net_should_send_full_sync(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    uint8_t player_id;
+    if (bknet::NetworkManager::instance().should_send_full_sync(player_id)) {
+        MEM_BU(0x00, out_ptr) = player_id;
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}
+
+// Send WorldStateFull packet: data_ptr(r4), size(r5), target_player(r6)
+extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context* ctx) {
+    gpr data_ptr = ctx->r4;
+    u32 size = static_cast<u32>(ctx->r5);
+    u32 target = static_cast<u32>(ctx->r6);
+
+    // Build packet from MIPS memory
+    bknet::WorldStateFullPacket pkt{};
+    pkt.header.type = bknet::PacketType::WorldStateFull;
+    pkt.header.player_id = bknet::NetworkManager::instance().local_player_id();
+    pkt.header.sequence = 0;
+
+    // Read fields from MIPS: layout must match MIPS struct
+    pkt.map_id = MEM_W(0x00, data_ptr);
+    pkt.level_id = MEM_BU(0x04, data_ptr);
+    // jiggy_score at 0x08 (13 bytes)
+    for (int i = 0; i < 13; i++) pkt.jiggy_score[i] = MEM_BU(0x08 + i, data_ptr);
+    // mumbo_score at 0x15 (16 bytes)
+    for (int i = 0; i < 16; i++) pkt.mumbo_score[i] = MEM_BU(0x15 + i, data_ptr);
+    // honeycomb_score at 0x25 (3 bytes)
+    for (int i = 0; i < 3; i++) pkt.honeycomb_score[i] = MEM_BU(0x25 + i, data_ptr);
+    pkt.jinjo_bits = MEM_BU(0x28, data_ptr);
+    pkt.note_count = static_cast<uint16_t>(MEM_HU(0x2A, data_ptr));
+    pkt.lives = MEM_BU(0x2C, data_ptr);
+
+    bknet::NetworkManager::instance().send_world_state_full(
+        reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt), static_cast<uint8_t>(target));
+}
+
+// Pop full state event from separate queue. Returns 1 if available.
+extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    bknet::WorldStateFullPacket pkt;
+    if (bknet::NetworkManager::instance().pop_full_state(pkt)) {
+        MEM_W(0x00, out_ptr) = pkt.map_id;
+        MEM_BU(0x04, out_ptr) = pkt.level_id;
+        for (int i = 0; i < 13; i++) MEM_BU(0x08 + i, out_ptr) = pkt.jiggy_score[i];
+        for (int i = 0; i < 16; i++) MEM_BU(0x15 + i, out_ptr) = pkt.mumbo_score[i];
+        for (int i = 0; i < 3; i++) MEM_BU(0x25 + i, out_ptr) = pkt.honeycomb_score[i];
+        MEM_BU(0x28, out_ptr) = pkt.jinjo_bits;
+        MEM_HU(0x2A, out_ptr) = pkt.note_count;
+        MEM_BU(0x2C, out_ptr) = pkt.lives;
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}
+
 // Pop next world event from queue. Returns 1 if event available, 0 if empty.
 // Writes event data to output struct at r4.
 // Output layout (28 bytes):

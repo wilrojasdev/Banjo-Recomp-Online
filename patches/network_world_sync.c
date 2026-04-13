@@ -10,6 +10,9 @@ u32  recomp_net_is_connected(void);
 u32  recomp_net_is_host(void);
 void recomp_net_send_enemy_positions(void *buf, u32 count, u32 map_id);
 void recomp_net_get_enemy_positions(void *buf, u32 *count);
+u32  recomp_net_should_send_full_sync(u8 *out_player_id);
+void recomp_net_send_world_state_full(void *data, u32 size, u32 target_player);
+u32  recomp_net_pop_full_state(void *out);
 
 extern enum map_e map_get(void);
 extern enum level_e level_get(void);
@@ -726,10 +729,17 @@ static void sync_enemy_positions(void) {
 
         if (count == 0) return;
 
+        // Build set of spawn_indices that host has alive
+        u16 host_alive[MAX_ENEMY_POS_ENTRIES];
+        s32 host_alive_count = 0;
+
         s32 e;
         for (e = 0; e < (s32)count; e++) {
             u16 target_spawn = buf[e].spawn_index;
             u16 target_marker = buf[e].marker_id;
+
+            host_alive[host_alive_count] = target_spawn;
+            host_alive_count++;
 
             // Skip dying enemies — let death animation play without override
             if (is_dying(target_spawn)) continue;
@@ -762,7 +772,6 @@ static void sync_enemy_positions(void) {
                 actor->velocity[2] = 0.0f;
 
                 // Suppress local AI — host controls position + animation.
-                // Death sequences still work: dying enemies are excluded from this loop.
                 actor->marker->actorUpdateFunc = (ActorUpdateFunc)0;
 
                 // Install dieFunc proxy so join kills send events to host
@@ -772,12 +781,206 @@ static void sync_enemy_positions(void) {
                 break;
             }
         }
+
+        // Despawn local enemies that host doesn't have (killed before join entered)
+        // Iterate backwards since marker_despawn uses swap-and-pop
+        if (host_alive_count > 0 && suBaddieActorArray) {
+            s32 i;
+            for (i = suBaddieActorArray->cnt - 1; i >= 0; i--) {
+                Actor *actor = &suBaddieActorArray->data[i];
+                if (!actor->marker) continue;
+                u32 mid = actor->marker->id;
+                if (is_collectible_marker(mid)) continue;
+                if (is_dying((u16)bkrecomp_get_marker_spawn_index(actor->marker))) continue;
+
+                u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+                bool in_host = FALSE;
+                s32 h;
+                for (h = 0; h < host_alive_count; h++) {
+                    if (host_alive[h] == si) { in_host = TRUE; break; }
+                }
+                if (!in_host) {
+                    marker_despawn(actor->marker);
+                }
+            }
+        }
     }
+}
+
+// === Full state sync on join ===
+
+// MIPS layout for WorldStateFull data (must match net_recomp_api.cpp):
+// 0x00: u32 map_id
+// 0x04: u8  level_id
+// 0x08: u8[13] jiggy_score
+// 0x15: u8[16] mumbo_score
+// 0x25: u8[3]  honeycomb_score
+// 0x28: u8  jinjo_bits
+// 0x2A: u16 note_count
+// 0x2C: u8  lives
+// Total: 0x2D (45 bytes)
+
+typedef struct {
+    u32 map_id;              // 0x00
+    u8  level_id;            // 0x04
+    u8  _pad[3];             // 0x05-0x07
+    u8  jiggy_score[13];     // 0x08
+    u8  mumbo_score[16];     // 0x15
+    u8  honeycomb_score[3];  // 0x25
+    u8  jinjo_bits;          // 0x28
+    u8  _pad2;               // 0x29
+    u16 note_count;          // 0x2A
+    u8  lives;               // 0x2C
+    u8  _pad3;               // 0x2D
+} WorldStateFullData;        // 0x2E = 46 bytes
+
+// Host: snapshot and send current state when a new player joins
+static void check_full_sync_send(void) {
+    if (!recomp_net_is_host()) return;
+
+    u8 target_player;
+    if (!recomp_net_should_send_full_sync(&target_player)) return;
+
+    WorldStateFullData data;
+    data.map_id = (u32)map_get();
+    data.level_id = (u8)level_get();
+
+    // Jiggy score
+    u8 *js = jiggyscore_getPtr();
+    if (js) { s32 i; for (i = 0; i < 13; i++) data.jiggy_score[i] = js[i]; }
+    else { s32 i; for (i = 0; i < 13; i++) data.jiggy_score[i] = 0; }
+
+    // Mumbo token score
+    u8 *ms = func_80321538();
+    if (ms) { s32 i; for (i = 0; i < 16; i++) data.mumbo_score[i] = ms[i]; }
+    else { s32 i; for (i = 0; i < 16; i++) data.mumbo_score[i] = 0; }
+
+    // Honeycomb score
+    u8 *hs = honeycombscore_get_ptr();
+    if (hs) { s32 i; for (i = 0; i < 3; i++) data.honeycomb_score[i] = hs[i]; }
+    else { s32 i; for (i = 0; i < 3; i++) data.honeycomb_score[i] = 0; }
+
+    data.jinjo_bits = (u8)item_getCount(ITEM_12_JINJOS);
+    data.note_count = (u16)item_getCount(ITEM_C_NOTE);
+    data.lives = (u8)item_getCount(ITEM_16_LIFE);
+
+    recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
+    recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d)\n", target_player, data.map_id);
+}
+
+// Join: apply received full state from host
+static void check_full_sync_receive(void) {
+    if (recomp_net_is_host()) return;
+
+    WorldStateFullData data;
+    if (!recomp_net_pop_full_state(&data)) return;
+
+    recomp_printf("[STATE-SYNC] applying full state from host (map=%d)\n", data.map_id);
+
+    processing_remote = TRUE;
+
+    // Apply jiggy scores
+    {
+        s32 i;
+        for (i = 0; i < 13; i++) {
+            s32 bit;
+            for (bit = 0; bit < 8; bit++) {
+                if (data.jiggy_score[i] & (1 << bit)) {
+                    s32 jiggy_id = i * 8 + bit + 1;
+                    if (jiggy_id > 0 && jiggy_id < 0x65) {
+                        if (!jiggyscore_isCollected(jiggy_id)) {
+                            jiggyscore_setCollected(jiggy_id, TRUE);
+                            item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+                        }
+                    }
+                }
+            }
+        }
+        // Sync prev tracking
+        u8 *s = jiggyscore_getPtr();
+        if (s) { s32 j; for (j = 0; j < 0xD; j++) prev_jiggyscore[j] = s[j]; }
+    }
+
+    // Apply mumbo token scores
+    {
+        s32 i;
+        for (i = 0; i < 16; i++) {
+            s32 bit;
+            for (bit = 0; bit < 8; bit++) {
+                if (data.mumbo_score[i] & (1 << bit)) {
+                    s32 token_id = i * 8 + bit + 1;
+                    if (!mumboscore_get(token_id)) {
+                        mumboscore_set(token_id, TRUE);
+                        item_inc(ITEM_1C_MUMBO_TOKEN);
+                    }
+                }
+            }
+        }
+        u8 *s = func_80321538();
+        if (s) { s32 j; for (j = 0; j < 16; j++) prev_mumboscore[j] = s[j]; }
+    }
+
+    // Apply honeycomb scores
+    {
+        s32 i;
+        for (i = 0; i < 3; i++) {
+            s32 bit;
+            for (bit = 0; bit < 8; bit++) {
+                if (data.honeycomb_score[i] & (1 << bit)) {
+                    s32 hc_id = i * 8 + bit + 1;
+                    if (hc_id > 0 && hc_id < 0x19) {
+                        if (!honeycombscore_get(hc_id)) {
+                            honeycombscore_set(hc_id, TRUE);
+                            item_inc(ITEM_13_EMPTY_HONEYCOMB);
+                        }
+                    }
+                }
+            }
+        }
+        u8 *s = honeycombscore_get_ptr();
+        if (s) { s32 j; for (j = 0; j < 3; j++) prev_honeycombscore[j] = s[j]; }
+    }
+
+    // Apply jinjo bits
+    {
+        s32 cur = item_getCount(ITEM_12_JINJOS);
+        s32 target = (s32)data.jinjo_bits;
+        s32 new_bits = target & ~cur;
+        if (new_bits > 0) {
+            item_adjustByDiffWithHud(ITEM_12_JINJOS, new_bits);
+        }
+        prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+    }
+
+    // Apply note count
+    {
+        s32 cur = item_getCount(ITEM_C_NOTE);
+        s32 target = (s32)data.note_count;
+        if (target > cur) {
+            item_adjustByDiffWithoutHud(ITEM_C_NOTE, target - cur);
+        }
+    }
+
+    // Apply lives
+    {
+        s32 cur = item_getCount(ITEM_16_LIFE);
+        s32 target = (s32)data.lives;
+        if (target > cur) {
+            item_adjustByDiffWithoutHud(ITEM_16_LIFE, target - cur);
+        }
+        prev_lives = item_getCount(ITEM_16_LIFE);
+    }
+
+    processing_remote = FALSE;
 }
 
 // Called every frame
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     if (!recomp_net_is_connected()) return;
+
+    // Full state sync (runs once when new player joins)
+    check_full_sync_send();
+    check_full_sync_receive();
 
     poll_shared_collectibles();
     poll_nonshared_collectibles();

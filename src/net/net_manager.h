@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -57,6 +58,11 @@ public:
     void send_enemy_positions(const EnemyPositionEntry* entries, uint8_t count, uint32_t map_id);
     size_t get_enemy_positions(EnemyInterpolatedState* out, size_t max_count) const;
 
+    // Full state sync on join
+    void request_full_sync(uint8_t player_id);
+    bool should_send_full_sync(uint8_t& out_player_id);
+    void send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player);
+
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
         enum Type : uint8_t { COLLECTIBLE, ENEMY, FLAG } type;
@@ -67,6 +73,7 @@ public:
         };
     };
     bool pop_world_event(WorldEvent& out);  // Called from game thread
+    bool pop_full_state(WorldStateFullPacket& out);  // Called from game thread
 
     struct ChatEntry {
         uint8_t player_id;
@@ -105,6 +112,7 @@ private:
     void handle_enemy_packet(const WorldEnemyPacket& pkt);
     void handle_enemy_position_packet(const uint8_t* data, size_t size);
     void handle_flag_packet(const WorldFlagPacket& pkt);
+    void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
@@ -132,6 +140,11 @@ private:
 
     // Enemy position interpolation (host→join)
     EnemyInterpolationManager enemy_interp_;
+
+    // Full state sync on join
+    std::atomic<bool> pending_full_sync_{false};
+    uint8_t sync_target_player_ = 0;
+    std::deque<WorldStateFullPacket> full_state_queue_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;
 };

@@ -197,6 +197,23 @@ struct WorldFlagPacket {
     uint32_t map_id;            // Context: which map (for map-specific flags)
 };
 
+// --- Full world state sync (sent to joiner) ---
+
+struct WorldStateFullPacket {
+    PacketHeader header;
+    uint32_t map_id;
+    uint8_t level_id;
+    uint8_t _pad1[3];
+    uint8_t jiggy_score[13];
+    uint8_t mumbo_score[16];
+    uint8_t honeycomb_score[3];
+    uint8_t jinjo_bits;         // ITEM_12_JINJOS bitmask
+    uint8_t _pad2;
+    uint16_t note_count;
+    uint8_t lives;
+    uint8_t _pad3;
+};
+
 // --- Chat ---
 
 constexpr size_t CHAT_MAX_LENGTH = 128;

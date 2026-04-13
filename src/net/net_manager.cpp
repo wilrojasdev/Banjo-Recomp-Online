@@ -45,8 +45,9 @@ bool NetworkManager::host_game() {
         handle_packet(player_id, data, size);
     });
 
-    server_->set_connect_callback([](uint8_t player_id) {
+    server_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[Network] Player %u joined the game\n", player_id);
+        request_full_sync(player_id);
     });
 
     server_->set_disconnect_callback([this](uint8_t player_id) {
@@ -242,6 +243,13 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             WorldFlagPacket pkt;
             if (deserialize(data, size, pkt)) {
                 handle_flag_packet(pkt);
+            }
+            break;
+        }
+        case PacketType::WorldStateFull: {
+            WorldStateFullPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_world_state_full_packet(pkt);
             }
             break;
         }
@@ -522,6 +530,46 @@ void NetworkManager::handle_enemy_position_packet(const uint8_t* data, size_t si
 
 size_t NetworkManager::get_enemy_positions(EnemyInterpolatedState* out, size_t max_count) const {
     return enemy_interp_.get_interpolated(out, max_count, get_time());
+}
+
+// === Full state sync on join ===
+
+void NetworkManager::request_full_sync(uint8_t player_id) {
+    sync_target_player_ = player_id;
+    pending_full_sync_.store(true);
+    std::printf("[Network] Full state sync requested for player %u\n", player_id);
+}
+
+bool NetworkManager::should_send_full_sync(uint8_t& out_player_id) {
+    if (pending_full_sync_.load()) {
+        out_player_id = sync_target_player_;
+        pending_full_sync_.store(false);
+        return true;
+    }
+    return false;
+}
+
+void NetworkManager::send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player) {
+    if (!is_connected() || !server_) return;
+
+    // Send to specific player only
+    server_->send_to(target_player, data, size, CHANNEL_RELIABLE, true);
+    std::printf("[Network] Sent WorldStateFull (%zu bytes) to player %u\n", size, target_player);
+}
+
+void NetworkManager::handle_world_state_full_packet(const WorldStateFullPacket& pkt) {
+    if (is_host()) return;
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    full_state_queue_.push_back(pkt);
+    std::printf("[Network] Received WorldStateFull from host\n");
+}
+
+bool NetworkManager::pop_full_state(WorldStateFullPacket& out) {
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    if (full_state_queue_.empty()) return false;
+    out = full_state_queue_.front();
+    full_state_queue_.pop_front();
+    return true;
 }
 
 } // namespace bknet
