@@ -100,10 +100,19 @@ extern "C" void recomp_net_is_connected(uint8_t* rdram, recomp_context* ctx) {
     _return(ctx, bknet::NetworkManager::instance().is_connected() ? 1u : 0u);
 }
 
-// Returns 1 if online mode is configured (BK_NET_MODE is set), 0 otherwise.
-// Available at boot time, before networking is initialized.
+// Returns 1 if online mode is configured, 0 otherwise.
 extern "C" void recomp_net_is_online_mode(uint8_t* rdram, recomp_context* ctx) {
     _return(ctx, bknet::get_config().mode != bknet::NetworkMode::Off ? 1u : 0u);
+}
+
+// Returns the selected save slot (0-2). Set from launcher Host submenu.
+extern "C" void recomp_net_get_save_slot(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, static_cast<u32>(bknet::get_config().save_slot));
+}
+
+// Returns 1 if join mode, 0 if host or off.
+extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, bknet::get_config().mode == bknet::NetworkMode::Join ? 1u : 0u);
 }
 
 // Get remote player's interpolated state.

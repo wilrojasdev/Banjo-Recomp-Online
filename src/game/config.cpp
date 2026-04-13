@@ -287,7 +287,7 @@ void banjo::init_config() {
 
     auto &general_config = recompui::config::create_general_tab(general_options);
     add_general_options(general_config);
-    add_network_options(general_config);
+    // Network options removed from Settings — handled by launcher Host/Join buttons
 
     auto &graphics_config = recompui::config::create_graphics_tab();
     add_graphics_options(graphics_config);

@@ -17,6 +17,7 @@ struct NetworkConfig {
     uint16_t port = 7777;
     std::string join_ip = "127.0.0.1";
     std::string player_name = "Player";
+    int save_slot = 0; // 0-2, selected in Host submenu
 };
 
 // Global config accessors

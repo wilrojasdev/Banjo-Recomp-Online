@@ -108,6 +108,7 @@ static void net_sync_local_state(void) {
 extern void bkrecomp_net_manage_ghosts(void);
 // World state sync (defined in network_world_sync.c)
 extern void bkrecomp_net_process_world_events(void);
+// Auto-load is handled directly in title_screen_patches.c via gameSelect_initAndUpdate patch
 
 // @recomp Export: called from ncCamera_update each game frame.
 RECOMP_EXPORT void bkrecomp_net_sync_frame(void) {
