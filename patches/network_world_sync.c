@@ -4,8 +4,12 @@
 
 // Network bridge
 void recomp_net_send_collectible(u32 type, u32 id, u32 collected, u32 map_id, u32 level_id);
+void recomp_net_send_enemy_death(u32 marker_type, u32 spawn_index, u32 map_id, f32 *pos);
 u32  recomp_net_pop_world_event(void *out);
 u32  recomp_net_is_connected(void);
+u32  recomp_net_is_host(void);
+void recomp_net_send_enemy_positions(void *buf, u32 count, u32 map_id);
+void recomp_net_get_enemy_positions(void *buf, u32 *count);
 
 extern enum map_e map_get(void);
 extern enum level_e level_get(void);
@@ -19,6 +23,24 @@ extern bool mumboscore_get(s32 indx);
 extern void mumboscore_set(s32 indx, bool val);
 extern void marker_despawn(ActorMarker *marker);
 extern ActorArray *suBaddieActorArray;
+
+// Marker spawn index (stable ID across clients)
+extern u32 bkrecomp_get_marker_spawn_index(ActorMarker* marker);
+
+// Animation control
+extern enum asset_e anctrl_getIndex(AnimCtrl *this);
+extern f32 anctrl_getAnimTimer(AnimCtrl *this);
+extern void anctrl_setIndex(AnimCtrl *this, enum asset_e index);
+extern void anctrl_setAnimTimer(AnimCtrl *this, f32 timer);
+
+// Player marker (for triggering enemy death callbacks)
+extern ActorMarker *baMarker_get(void);
+
+// Bundle/item drop system (honeycomb on enemy kill)
+extern Actor *__bundle_spawnFromFirstActor(enum bundle_e bundle_id, Actor *actor);
+extern Actor *bundle_spawn_f32(enum bundle_e bundle_id, f32 position[3]);
+extern void bundle_setYaw(f32 yaw);
+extern s32 D_8036E564; // bundle count global, read by bundle system
 
 // Score pointers
 extern u8 *jiggyscore_getPtr(void);
@@ -37,8 +59,128 @@ extern void honeycombscore_set(s32 indx, bool val);
 #define COLLECTIBLE_EXTRA_LIFE       6  // Shared: Banjo trophy
 
 #define EVENT_COLLECTIBLE 0
+#define EVENT_ENEMY       1
 
 static bool processing_remote = FALSE;
+
+// === Enemy tracking ===
+#define MAX_TRACKED_ENEMIES 128
+
+typedef struct {
+    u16 marker_id;
+    u16 spawn_index;
+    f32 pos_x, pos_y, pos_z;
+} TrackedEnemy;
+
+// --- Dying enemies: stop position override so death animation can play ---
+#define MAX_DYING_ENEMIES 32
+static u16 dying_spawns[MAX_DYING_ENEMIES];
+static s32 dying_count = 0;
+
+static bool is_dying(u16 spawn_index) {
+    s32 i;
+    for (i = 0; i < dying_count; i++) {
+        if (dying_spawns[i] == spawn_index) return TRUE;
+    }
+    return FALSE;
+}
+
+static void mark_dying(u16 spawn_index) {
+    if (dying_count < MAX_DYING_ENEMIES && !is_dying(spawn_index)) {
+        dying_spawns[dying_count] = spawn_index;
+        dying_count++;
+    }
+}
+
+// --- Join dieFunc proxy ---
+// Saves original dieFuncs. Proxy sends event to host + calls original for local death.
+#define MAX_SAVED_DIEFUNCS 64
+static struct {
+    u16 spawn_index;
+    MarkerCollisionFunc original;
+} saved_diefuncs[MAX_SAVED_DIEFUNCS];
+static s32 saved_diefunc_count = 0;
+
+static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_marker);
+
+static void save_diefunc(u16 spawn_index, MarkerCollisionFunc func) {
+    if (func == (MarkerCollisionFunc)net_enemy_die_proxy || !func) return;
+    s32 i;
+    for (i = 0; i < saved_diefunc_count; i++) {
+        if (saved_diefuncs[i].spawn_index == spawn_index) return; // already saved
+    }
+    if (saved_diefunc_count < MAX_SAVED_DIEFUNCS) {
+        saved_diefuncs[saved_diefunc_count].spawn_index = spawn_index;
+        saved_diefuncs[saved_diefunc_count].original = func;
+        saved_diefunc_count++;
+    }
+}
+
+static MarkerCollisionFunc get_saved_diefunc(u16 spawn_index) {
+    s32 i;
+    for (i = 0; i < saved_diefunc_count; i++) {
+        if (saved_diefuncs[i].spawn_index == spawn_index)
+            return saved_diefuncs[i].original;
+    }
+    return (MarkerCollisionFunc)0;
+}
+
+static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_marker) {
+    if (!self_marker || !suBaddieActorArray) return;
+
+    Actor *actor = &suBaddieActorArray->data[self_marker->actrArrayIdx];
+    u16 spawn_index = (u16)bkrecomp_get_marker_spawn_index(self_marker);
+    u16 marker_id = (u16)self_marker->id;
+
+    f32 pos[3];
+    pos[0] = actor->position[0];
+    pos[1] = actor->position[1];
+    pos[2] = actor->position[2];
+
+    // Send kill event to host
+    recomp_net_send_enemy_death((u32)marker_id, (u32)spawn_index, (u32)map_get(), pos);
+
+    // Stop position override so death animation plays
+    mark_dying(spawn_index);
+
+    // Restore + call original dieFunc for natural death sequence
+    MarkerCollisionFunc orig = get_saved_diefunc(spawn_index);
+    if (orig) {
+        self_marker->dieFunc = orig;
+        orig(self_marker, other_marker);
+    } else {
+        marker_despawn(self_marker);
+    }
+}
+
+static TrackedEnemy prev_enemies[MAX_TRACKED_ENEMIES];
+static s32 prev_enemy_count = 0;
+static u32 prev_enemy_map = 0xFFFFFFFF;
+
+// Returns TRUE for marker types already handled by collectible sync
+static bool is_collectible_marker(u32 id) {
+    if (id == MARKER_52_JIGGY) return TRUE;
+    if (id == MARKER_39_MUMBO_TOKEN) return TRUE;
+    if (id == MARKER_5A_JINJO_BLUE) return TRUE;
+    if (id == MARKER_5B_JINJO_GREEN) return TRUE;
+    if (id == MARKER_5C_JINJO_ORANGE) return TRUE;
+    if (id == MARKER_5D_JINJO_PINK) return TRUE;
+    if (id == MARKER_5E_JINJO_YELLOW) return TRUE;
+    if (id == MARKER_5F_MUSIC_NOTE) return TRUE;
+    if (id == MARKER_53_EMPTY_HONEYCOMB) return TRUE;
+    if (id == MARKER_61_EXTRA_LIFE) return TRUE;
+    if (id == MARKER_55_HONEYCOMB) return TRUE;
+    if (id == MARKER_60_BLUE_EGG_COLLECTIBLE) return TRUE;
+    if (id == MARKER_36_ORANGE_COLLECTIBLE) return TRUE;
+    if (id == MARKER_37_GOLD_BULLION) return TRUE;
+    // UI/system markers
+    if (id == MARKER_32_PLAYER_SHADOW) return TRUE;
+    if (id == MARKER_62_RED_ARROW) return TRUE;
+    if (id == MARKER_63_RED_QUESTION_MARK) return TRUE;
+    if (id == MARKER_64_RED_X) return TRUE;
+    if (id == MARKER_65_SHRAPNEL) return TRUE;
+    return FALSE;
+}
 
 // === Polling state ===
 static s32 prev_jinjo_bits = 0;
@@ -247,6 +389,99 @@ static void poll_nonshared_collectibles(void) {
     }
 }
 
+// === POLLING: Detect local enemy deaths each frame ===
+
+static void poll_enemy_deaths(void) {
+    if (!recomp_net_is_connected() || processing_remote) return;
+    // Only host polls — join detects kills via state change in sync_enemy_positions
+    if (!recomp_net_is_host()) return;
+    if (!suBaddieActorArray) return;
+
+    u32 cur_map = (u32)map_get();
+
+    // Reset tracking on map change (avoids false positives from level unloading)
+    if (cur_map != prev_enemy_map) {
+        prev_enemy_count = 0;
+        prev_enemy_map = cur_map;
+        saved_diefunc_count = 0;
+        dying_count = 0;
+        // Build initial snapshot without sending events
+        s32 count = 0;
+        s32 i;
+        for (i = 0; i < suBaddieActorArray->cnt && count < MAX_TRACKED_ENEMIES; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            u32 mid = actor->marker->id;
+            if (is_collectible_marker(mid)) continue;
+            prev_enemies[count].marker_id = (u16)mid;
+            prev_enemies[count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            prev_enemies[count].pos_x = actor->position[0];
+            prev_enemies[count].pos_y = actor->position[1];
+            prev_enemies[count].pos_z = actor->position[2];
+            count++;
+        }
+        prev_enemy_count = count;
+        return;
+    }
+
+    // Build current snapshot
+    TrackedEnemy cur_enemies[MAX_TRACKED_ENEMIES];
+    s32 cur_count = 0;
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt && cur_count < MAX_TRACKED_ENEMIES; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker) continue;
+        u32 mid = actor->marker->id;
+        if (is_collectible_marker(mid)) continue;
+        cur_enemies[cur_count].marker_id = (u16)mid;
+        cur_enemies[cur_count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+        cur_enemies[cur_count].pos_x = actor->position[0];
+        cur_enemies[cur_count].pos_y = actor->position[1];
+        cur_enemies[cur_count].pos_z = actor->position[2];
+        cur_count++;
+    }
+
+    // Detect deaths: entries in prev but not in current
+    s32 p;
+    for (p = 0; p < prev_enemy_count; p++) {
+        bool found = FALSE;
+        s32 c;
+        for (c = 0; c < cur_count; c++) {
+            if (prev_enemies[p].marker_id == cur_enemies[c].marker_id &&
+                prev_enemies[p].spawn_index == cur_enemies[c].spawn_index) {
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            f32 pos[3];
+            pos[0] = prev_enemies[p].pos_x;
+            pos[1] = prev_enemies[p].pos_y;
+            pos[2] = prev_enemies[p].pos_z;
+
+            recomp_printf("[ENEMY-POLL] death: marker=0x%X spawn=%d pos=(%.1f,%.1f,%.1f)\n",
+                prev_enemies[p].marker_id, prev_enemies[p].spawn_index,
+                pos[0], pos[1], pos[2]);
+
+            recomp_net_send_enemy_death(
+                (u32)prev_enemies[p].marker_id,
+                (u32)prev_enemies[p].spawn_index,
+                cur_map, pos);
+        }
+    }
+
+    // Update prev snapshot (manual field copy to avoid compiler-generated memcpy)
+    s32 j;
+    for (j = 0; j < cur_count; j++) {
+        prev_enemies[j].marker_id = cur_enemies[j].marker_id;
+        prev_enemies[j].spawn_index = cur_enemies[j].spawn_index;
+        prev_enemies[j].pos_x = cur_enemies[j].pos_x;
+        prev_enemies[j].pos_y = cur_enemies[j].pos_y;
+        prev_enemies[j].pos_z = cur_enemies[j].pos_z;
+    }
+    prev_enemy_count = cur_count;
+}
+
 // === RECEIVE: Apply remote collectible events ===
 
 typedef struct {
@@ -342,18 +577,219 @@ static void process_collectible_event(WorldEventData *evt) {
     processing_remote = FALSE;
 }
 
+// Enemy event layout (matches net_recomp_api.cpp ENEMY case output):
+typedef struct {
+    u8  event_type;        // 0x00
+    u8  _pad[3];           // 0x01-0x03
+    u16 enemy_marker_type; // 0x04
+    u16 enemy_spawn_index; // 0x06
+    u32 enemy_map_id;      // 0x08
+    u8  enemy_alive;       // 0x0C
+    u8  enemy_health;      // 0x0D
+    u8  _pad2[2];          // 0x0E-0x0F
+    f32 enemy_pos_x;       // 0x10
+    f32 enemy_pos_y;       // 0x14
+    f32 enemy_pos_z;       // 0x18
+} EnemyEventData;
+
+static void process_enemy_event(EnemyEventData *evt) {
+    processing_remote = TRUE;
+
+    u32 cur_map = (u32)map_get();
+
+    if (cur_map != evt->enemy_map_id) {
+        processing_remote = FALSE;
+        return;
+    }
+
+    u16 target_marker = evt->enemy_marker_type;
+    u16 target_spawn = evt->enemy_spawn_index;
+    f32 pos[3];
+    pos[0] = evt->enemy_pos_x;
+    pos[1] = evt->enemy_pos_y;
+    pos[2] = evt->enemy_pos_z;
+
+    // Stop position override so death animation can play
+    mark_dying(target_spawn);
+
+    D_8036E564 = 1;
+    bundle_setYaw(0.0f);
+
+    if (suBaddieActorArray) {
+        s32 i;
+        for (i = 0; i < suBaddieActorArray->cnt; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            if (actor->marker->id != target_marker) continue;
+            u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            if (si != target_spawn) continue;
+
+            // Spawn honeycomb (killer got theirs from collision, we need ours)
+            __bundle_spawnFromFirstActor(BUNDLE_19__HONEYCOMB, actor);
+
+            // Trigger death animation via dieFunc (updateFunc is active, so it plays!)
+            MarkerCollisionFunc die = get_saved_diefunc(target_spawn);
+            if (!die) die = actor->marker->dieFunc;
+            if (die && die != (MarkerCollisionFunc)net_enemy_die_proxy) {
+                actor->marker->dieFunc = die; // restore original if proxy
+                die(actor->marker, baMarker_get());
+            } else {
+                marker_despawn(actor->marker);
+            }
+            goto done;
+        }
+    }
+
+    // Actor not found — spawn honeycomb at packet position
+    bundle_spawn_f32(BUNDLE_19__HONEYCOMB, pos);
+
+done:
+    // If host: remove from prev_enemies so poll doesn't re-detect
+    if (recomp_net_is_host()) {
+        s32 p;
+        for (p = 0; p < prev_enemy_count; p++) {
+            if (prev_enemies[p].marker_id == target_marker &&
+                prev_enemies[p].spawn_index == target_spawn) {
+                prev_enemies[p].marker_id = prev_enemies[prev_enemy_count - 1].marker_id;
+                prev_enemies[p].spawn_index = prev_enemies[prev_enemy_count - 1].spawn_index;
+                prev_enemies[p].pos_x = prev_enemies[prev_enemy_count - 1].pos_x;
+                prev_enemies[p].pos_y = prev_enemies[prev_enemy_count - 1].pos_y;
+                prev_enemies[p].pos_z = prev_enemies[prev_enemy_count - 1].pos_z;
+                prev_enemy_count--;
+                break;
+            }
+        }
+    }
+
+    processing_remote = FALSE;
+}
+
+// === Enemy position sync (host-authoritative) ===
+
+// Must match MIPS layout expected by net_recomp_api.cpp (28 bytes per entry)
+typedef struct {
+    u16 spawn_index;  // 0x00
+    u16 marker_id;    // 0x02
+    f32 x;            // 0x04
+    f32 y;            // 0x08
+    f32 z;            // 0x0C
+    f32 yaw;          // 0x10
+    u16 anim_id;      // 0x14
+    u16 _pad;         // 0x16
+    f32 anim_timer;   // 0x18
+} EnemyPosEntry;      // 0x1C = 28 bytes
+
+#define MAX_ENEMY_POS_ENTRIES 64
+
+static void sync_enemy_positions(void) {
+    if (!recomp_net_is_connected()) return;
+    if (!suBaddieActorArray) return;
+
+    u32 cur_map = (u32)map_get();
+
+    if (recomp_net_is_host()) {
+        // HOST: collect enemy positions and send to network
+        EnemyPosEntry buf[MAX_ENEMY_POS_ENTRIES];
+        s32 count = 0;
+        s32 i;
+
+        for (i = 0; i < suBaddieActorArray->cnt && count < MAX_ENEMY_POS_ENTRIES; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            u32 mid = actor->marker->id;
+            if (is_collectible_marker(mid)) continue;
+
+            buf[count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            buf[count].marker_id = (u16)mid;
+            buf[count].x = actor->position[0];
+            buf[count].y = actor->position[1];
+            buf[count].z = actor->position[2];
+            buf[count].yaw = actor->yaw;
+            if (actor->anctrl) {
+                buf[count].anim_id = (u16)anctrl_getIndex(actor->anctrl);
+                buf[count].anim_timer = anctrl_getAnimTimer(actor->anctrl);
+            } else {
+                buf[count].anim_id = 0;
+                buf[count].anim_timer = 0.0f;
+            }
+            count++;
+        }
+
+        if (count > 0) {
+            recomp_net_send_enemy_positions(buf, (u32)count, cur_map);
+        }
+    } else {
+        // JOIN: receive interpolated positions and apply to local actors
+        EnemyPosEntry buf[MAX_ENEMY_POS_ENTRIES];
+        u32 count = 0;
+        recomp_net_get_enemy_positions(buf, &count);
+
+        if (count == 0) return;
+
+        s32 e;
+        for (e = 0; e < (s32)count; e++) {
+            u16 target_spawn = buf[e].spawn_index;
+            u16 target_marker = buf[e].marker_id;
+
+            // Skip dying enemies — let death animation play without override
+            if (is_dying(target_spawn)) continue;
+
+            // Find matching actor
+            s32 i;
+            for (i = 0; i < suBaddieActorArray->cnt; i++) {
+                Actor *actor = &suBaddieActorArray->data[i];
+                if (!actor->marker) continue;
+                if (actor->marker->id != target_marker) continue;
+
+                u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+                if (si != target_spawn) continue;
+
+                // Apply host position
+                actor->position[0] = buf[e].x;
+                actor->position[1] = buf[e].y;
+                actor->position[2] = buf[e].z;
+                actor->yaw = buf[e].yaw;
+
+                // Full animation sync from host (ID + timer every frame)
+                if (actor->anctrl && buf[e].anim_id != 0) {
+                    anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
+                    anctrl_setAnimTimer(actor->anctrl, buf[e].anim_timer);
+                }
+
+                // Zero velocity to prevent physics drift
+                actor->velocity[0] = 0.0f;
+                actor->velocity[1] = 0.0f;
+                actor->velocity[2] = 0.0f;
+
+                // Suppress local AI — host controls position + animation.
+                // Death sequences still work: dying enemies are excluded from this loop.
+                actor->marker->actorUpdateFunc = (ActorUpdateFunc)0;
+
+                // Install dieFunc proxy so join kills send events to host
+                save_diefunc(target_spawn, actor->marker->dieFunc);
+                actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
+
+                break;
+            }
+        }
+    }
+}
+
 // Called every frame
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     if (!recomp_net_is_connected()) return;
 
     poll_shared_collectibles();
     poll_nonshared_collectibles();
+    poll_enemy_deaths();
+    sync_enemy_positions();
 
     WorldEventData evt;
     while (recomp_net_pop_world_event(&evt)) {
-        recomp_printf("[WORLD-EVT] type=%d coll_type=%d id=%d\n", evt.event_type, evt.coll_type, evt.coll_id);
         if (evt.event_type == EVENT_COLLECTIBLE) {
             process_collectible_event(&evt);
+        } else if (evt.event_type == EVENT_ENEMY) {
+            process_enemy_event((EnemyEventData*)&evt);
         }
     }
 }

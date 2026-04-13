@@ -66,3 +66,8 @@ recomp_net_send_collectible = 0x8F0000E4;
 recomp_net_send_enemy_death = 0x8F0000E8;
 recomp_net_send_flag_change = 0x8F0000EC;
 recomp_net_pop_world_event = 0x8F0000F0;
+
+/* Enemy position sync */
+recomp_net_is_host = 0x8F0000F4;
+recomp_net_send_enemy_positions = 0x8F0000F8;
+recomp_net_get_enemy_positions = 0x8F0000FC;

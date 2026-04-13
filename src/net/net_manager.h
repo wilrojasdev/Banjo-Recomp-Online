@@ -50,8 +50,12 @@ public:
 
     // World state sync (Phase 3)
     void send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id);
-    void send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id);
+    void send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz);
     void send_flag_change(uint8_t flag_type, uint16_t flag_index, uint8_t value, uint32_t map_id);
+
+    // Enemy position sync (host-authoritative)
+    void send_enemy_positions(const EnemyPositionEntry* entries, uint8_t count, uint32_t map_id);
+    size_t get_enemy_positions(EnemyInterpolatedState* out, size_t max_count) const;
 
     // World event queue (received from network, consumed by game thread)
     struct WorldEvent {
@@ -99,6 +103,7 @@ private:
     void handle_chat_packet(const ChatMessagePacket& pkt);
     void handle_collectible_packet(const WorldCollectiblePacket& pkt);
     void handle_enemy_packet(const WorldEnemyPacket& pkt);
+    void handle_enemy_position_packet(const uint8_t* data, size_t size);
     void handle_flag_packet(const WorldFlagPacket& pkt);
 
     std::unique_ptr<Server> server_;
@@ -124,6 +129,9 @@ private:
     // World event queue (network thread pushes, game thread pops)
     mutable std::mutex world_mutex_;
     std::deque<WorldEvent> world_events_;
+
+    // Enemy position interpolation (host→join)
+    EnemyInterpolationManager enemy_interp_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;
 };

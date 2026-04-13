@@ -5,6 +5,7 @@
 #include <chrono>
 #include <array>
 #include <mutex>
+#include <unordered_map>
 
 #include "net_packets.h"
 
@@ -86,6 +87,57 @@ public:
 private:
     std::array<RemotePlayerInterpolator, MAX_PLAYERS> players_{};
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
+};
+
+// --- Enemy interpolation (host-authoritative) ---
+
+struct EnemySnapshot {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f;
+    uint16_t anim_id = 0;
+    float anim_timer = 0.0f;
+    double timestamp = 0.0;
+    bool valid = false;
+};
+
+struct EnemyInterpolatedState {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f;
+    uint16_t spawn_index = 0;
+    uint16_t marker_type = 0;
+    uint16_t anim_id = 0;
+    float anim_timer = 0.0f;
+    bool active = false;
+};
+
+class EnemyInterpolator {
+public:
+    static constexpr size_t BUFFER_SIZE = 4;
+    static constexpr double INTERP_DELAY_SEC = 0.1;
+
+    uint16_t marker_type = 0;
+
+    void push_snapshot(const EnemySnapshot& snap);
+    EnemyInterpolatedState interpolate(double current_time, uint16_t spawn_idx) const;
+    void reset();
+
+private:
+    std::array<EnemySnapshot, BUFFER_SIZE> buffer_{};
+    size_t write_index_ = 0;
+    size_t snapshot_count_ = 0;
+};
+
+class EnemyInterpolationManager {
+public:
+    void push_bulk(const EnemyPositionEntry* entries, uint8_t count, uint32_t map_id, double timestamp);
+    size_t get_interpolated(EnemyInterpolatedState* out, size_t max_count, double current_time) const;
+    void clear();
+    uint32_t current_map_id() const { return map_id_; }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<uint16_t, EnemyInterpolator> enemies_; // keyed by spawn_index
+    uint32_t map_id_ = 0;
 };
 
 } // namespace bknet

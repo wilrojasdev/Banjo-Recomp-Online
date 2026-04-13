@@ -245,6 +245,10 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             }
             break;
         }
+        case PacketType::EnemyPositionBulk: {
+            handle_enemy_position_packet(data, size);
+            break;
+        }
         default:
             break;
     }
@@ -397,7 +401,7 @@ void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collect
     }
 }
 
-void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id) {
+void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz) {
     if (!is_connected()) return;
 
     WorldEnemyPacket pkt{};
@@ -409,6 +413,9 @@ void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index
     pkt.map_id = map_id;
     pkt.alive = 0;
     pkt.health = 0;
+    pkt.pos_x = px;
+    pkt.pos_y = py;
+    pkt.pos_z = pz;
 
     if (server_) {
         server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
@@ -469,6 +476,52 @@ bool NetworkManager::pop_world_event(WorldEvent& out) {
     out = world_events_.front();
     world_events_.pop_front();
     return true;
+}
+
+// === Enemy position sync (host-authoritative) ===
+
+void NetworkManager::send_enemy_positions(const EnemyPositionEntry* entries, uint8_t count, uint32_t map_id) {
+    if (!is_connected() || count == 0) return;
+
+    // Build variable-size packet
+    size_t payload_size = sizeof(PacketHeader) + sizeof(uint32_t) + 4 + count * sizeof(EnemyPositionEntry);
+    EnemyPositionBulkPacket pkt{};
+    pkt.header.type = PacketType::EnemyPositionBulk;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    pkt.map_id = map_id;
+    pkt.enemy_count = count;
+    std::memcpy(pkt.enemies, entries, count * sizeof(EnemyPositionEntry));
+
+    if (server_) {
+        server_->broadcast(&pkt, payload_size, CHANNEL_UNRELIABLE, false);
+    } else if (client_) {
+        client_->send(&pkt, payload_size, CHANNEL_UNRELIABLE, false);
+    }
+}
+
+void NetworkManager::handle_enemy_position_packet(const uint8_t* data, size_t size) {
+    // Minimum size: header + map_id + count + pad
+    if (size < sizeof(PacketHeader) + 8) return;
+
+    PacketHeader hdr;
+    std::memcpy(&hdr, data, sizeof(hdr));
+    if (hdr.player_id == local_player_id_) return;
+
+    uint32_t map_id;
+    std::memcpy(&map_id, data + sizeof(PacketHeader), sizeof(uint32_t));
+    uint8_t enemy_count = data[sizeof(PacketHeader) + 4];
+
+    size_t entries_offset = sizeof(PacketHeader) + 8; // header + map_id + count + pad
+    size_t expected_size = entries_offset + enemy_count * sizeof(EnemyPositionEntry);
+    if (size < expected_size || enemy_count > MAX_ENEMIES_PER_PACKET) return;
+
+    const auto* entries = reinterpret_cast<const EnemyPositionEntry*>(data + entries_offset);
+    enemy_interp_.push_bulk(entries, enemy_count, map_id, get_time());
+}
+
+size_t NetworkManager::get_enemy_positions(EnemyInterpolatedState* out, size_t max_count) const {
+    return enemy_interp_.get_interpolated(out, max_count, get_time());
 }
 
 } // namespace bknet

@@ -167,13 +167,18 @@ extern "C" void recomp_net_send_collectible(uint8_t* rdram, recomp_context* ctx)
         static_cast<uint8_t>(collected), map_id, static_cast<uint8_t>(level_id));
 }
 
-// Send enemy death: marker_type(r4), spawn_index(r5), map_id(r6)
+// Send enemy death: marker_type(r4), spawn_index(r5), map_id(r6), pos_ptr(r7)
 extern "C" void recomp_net_send_enemy_death(uint8_t* rdram, recomp_context* ctx) {
     u32 marker_type = static_cast<u32>(ctx->r4);
     u32 spawn_index = static_cast<u32>(ctx->r5);
     u32 map_id = static_cast<u32>(ctx->r6);
+    gpr pos_ptr = ctx->r7;
+    float px = read_f32(rdram, pos_ptr, 0x00);
+    float py = read_f32(rdram, pos_ptr, 0x04);
+    float pz = read_f32(rdram, pos_ptr, 0x08);
     bknet::NetworkManager::instance().send_enemy_death(
-        static_cast<uint16_t>(marker_type), static_cast<uint16_t>(spawn_index), map_id);
+        static_cast<uint16_t>(marker_type), static_cast<uint16_t>(spawn_index),
+        map_id, px, py, pz);
 }
 
 // Send flag change: flag_type(r4), flag_index(r5), value(r6), map_id(r7)
@@ -185,6 +190,62 @@ extern "C" void recomp_net_send_flag_change(uint8_t* rdram, recomp_context* ctx)
     bknet::NetworkManager::instance().send_flag_change(
         static_cast<uint8_t>(flag_type), static_cast<uint16_t>(flag_index),
         static_cast<uint8_t>(value), map_id);
+}
+
+// === Enemy position sync ===
+
+// Returns 1 if hosting, 0 otherwise
+extern "C" void recomp_net_is_host(uint8_t* rdram, recomp_context* ctx) {
+    _return(ctx, bknet::NetworkManager::instance().is_host() ? 1u : 0u);
+}
+
+// Send enemy positions from host: buffer_ptr(r4), count(r5), map_id(r6)
+// MIPS layout per entry (20 bytes): u16 spawn_index, u16 marker_id, f32 x, f32 y, f32 z, f32 yaw
+extern "C" void recomp_net_send_enemy_positions(uint8_t* rdram, recomp_context* ctx) {
+    gpr buf_ptr = ctx->r4;
+    u32 count = static_cast<u32>(ctx->r5);
+    u32 map_id = static_cast<u32>(ctx->r6);
+
+    if (count == 0 || count > bknet::MAX_ENEMIES_PER_PACKET) return;
+
+    std::vector<bknet::EnemyPositionEntry> entries(count);
+    for (u32 i = 0; i < count; i++) {
+        gpr entry_addr = buf_ptr + i * 28;
+        entries[i].spawn_index = static_cast<uint16_t>(MEM_HU(0x00, entry_addr));
+        entries[i].marker_type = static_cast<uint16_t>(MEM_HU(0x02, entry_addr));
+        entries[i].x = read_f32(rdram, entry_addr, 0x04);
+        entries[i].y = read_f32(rdram, entry_addr, 0x08);
+        entries[i].z = read_f32(rdram, entry_addr, 0x0C);
+        entries[i].yaw = read_f32(rdram, entry_addr, 0x10);
+        entries[i].anim_id = static_cast<uint16_t>(MEM_HU(0x14, entry_addr));
+        entries[i].anim_timer = read_f32(rdram, entry_addr, 0x18);
+    }
+
+    bknet::NetworkManager::instance().send_enemy_positions(entries.data(), static_cast<uint8_t>(count), map_id);
+}
+
+// Get interpolated enemy positions for join: buffer_ptr(r4), count_ptr(r5)
+// Writes entries to MIPS memory, sets count at count_ptr
+extern "C" void recomp_net_get_enemy_positions(uint8_t* rdram, recomp_context* ctx) {
+    gpr buf_ptr = ctx->r4;
+    gpr count_ptr = ctx->r5;
+
+    bknet::EnemyInterpolatedState states[bknet::MAX_ENEMIES_PER_PACKET];
+    size_t count = bknet::NetworkManager::instance().get_enemy_positions(states, bknet::MAX_ENEMIES_PER_PACKET);
+
+    for (size_t i = 0; i < count; i++) {
+        gpr entry_addr = buf_ptr + i * 28;
+        MEM_HU(0x00, entry_addr) = states[i].spawn_index;
+        MEM_HU(0x02, entry_addr) = states[i].marker_type;
+        write_f32(rdram, entry_addr, 0x04, states[i].x);
+        write_f32(rdram, entry_addr, 0x08, states[i].y);
+        write_f32(rdram, entry_addr, 0x0C, states[i].z);
+        write_f32(rdram, entry_addr, 0x10, states[i].yaw);
+        MEM_HU(0x14, entry_addr) = states[i].anim_id;
+        write_f32(rdram, entry_addr, 0x18, states[i].anim_timer);
+    }
+
+    MEM_W(0x00, count_ptr) = static_cast<u32>(count);
 }
 
 // Pop next world event from queue. Returns 1 if event available, 0 if empty.
@@ -214,6 +275,9 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
                 MEM_W(0x08, out_ptr) = evt.enemy.map_id;
                 MEM_BU(0x0C, out_ptr) = evt.enemy.alive;
                 MEM_BU(0x0D, out_ptr) = evt.enemy.health;
+                write_f32(rdram, out_ptr, 0x10, evt.enemy.pos_x);
+                write_f32(rdram, out_ptr, 0x14, evt.enemy.pos_y);
+                write_f32(rdram, out_ptr, 0x18, evt.enemy.pos_z);
                 break;
             case bknet::NetworkManager::WorldEvent::FLAG:
                 MEM_BU(0x04, out_ptr) = evt.flag.flag_type;

@@ -27,6 +27,9 @@ extern "C" void recomp_net_send_collectible(uint8_t* rdram, recomp_context* ctx)
 extern "C" void recomp_net_send_enemy_death(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_send_flag_change(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_is_host(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_enemy_positions(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_get_enemy_positions(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -770,6 +773,9 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_send_enemy_death);
     REGISTER_FUNC(recomp_net_send_flag_change);
     REGISTER_FUNC(recomp_net_pop_world_event);
+    REGISTER_FUNC(recomp_net_is_host);
+    REGISTER_FUNC(recomp_net_send_enemy_positions);
+    REGISTER_FUNC(recomp_net_get_enemy_positions);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();

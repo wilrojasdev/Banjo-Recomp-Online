@@ -36,6 +36,7 @@ enum class PacketType : uint8_t {
     WorldEnemy       = 0x31,
     WorldObject      = 0x32,
     MapChange        = 0x33,
+    EnemyPositionBulk = 0x34,  // Unreliable, ~20Hz from host
     WorldStateFull   = 0x3F,
 };
 
@@ -155,6 +156,30 @@ struct WorldEnemyPacket {
     uint32_t map_id;            // Which map the enemy is on
     uint8_t alive;              // 0=dead
     uint8_t health;
+    uint16_t _pad;
+    float pos_x, pos_y, pos_z;  // Enemy position at time of death
+};
+
+// --- Enemy position sync (host-authoritative) ---
+
+constexpr uint8_t MAX_ENEMIES_PER_PACKET = 64;
+
+struct EnemyPositionEntry {
+    uint16_t spawn_index;
+    uint16_t marker_type;
+    float x, y, z;
+    float yaw;
+    uint16_t anim_id;
+    uint16_t _pad;
+    float anim_timer;
+};  // 28 bytes
+
+struct EnemyPositionBulkPacket {
+    PacketHeader header;
+    uint32_t map_id;
+    uint8_t enemy_count;
+    uint8_t _pad[3];
+    EnemyPositionEntry enemies[MAX_ENEMIES_PER_PACKET];
 };
 
 // Flag types for WorldFlagPacket

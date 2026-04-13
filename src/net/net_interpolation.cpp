@@ -175,4 +175,132 @@ double InterpolationManager::get_time() const {
     return std::chrono::duration<double>(now - start_time_).count();
 }
 
+// --- EnemyInterpolator ---
+
+void EnemyInterpolator::push_snapshot(const EnemySnapshot& snap) {
+    buffer_[write_index_] = snap;
+    write_index_ = (write_index_ + 1) % BUFFER_SIZE;
+    if (snapshot_count_ < BUFFER_SIZE) snapshot_count_++;
+}
+
+EnemyInterpolatedState EnemyInterpolator::interpolate(double current_time, uint16_t spawn_idx) const {
+    EnemyInterpolatedState result{};
+    result.spawn_index = spawn_idx;
+    result.marker_type = marker_type;
+
+    if (snapshot_count_ == 0) return result;
+
+    double render_time = current_time - INTERP_DELAY_SEC;
+
+    // Collect valid snapshots sorted by timestamp
+    std::array<const EnemySnapshot*, BUFFER_SIZE> sorted{};
+    size_t count = 0;
+    for (size_t i = 0; i < snapshot_count_; i++) {
+        size_t idx = (write_index_ + BUFFER_SIZE - snapshot_count_ + i) % BUFFER_SIZE;
+        if (buffer_[idx].valid) {
+            sorted[count++] = &buffer_[idx];
+        }
+    }
+    if (count == 0) return result;
+
+    auto copy_snap = [&](const EnemySnapshot* s) {
+        result.x = s->x; result.y = s->y; result.z = s->z;
+        result.yaw = s->yaw;
+        result.anim_id = s->anim_id;
+        result.anim_timer = s->anim_timer;
+        result.active = true;
+    };
+
+    if (count == 1 || render_time <= sorted[0]->timestamp) {
+        copy_snap(sorted[count - 1]);
+        return result;
+    }
+    if (render_time >= sorted[count - 1]->timestamp) {
+        copy_snap(sorted[count - 1]);
+        return result;
+    }
+
+    for (size_t i = 0; i < count - 1; i++) {
+        const auto* a = sorted[i];
+        const auto* b = sorted[i + 1];
+        if (render_time >= a->timestamp && render_time <= b->timestamp) {
+            double dt = b->timestamp - a->timestamp;
+            float t = (dt > 0.0001) ? static_cast<float>((render_time - a->timestamp) / dt) : 0.0f;
+            t = std::clamp(t, 0.0f, 1.0f);
+
+            result.x = a->x + (b->x - a->x) * t;
+            result.y = a->y + (b->y - a->y) * t;
+            result.z = a->z + (b->z - a->z) * t;
+
+            float yaw_diff = b->yaw - a->yaw;
+            if (yaw_diff > 180.0f) yaw_diff -= 360.0f;
+            if (yaw_diff < -180.0f) yaw_diff += 360.0f;
+            result.yaw = a->yaw + yaw_diff * t;
+
+            // Animation: use target snapshot (don't interpolate anim state)
+            result.anim_id = b->anim_id;
+            result.anim_timer = b->anim_timer;
+
+            result.active = true;
+            return result;
+        }
+    }
+
+    copy_snap(sorted[count - 1]);
+    return result;
+}
+
+void EnemyInterpolator::reset() {
+    for (auto& s : buffer_) s.valid = false;
+    write_index_ = 0;
+    snapshot_count_ = 0;
+}
+
+// --- EnemyInterpolationManager ---
+
+void EnemyInterpolationManager::push_bulk(const EnemyPositionEntry* entries, uint8_t count, uint32_t map_id, double timestamp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Clear on map change
+    if (map_id != map_id_) {
+        enemies_.clear();
+        map_id_ = map_id;
+    }
+
+    for (uint8_t i = 0; i < count; i++) {
+        auto& interp = enemies_[entries[i].spawn_index];
+        interp.marker_type = entries[i].marker_type;
+
+        EnemySnapshot snap;
+        snap.x = entries[i].x;
+        snap.y = entries[i].y;
+        snap.z = entries[i].z;
+        snap.yaw = entries[i].yaw;
+        snap.anim_id = entries[i].anim_id;
+        snap.anim_timer = entries[i].anim_timer;
+        snap.timestamp = timestamp;
+        snap.valid = true;
+        interp.push_snapshot(snap);
+    }
+}
+
+size_t EnemyInterpolationManager::get_interpolated(EnemyInterpolatedState* out, size_t max_count, double current_time) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t written = 0;
+    for (const auto& [spawn_idx, interp] : enemies_) {
+        if (written >= max_count) break;
+        auto state = interp.interpolate(current_time, spawn_idx);
+        if (state.active) {
+            out[written++] = state;
+        }
+    }
+    return written;
+}
+
+void EnemyInterpolationManager::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    enemies_.clear();
+    map_id_ = 0;
+}
+
 } // namespace bknet
