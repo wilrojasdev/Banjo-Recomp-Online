@@ -614,6 +614,120 @@ void reorder_texture_pack(recomp::mods::ModContext&) {
     recompui::renderer::trigger_texture_pack_update();
 }
 
+// --- Host submenu panel ---
+static recompui::Element* host_panel = nullptr;
+static recompui::GameOptionsMenu* g_game_options_menu = nullptr;
+static int selected_save_slot = 0;
+
+static void ensure_host_panel(recompui::GameOptionsMenu* game_menu);
+
+static void show_host_panel() {
+    ensure_host_panel(g_game_options_menu);
+    if (host_panel) {
+        host_panel->display_show();
+        g_game_options_menu->display_hide();
+    }
+}
+
+static void hide_host_panel() {
+    if (host_panel) {
+        host_panel->display_hide();
+        g_game_options_menu->display_show();
+    }
+}
+
+static void start_host_game() {
+    bknet::set_mode(bknet::NetworkMode::Host);
+    bknet::get_config().save_slot = selected_save_slot;
+    recompui::update_game_mod_id(supported_games[0].mod_game_id);
+    recomp::start_game(supported_games[0].game_id, {});
+    recompui::hide_all_contexts();
+}
+
+static void build_host_panel(recompui::LauncherMenu* menu) {
+    // Host submenu is built lazily on first show to avoid context issues at init
+    (void)menu;
+}
+
+static void ensure_host_panel(recompui::GameOptionsMenu* game_menu) {
+    if (host_panel != nullptr) return;
+
+    auto context = recompui::get_launcher_context_id();
+
+    // Get the menu container as parent for the overlay
+    host_panel = context.create_element<recompui::Element>(static_cast<recompui::Element*>(game_menu));
+    host_panel->set_display(recompui::Display::Flex);
+    host_panel->set_flex_direction(recompui::FlexDirection::Column);
+    host_panel->set_align_items(recompui::AlignItems::Center);
+    host_panel->set_justify_content(recompui::JustifyContent::Center);
+    host_panel->set_position(recompui::Position::Absolute);
+    host_panel->set_left(0.0f);
+    host_panel->set_top(0.0f);
+    host_panel->set_width(100.0f, recompui::Unit::Percent);
+    host_panel->set_height(100.0f, recompui::Unit::Percent);
+    host_panel->set_background_color(recompui::theme::color::ModalOverlay);
+
+    auto wrapper = context.create_element<recompui::Element>(host_panel);
+    wrapper->set_display(recompui::Display::Flex);
+    wrapper->set_flex_direction(recompui::FlexDirection::Column);
+    wrapper->set_align_items(recompui::AlignItems::Center);
+    wrapper->set_gap(20.0f);
+    wrapper->set_padding(40.0f);
+
+    // Title
+    context.create_element<recompui::Label>(wrapper, "Host Game", recompui::theme::Typography::Header3);
+
+    // Connection info
+    context.create_element<recompui::Label>(wrapper, "Connection: Direct (LAN)", recompui::theme::Typography::Body);
+
+    // Save slots
+    context.create_element<recompui::Label>(wrapper, "Select Save Slot", recompui::theme::Typography::LabelLG);
+
+    auto slots_row = context.create_element<recompui::Element>(wrapper);
+    slots_row->set_display(recompui::Display::Flex);
+    slots_row->set_flex_direction(recompui::FlexDirection::Row);
+    slots_row->set_gap(16.0f);
+    slots_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
+    // Store button pointers in static array (must survive callback lifetime)
+    static recompui::Button* slot_buttons[3] = {};
+    for (int i = 0; i < 3; i++) {
+        std::string label = "Save " + std::to_string(i + 1);
+        slot_buttons[i] = context.create_element<recompui::Button>(
+            slots_row, label,
+            recompui::ButtonStyle::Secondary,
+            recompui::ButtonSize::Large
+        );
+        slot_buttons[i]->set_width(160.0f);
+        if (i == 0) slot_buttons[i]->set_opacity(1.0f);
+        else slot_buttons[i]->set_opacity(0.5f);
+
+        slot_buttons[i]->add_pressed_callback([i]() {
+            selected_save_slot = i;
+            for (int j = 0; j < 3; j++) {
+                slot_buttons[j]->set_opacity(j == i ? 1.0f : 0.5f);
+            }
+        });
+    }
+
+    // Action buttons
+    auto buttons_row = context.create_element<recompui::Element>(wrapper);
+    buttons_row->set_display(recompui::Display::Flex);
+    buttons_row->set_flex_direction(recompui::FlexDirection::Row);
+    buttons_row->set_gap(16.0f);
+    buttons_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
+    auto back_btn = context.create_element<recompui::Button>(
+        buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
+    );
+    back_btn->add_pressed_callback([]() { hide_host_panel(); });
+
+    auto start_btn = context.create_element<recompui::Button>(
+        buttons_row, "Start", recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
+    );
+    start_btn->add_pressed_callback([]() { start_host_game(); });
+}
+
 void on_launcher_init(recompui::LauncherMenu *menu) {
     auto game_options_menu = menu->init_game_options_menu(
         supported_games[0].game_id,
@@ -622,26 +736,23 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
         supported_games[0].thumbnail_bytes,
         recompui::GameOptionsMenuLayout::Center
     );
+    g_game_options_menu = game_options_menu;
 
     // Online menu: Host, Join, Settings, Exit
-    // Use add_start_game_or_load_rom_option for "Host" — handles ROM validation + file dialog
     game_options_menu->add_start_game_or_load_rom_option("Load ROM", "Host");
-    // Wrap callback to set host mode before the original logic runs
     if (auto* host_opt = game_options_menu->get_start_game_option()) {
-        auto original_cb = [game_options_menu]() {
-            // This replicates the start game logic from add_start_game_or_load_rom_option
+        host_opt->set_callback([]() {
+            bknet::set_mode(bknet::NetworkMode::Host);
+            bknet::NetworkManager::instance().host_game();
             recompui::update_game_mod_id(supported_games[0].mod_game_id);
             recomp::start_game(supported_games[0].game_id, {});
             recompui::hide_all_contexts();
-        };
-        host_opt->set_callback([original_cb]() {
-            bknet::set_mode(bknet::NetworkMode::Host);
-            original_cb();
         });
     }
 
     game_options_menu->add_option("Join", []() {
         bknet::set_mode(bknet::NetworkMode::Join);
+        bknet::NetworkManager::instance().join_game();
         recompui::update_game_mod_id(supported_games[0].mod_game_id);
         recomp::start_game(supported_games[0].game_id, {});
         recompui::hide_all_contexts();
@@ -831,48 +942,10 @@ int main(int argc, char** argv) {
 
     banjo::init_config();
 
-    // Read network config. Environment variables override UI settings:
-    //   BK_NET_MODE=host|join|off
-    //   BK_NET_IP=<ip>        (for join mode, default 127.0.0.1)
-    //   BK_NET_PORT=<port>    (default 7777)
-    {
-        auto ui_mode = banjo::get_network_mode();
-        auto ui_port = banjo::get_network_port();
-
-        // Env var overrides
-        const char* env_mode = std::getenv("BK_NET_MODE");
-        const char* env_ip = std::getenv("BK_NET_IP");
-        const char* env_port = std::getenv("BK_NET_PORT");
-
-        // Determine mode: env var takes priority, then UI setting
-        banjo::NetworkMode mode = ui_mode;
-        if (env_mode) {
-            std::string m(env_mode);
-            if (m == "host") mode = banjo::NetworkMode::Host;
-            else if (m == "join") mode = banjo::NetworkMode::Join;
-            else if (m == "off") mode = banjo::NetworkMode::Off;
-        }
-        // Legacy: BK_NET_IP without BK_NET_MODE implies join
-        if (!env_mode && env_ip && env_ip[0] != '\0') {
-            mode = banjo::NetworkMode::Join;
-        }
-
-        if (env_port) bknet::set_port(static_cast<uint16_t>(std::atoi(env_port)));
-        else bknet::set_port(static_cast<uint16_t>(ui_port));
-
-        recompinput::players::set_single_player_mode(true);
-
-        if (mode == banjo::NetworkMode::Host) {
-            bknet::set_mode(bknet::NetworkMode::Host);
-            bknet::NetworkManager::instance().host_game();
-        } else if (mode == banjo::NetworkMode::Join) {
-            bknet::set_mode(bknet::NetworkMode::Join);
-            if (env_ip && env_ip[0] != '\0') {
-                bknet::set_join_ip(env_ip);
-            }
-            bknet::NetworkManager::instance().join_game();
-        }
-    }
+    // Network mode is now set from the launcher UI (Host/Join buttons).
+    // The mode is configured when the user clicks Host or Join, and the
+    // game starts with host_game()/join_game() called at that point.
+    recompinput::players::set_single_player_mode(true);
 
     // Initialize chat input system (SDL event watcher)
     bknet::ChatInput::instance().init();
