@@ -11,9 +11,14 @@
 #include <chrono>
 #ifdef _WIN32
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <unistd.h>
 #include <spawn.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 extern char **environ;
 #endif
 #include <stdexcept>
@@ -677,6 +682,68 @@ void reorder_texture_pack(recomp::mods::ModContext&) {
     recompui::renderer::trigger_texture_pack_update();
 }
 
+// --- Get local LAN IP address ---
+static std::string get_local_ip() {
+#ifdef _WIN32
+    // Windows: use GetAdaptersAddresses or simple Winsock approach
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        struct addrinfo hints = {}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(hostname, nullptr, &hints, &res) == 0 && res) {
+            char ip[INET_ADDRSTRLEN];
+            auto* addr = (struct sockaddr_in*)res->ai_addr;
+            inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
+            freeaddrinfo(res);
+            return ip;
+        }
+        if (res) freeaddrinfo(res);
+    }
+    return "unknown";
+#else
+    // macOS/Linux: iterate network interfaces
+    struct ifaddrs *ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) return "unknown";
+
+    std::string result = "unknown";
+    for (auto *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        // Skip loopback
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        auto* addr = (struct sockaddr_in*)ifa->ifa_addr;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
+        // Prefer 192.168.x.x or 10.x.x.x or 172.16-31.x.x
+        std::string s = ip;
+        if (s.rfind("192.168.", 0) == 0 || s.rfind("10.", 0) == 0 || s.rfind("172.", 0) == 0) {
+            result = s;
+            break;
+        }
+        if (result == "unknown") result = s;
+    }
+    freeifaddrs(ifaddr);
+    return result;
+#endif
+}
+
+// --- Persistence: save/load last used join IP ---
+static std::filesystem::path get_net_config_path() {
+    return recomp::get_config_path() / u8"net_settings.txt";
+}
+
+static std::string load_last_join_ip() {
+    std::ifstream f(get_net_config_path());
+    std::string ip;
+    if (f.good() && std::getline(f, ip) && !ip.empty()) return ip;
+    return "127.0.0.1";
+}
+
+static void save_last_join_ip(const std::string& ip) {
+    std::ofstream f(get_net_config_path());
+    if (f.good()) f << ip;
+}
+
 // --- Multiplayer submenu panels ---
 static recompui::Element* host_panel = nullptr;
 static recompui::Element* join_panel = nullptr;
@@ -890,9 +957,16 @@ static std::string make_slot_label(int slot_index) {
 
 static void ensure_host_panel();
 
+static recompui::TextInput* host_port_input = nullptr;
+
 static void start_host_game() {
     bknet::set_mode(bknet::NetworkMode::Host);
     bknet::get_config().save_slot = selected_save_slot;
+    // Apply port from UI
+    if (host_port_input) {
+        int port = std::atoi(host_port_input->get_text().c_str());
+        if (port > 0 && port < 65536) bknet::set_port(static_cast<uint16_t>(port));
+    }
     bknet::NetworkManager::instance().host_game();
     recompui::set_online_session(true);
     recompui::update_game_mod_id(supported_games[0].mod_game_id);
@@ -915,23 +989,37 @@ static void ensure_host_panel() {
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Host Game", recompui::theme::Typography::Header2);
 
-    // --- Connection mode section ---
-    auto conn_section = create_section(context, card, "Connection Mode");
-    auto mode_select = context.create_element<recompui::Select>(
-        conn_section,
-        std::vector<recompui::SelectOption>{
-            {"Direct (LAN)", "lan"},
-            {"Online (WAN)", "wan"},
-        },
-        "lan"
+    // --- Connection info section ---
+    auto conn_section = create_section(context, card, "Your IP Address");
+
+    std::string local_ip = get_local_ip();
+
+    // IP row: [IP label] [Copy button]
+    auto ip_row = context.create_element<recompui::Element>(conn_section);
+    ip_row->set_display(recompui::Display::Flex);
+    ip_row->set_flex_direction(recompui::FlexDirection::Row);
+    ip_row->set_align_items(recompui::AlignItems::Center);
+    ip_row->set_gap(12.0f);
+    ip_row->set_width(100.0f, recompui::Unit::Percent);
+
+    context.create_element<recompui::Label>(ip_row, local_ip, recompui::theme::Typography::LabelLG);
+
+    auto copy_btn = context.create_element<recompui::Button>(
+        ip_row, "Copy", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
     );
-    mode_select->set_width(100.0f, recompui::Unit::Percent);
-    mode_select->add_change_callback([](recompui::SelectOption& opt, int) {
-        if (opt.value == "wan") {
-            printf("[Network] WAN mode selected (not yet implemented, using LAN)\n");
-        }
+    copy_btn->set_overflow(recompui::Overflow::Visible);
+    copy_btn->add_pressed_callback([local_ip]() {
+        SDL_SetClipboardText(local_ip.c_str());
+        printf("[Launcher] Copied IP to clipboard: %s\n", local_ip.c_str());
     });
-    context.create_element<recompui::Label>(conn_section, "Port: 7777", recompui::theme::Typography::LabelXS);
+
+    context.create_element<recompui::Label>(conn_section, "Share this IP with the player who wants to join.", recompui::theme::Typography::LabelXS);
+
+    // Port section
+    auto port_section = create_section(context, card, "Port");
+    host_port_input = context.create_element<recompui::TextInput>(port_section);
+    host_port_input->set_text("7777");
+    host_port_input->set_width(100.0f, recompui::Unit::Percent);
 
     // --- Save slot section ---
     auto slots_section = create_section(context, card, "Select Save Slot");
@@ -1028,6 +1116,7 @@ static recompui::Label* join_timer_label = nullptr;
 static recompui::Button* join_cancel_btn = nullptr;
 static recompui::Button* join_retry_btn = nullptr;
 static recompui::TextInput* ip_input = nullptr;
+static recompui::TextInput* join_port_input = nullptr;
 
 static void ensure_join_panel();
 
@@ -1041,8 +1130,14 @@ static void join_show_status() {
     if (join_status_view) join_status_view->display_show();
 }
 
-static void begin_join(const std::string& ip) {
+static void begin_join(const std::string& ip, const std::string& port_str) {
     join_target_ip = ip.empty() ? "127.0.0.1" : ip;
+    save_last_join_ip(join_target_ip);
+
+    // Apply port
+    int port = std::atoi(port_str.c_str());
+    if (port > 0 && port < 65536) bknet::set_port(static_cast<uint16_t>(port));
+
     join_state.store(static_cast<int>(JoinState::Connecting));
     join_start_time = std::chrono::steady_clock::now();
 
@@ -1119,12 +1214,17 @@ static void ensure_join_panel() {
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Join Game", recompui::theme::Typography::Header2);
 
-    // Connection section
-    auto conn_section = create_section(context, join_form, "Host IP Address");
-    ip_input = context.create_element<recompui::TextInput>(conn_section);
-    ip_input->set_text("127.0.0.1");
+    // IP section
+    auto ip_section = create_section(context, join_form, "Host IP Address");
+    ip_input = context.create_element<recompui::TextInput>(ip_section);
+    ip_input->set_text(load_last_join_ip());
     ip_input->set_width(100.0f, recompui::Unit::Percent);
-    context.create_element<recompui::Label>(conn_section, "Port: 7777", recompui::theme::Typography::LabelXS);
+
+    // Port section
+    auto port_section = create_section(context, join_form, "Port");
+    join_port_input = context.create_element<recompui::TextInput>(port_section);
+    join_port_input->set_text("7777");
+    join_port_input->set_width(100.0f, recompui::Unit::Percent);
 
     // Action buttons
     auto buttons_row = context.create_element<recompui::Element>(join_form);
@@ -1149,7 +1249,7 @@ static void ensure_join_panel() {
     connect_btn->set_min_width(160.0f);
     connect_btn->set_overflow(recompui::Overflow::Visible);
     connect_btn->add_pressed_callback([]() {
-        begin_join(ip_input->get_text());
+        begin_join(ip_input->get_text(), join_port_input ? join_port_input->get_text() : "7777");
     });
 
     // ========== STATUS VIEW (hidden by default) ==========
