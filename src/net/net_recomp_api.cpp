@@ -306,7 +306,7 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
     pkt.header.player_id = bknet::NetworkManager::instance().local_player_id();
     pkt.header.sequence = 0;
 
-    // Read fields from MIPS: layout must match MIPS struct
+    // Read fields from MIPS: layout must match MIPS struct (WorldStateFullData)
     pkt.map_id = MEM_W(0x00, data_ptr);
     pkt.level_id = MEM_BU(0x04, data_ptr);
     // jiggy_score at 0x08 (13 bytes)
@@ -318,6 +318,12 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
     pkt.jinjo_bits = MEM_BU(0x28, data_ptr);
     pkt.note_count = static_cast<uint16_t>(MEM_HU(0x2A, data_ptr));
     pkt.lives = MEM_BU(0x2C, data_ptr);
+    // Flag arrays at 0x2E
+    for (int i = 0; i < 37; i++) pkt.file_progress_flags[i] = MEM_BU(0x2E + i, data_ptr);
+    for (int i = 0; i < 8; i++) pkt.level_specific_flags[i] = MEM_BU(0x53 + i, data_ptr);
+    for (int i = 0; i < 25; i++) pkt.volatile_flags[i] = MEM_BU(0x5B + i, data_ptr);
+    pkt.map_specific_flags = MEM_W(0x74, data_ptr);
+    pkt.has_flags = MEM_BU(0x78, data_ptr);
 
     bknet::NetworkManager::instance().send_world_state_full(
         reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt), static_cast<uint8_t>(target));
@@ -336,6 +342,12 @@ extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
         MEM_BU(0x28, out_ptr) = pkt.jinjo_bits;
         MEM_HU(0x2A, out_ptr) = pkt.note_count;
         MEM_BU(0x2C, out_ptr) = pkt.lives;
+        // Flag arrays
+        for (int i = 0; i < 37; i++) MEM_BU(0x2E + i, out_ptr) = pkt.file_progress_flags[i];
+        for (int i = 0; i < 8; i++) MEM_BU(0x53 + i, out_ptr) = pkt.level_specific_flags[i];
+        for (int i = 0; i < 25; i++) MEM_BU(0x5B + i, out_ptr) = pkt.volatile_flags[i];
+        MEM_W(0x74, out_ptr) = pkt.map_specific_flags;
+        MEM_BU(0x78, out_ptr) = pkt.has_flags;
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

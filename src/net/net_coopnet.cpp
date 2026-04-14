@@ -1,5 +1,6 @@
 #include "net_coopnet.h"
 #include "libcoopnet.h"
+#include <juice/juice.h>
 #include <cstdio>
 #include <cstring>
 
@@ -35,6 +36,9 @@ bool CoopNetTransport::begin(const std::string& server, uint16_t port, const std
     gCoopNetCallbacks.OnError = on_error;
     gCoopNetCallbacks.OnPeerConnected = on_peer_connected;
     gCoopNetCallbacks.OnPeerDisconnected = on_peer_disconnected;
+
+    // Suppress libjuice STUN datagram spam (DEBUG/VERBOSE)
+    juice_set_log_level(JUICE_LOG_LEVEL_WARN);
 
     CoopNetRc rc = coopnet_begin(server.c_str(), port, player_name.c_str(), 0);
     if (rc != COOPNET_OK) {

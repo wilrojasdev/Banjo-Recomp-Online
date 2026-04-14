@@ -188,9 +188,11 @@ struct EnemyPositionBulkPacket {
 
 // Flag types for WorldFlagPacket
 enum WorldFlagType : uint8_t {
-    FLAG_MAP_SPECIFIC   = 0,
-    FLAG_LEVEL_SPECIFIC = 1,
-    FLAG_FILE_PROGRESS  = 2,
+    FLAG_MAP_SPECIFIC   = 0,      // Per-map actor states (doors, switches within a map)
+    FLAG_LEVEL_SPECIFIC = 1,      // Per-level progress flags
+    FLAG_FILE_PROGRESS  = 2,      // Global file/save progress (jiggy doors, note doors, witch switches)
+    FLAG_VOLATILE       = 3,      // Runtime volatile flags (witch switch pressed, sandcastle doors)
+    FLAG_JIGSAW_ACTION  = 4,      // Jigsaw puzzle pedestal sync (lock/unlock/add/remove/complete)
 };
 
 struct WorldFlagPacket {
@@ -251,6 +253,13 @@ struct WorldStateFullPacket {
     uint16_t note_count;
     uint8_t lives;
     uint8_t _pad3;
+    // Flag sync (Phase 8)
+    uint8_t file_progress_flags[37]; // fileProgressFlags bitfield (0x25 bytes)
+    uint8_t level_specific_flags[8]; // levelSpecificFlags bitfield
+    uint8_t volatile_flags[25];      // volatileFlags bitfield (0x19 bytes)
+    uint32_t map_specific_flags;     // mapSpecificFlags (single u32)
+    uint8_t has_flags;               // 1 if flag data is present (backwards compat)
+    uint8_t _pad4[3];
 };
 
 // --- Chat ---

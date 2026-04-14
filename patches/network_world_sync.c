@@ -31,6 +31,13 @@ extern ActorArray *suBaddieActorArray;
 // Marker spawn index (stable ID across clients)
 extern u32 bkrecomp_get_marker_spawn_index(ActorMarker* marker);
 
+// Flag data access for full state sync
+extern void fileProgressFlag_getSizeAndPtr(s32 *size, u8 **addr);
+extern struct { s32 unk0; s32 unk4; u8 unk8[0x25]; } gFileProgressFlags;
+extern struct { u32 unk0; u32 unk4; u8 unk8[8]; } D_80383320;
+extern struct { s32 unk0; s32 unk4; u8 unk8[0x19]; } gVolatileFlags;
+extern u32 D_80367000;  // mapSpecificFlags
+
 // Animation control
 extern enum asset_e anctrl_getIndex(AnimCtrl *this);
 extern f32 anctrl_getAnimTimer(AnimCtrl *this);
@@ -77,6 +84,18 @@ extern void honeycombscore_set(s32 indx, bool val);
 
 #define EVENT_COLLECTIBLE 0
 #define EVENT_ENEMY       1
+#define EVENT_FLAG        2
+
+// Flag sync (from network_flag_sync.c)
+extern void bkrecomp_net_process_flag_event(void *data);
+
+// Jigsaw sync (from network_jigsaw_sync.c)
+extern void bkrecomp_net_jigsaw_check_disconnects(void);
+extern void bkrecomp_net_apply_flag_bulk(
+    u8 *file_progress, s32 fp_size,
+    u8 *level_specific, s32 ls_size,
+    u8 *volatile_flags, s32 vf_size,
+    u32 map_flags);
 
 static bool processing_remote = FALSE;
 
@@ -1063,7 +1082,14 @@ typedef struct {
     u16 note_count;          // 0x2A
     u8  lives;               // 0x2C
     u8  _pad3;               // 0x2D
-} WorldStateFullData;        // 0x2E = 46 bytes
+    // Flag sync data (Phase 8)
+    u8  file_progress_flags[37]; // 0x2E (0x25 bytes) -> ends at 0x53
+    u8  level_specific_flags[8]; // 0x53 -> ends at 0x5B
+    u8  volatile_flags[25];      // 0x5B (0x19 bytes) -> ends at 0x74
+    u32 map_specific_flags;      // 0x74 (4-byte aligned)
+    u8  has_flags;               // 0x78 (1 if flag data present)
+    u8  _pad4[3];                // 0x79
+} WorldStateFullData;            // 0x7C = 124 bytes
 
 // Host: snapshot and send current state when a new player joins
 static void check_full_sync_send(void) {
@@ -1097,8 +1123,18 @@ static void check_full_sync_send(void) {
     data.note_count = 0;  // per-level, handled by collectible resync
     data.lives = (u8)item_getCount(ITEM_16_LIFE);
 
+    // Flag state
+    {
+        s32 i;
+        for (i = 0; i < 37; i++) data.file_progress_flags[i] = gFileProgressFlags.unk8[i];
+        for (i = 0; i < 8; i++) data.level_specific_flags[i] = D_80383320.unk8[i];
+        for (i = 0; i < 25; i++) data.volatile_flags[i] = gVolatileFlags.unk8[i];
+        data.map_specific_flags = D_80367000;
+        data.has_flags = 1;
+    }
+
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
-    recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d)\n",
+    recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d, flags=yes)\n",
         target_player, data.map_id);
     // Killed enemies are now sent from C++ centralized tracking (level_kills_)
 }
@@ -1206,6 +1242,16 @@ static void check_full_sync_receive(void) {
         prev_lives = item_getCount(ITEM_16_LIFE);
     }
 
+    // Apply flag state from host
+    if (data.has_flags) {
+        bkrecomp_net_apply_flag_bulk(
+            data.file_progress_flags, 37,
+            data.level_specific_flags, 8,
+            data.volatile_flags, 25,
+            data.map_specific_flags);
+        recomp_printf("[STATE-SYNC] applied flag state from host\n");
+    }
+
     processing_remote = FALSE;
 }
 
@@ -1279,6 +1325,9 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
         }
     }
 
+    // Jigsaw puzzle disconnect detection
+    bkrecomp_net_jigsaw_check_disconnects();
+
     poll_shared_collectibles();
     poll_nonshared_collectibles();
     poll_enemy_deaths();
@@ -1290,6 +1339,8 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
             process_collectible_event(&evt);
         } else if (evt.event_type == EVENT_ENEMY) {
             process_enemy_event((EnemyEventData*)&evt);
+        } else if (evt.event_type == EVENT_FLAG) {
+            bkrecomp_net_process_flag_event(&evt);
         }
     }
 }
