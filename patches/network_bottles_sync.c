@@ -7,6 +7,7 @@ extern u32 recomp_net_is_connected(void);
 extern bool bkrecomp_net_bottles_is_locked(void);
 extern bool bkrecomp_net_bottles_is_local_owner(void);
 extern void bkrecomp_net_bottles_send_lock(void);
+extern void bkrecomp_net_bottles_send_lock_refresher(void);
 extern void bkrecomp_net_bottles_send_unlock(void);
 extern u8 bkrecomp_net_bottles_get_lock_owner(void);
 
@@ -25,7 +26,7 @@ extern f32 nodeprop_getRadius(NodeProp *node_prop);
 // From mole.c — internal functions
 extern void chmole_startingDialog(Actor *this);
 extern void chmole_spawnMolehill(s32 marker_as_int);
-extern void func_802D9600(Actor *this);  // hide mole (state→1, invisible)
+extern void func_802D9600(Actor *this);  // hide mole (state->1, invisible)
 extern void func_802D9C90(Actor *this);  // free method
 extern void chmole_setFacingDirection(Actor *this);
 extern void chmole_learnAbility(Actor *this);
@@ -42,46 +43,53 @@ typedef struct {
 } NetFullState_Pos;
 extern u32 recomp_net_get_remote_state(u32 player_id, NetFullState_Pos *out);
 
-// Mole table (from mole.c)
+// Mole table (from mole.c) — must match original struct layout exactly
 typedef struct {
-    s32 teach_text;
-    s32 refresher_text;
-    s32 camera_node;
-    s32 ability;
+    s16 teach_text;
+    s16 refresher_text;
+    s8 camera_node;
+    s8 ability;
 } ChMoleDescription;
 extern ChMoleDescription moleTable[];
 
-// === State tracking ===
+// === State tracking (per-actor via pointer) ===
 
-// Actor registry — updated every frame from chmole_update.
-// actorArray_findActorFromActorId may return NULL for some actors,
-// so we keep our own pointer (same pattern as jigsaw actor registry).
-static Actor *active_bottles_actor = (Actor*)0;
+// The specific Bottles actor that the LOCAL player is talking to.
+// NULL when no local conversation is active.
+static Actor *local_talking_actor = (Actor*)0;
 
-// TRUE when LOCAL player initiated a conversation with Bottles.
-static bool local_talking = FALSE;
+// Previous state of the local_talking_actor (for unlock transition detection).
+static s32 local_talking_prev_state = 1;
 
-// TRUE when a REMOTE player is talking to Bottles.
-static bool remote_animating = FALSE;
+// The specific Bottles actor showing remote animation.
+// NULL when no remote animation is active.
+static Actor *remote_anim_actor = (Actor*)0;
 
-// Track previous state to detect transitions to state 1 (idle).
-static s32 prev_state = 1;
+// Find the Bottles actor closest to a given position.
+static Actor *find_closest_bottles(f32 pos[3]) {
+    f32 dist;
+    return actorArray_findClosestActorFromActorId(pos, ACTOR_37A_BOTTLES, -1, &dist);
+}
 
 // === Remote animation triggers (called from network_flag_sync.c) ===
 
 RECOMP_EXPORT void bkrecomp_net_bottles_remote_emerge(void) {
-    Actor *bottles = active_bottles_actor;
+    // Find the Bottles closest to the lock owner (the remote player who is talking)
+    u8 owner_id = bkrecomp_net_bottles_get_lock_owner();
+    NetFullState_Pos rs;
+    if (!recomp_net_get_remote_state((u32)owner_id, &rs)) return;
+
+    f32 owner_pos[3];
+    owner_pos[0] = rs.x;
+    owner_pos[1] = rs.y;
+    owner_pos[2] = rs.z;
+
+    Actor *bottles = find_closest_bottles(owner_pos);
     if (!bottles || !bottles->marker) return;
 
-    // Only show emerge animation for first-time learn.
-    // If ability already learned, Bottles uses refresher (state 5, no emerge).
-    if (bottles->actorTypeSpecificField >= 9 && bottles->actorTypeSpecificField < 0x13) {
-        if (ability_isUnlocked(moleTable[bottles->actorTypeSpecificField - 9].ability)) {
-            return;
-        }
-    }
-
-    remote_animating = TRUE;
+    // The host already decides whether to send LOCK (emerge) vs LOCK_REFRESHER (no emerge).
+    // This function is only called for LOCK, so always show the emerge animation.
+    remote_anim_actor = bottles;
 
     // Animate molehill partner — state 2 = opening
     Actor *molehill = subaddie_getLinkedActor(bottles);
@@ -97,11 +105,11 @@ RECOMP_EXPORT void bkrecomp_net_bottles_remote_emerge(void) {
 }
 
 RECOMP_EXPORT void bkrecomp_net_bottles_remote_hide(void) {
-    if (!remote_animating) return;  // Nothing to hide
+    if (!remote_anim_actor) return;
 
-    Actor *bottles = active_bottles_actor;
-    if (!bottles || !bottles->marker) {
-        remote_animating = FALSE;
+    Actor *bottles = remote_anim_actor;
+    if (!bottles->marker) {
+        remote_anim_actor = (Actor*)0;
         return;
     }
 
@@ -143,13 +151,22 @@ RECOMP_PATCH void chmole_update(Actor *this) {
     if (this->actorTypeSpecificField < 8 || this->actorTypeSpecificField >= 0x13)
         return;
 
-    // Register this actor every frame so remote functions can find it
-    active_bottles_actor = this;
+    // (Bottles are found via actorArray_findClosestActorFromActorId when needed)
 
     // --- Init (unchanged from original) ---
     if (!this->volatile_initialized) {
         this->volatile_initialized = TRUE;
         marker_setFreeMethod(this->marker, func_802D9C90);
+
+        // Reset stale network state for THIS actor on init
+        if (local_talking_actor == this) {
+            local_talking_actor = (Actor*)0;
+            local_talking_prev_state = 1;
+        }
+        if (remote_anim_actor == this) {
+            remote_anim_actor = (Actor*)0;
+        }
+
         if (this->initialized) {
             other = actorArray_findClosestActorFromActorId(this->position, ACTOR_12C_MOLEHILL, -1, &sp4C);
             this->partnerActor = (other) ? other->marker : NULL;
@@ -188,45 +205,70 @@ RECOMP_PATCH void chmole_update(Actor *this) {
         }
     }
 
-    // --- NET: Detect return to idle (state 1) from any conversation state ---
-    // This fires once on the transition, not every frame.
-    if (this->state == 1 && prev_state != 1) {
-        if (local_talking) {
+    // ================================================================
+    // NET: TOP-LEVEL LOCK GUARD
+    // If another player owns the lock, skip ALL normal logic for ALL
+    // Bottles actors on this map. Only allow remote animation on the
+    // specific actor that was triggered.
+    // ================================================================
+    if (recomp_net_is_connected()) {
+        bool lock_is_remote = bkrecomp_net_bottles_is_locked()
+                              && !bkrecomp_net_bottles_is_local_owner();
+
+        if (lock_is_remote && !local_talking_actor) {
+            // This actor is the one showing remote animation
+            if (remote_anim_actor == this) {
+                switch (this->state) {
+                    case 2: // Emerge animation
+                        this->marker->propPtr->unk8_3 = TRUE;
+                        face_toward_lock_owner(this);
+                        if (actor_animationIsAt(this, 0.9999f)) {
+                            subaddie_set_state_with_direction(this, 3, 0.0001f, 1);
+                            actor_loopAnimation(this);
+                        }
+                        break;
+                    case 3: // Idle visible
+                        face_toward_lock_owner(this);
+                        break;
+                    case 4: // Exit animation
+                        if (actor_animationIsAt(this, 0.9999f)) {
+                            func_802D9600(this);
+                            remote_anim_actor = (Actor*)0;
+                        }
+                        break;
+                    case 1: // Returned to idle
+                        remote_anim_actor = (Actor*)0;
+                        break;
+                }
+            }
+            // ALL Bottles skip normal logic while remote lock is active
+            return;
+        }
+    }
+
+    // ================================================================
+    // NET: LOCAL UNLOCK DETECTION (per-actor)
+    // Only fires for the SPECIFIC Bottles actor that started the conversation.
+    // Other Bottles on the same map won't trigger false unlocks.
+    // ================================================================
+    if (local_talking_actor == this) {
+        if (this->state == 1 && local_talking_prev_state != 1) {
             bkrecomp_net_bottles_send_unlock();
-            local_talking = FALSE;
-        }
-        if (remote_animating) {
-            remote_animating = FALSE;
+            local_talking_actor = (Actor*)0;
+            local_talking_prev_state = 1;
+        } else {
+            local_talking_prev_state = this->state;
         }
     }
-    prev_state = this->state;
 
-    // --- Remote animation mode: only run visual states ---
-    if (remote_animating) {
-        switch (this->state) {
-            case 2: // Emerge animation
-                this->marker->propPtr->unk8_3 = TRUE;
-                face_toward_lock_owner(this);
-                if (actor_animationIsAt(this, 0.9999f)) {
-                    // Emerge done → idle visible (face toward owner)
-                    subaddie_set_state_with_direction(this, 3, 0.0001f, 1);
-                    actor_loopAnimation(this);
-                }
-                break;
-            case 3: // Idle visible (waiting for remote conversation to end)
-                face_toward_lock_owner(this);
-                break;
-            case 4: // Exit animation
-                if (actor_animationIsAt(this, 0.9999f)) {
-                    func_802D9600(this); // hide, go to state 1
-                    remote_animating = FALSE;
-                }
-                break;
-        }
-        return; // Skip ALL normal logic — no input, no dialog, nothing
+    // Clean up remote_anim if lock was released and this actor was animating
+    if (remote_anim_actor == this && this->state == 1) {
+        remote_anim_actor = (Actor*)0;
     }
 
-    // --- Normal (local) update ---
+    // ================================================================
+    // NORMAL (LOCAL) UPDATE
+    // ================================================================
     controller_copyFaceButtons(0, sp50);
 
     switch (this->state) {
@@ -248,7 +290,8 @@ RECOMP_PATCH void chmole_update(Actor *this) {
                     if (ml_vec3f_distance(sp34, this->velocity) < this->actor_specific_1_f) {
                         if (recomp_net_is_connected()) {
                             bkrecomp_net_bottles_send_lock();
-                            local_talking = TRUE;
+                            local_talking_actor = this;
+                            local_talking_prev_state = this->state;
                         }
                         chmole_startingDialog(this);
                     }
@@ -259,8 +302,18 @@ RECOMP_PATCH void chmole_update(Actor *this) {
                         && sp50[FACE_BUTTON(BUTTON_B)] == 1
                     ) {
                         if (recomp_net_is_connected()) {
-                            bkrecomp_net_bottles_send_lock();
-                            local_talking = TRUE;
+                            // Send refresher lock if ability already learned (no emerge on remote)
+                            s32 is_refresher = 0;
+                            if (this->actorTypeSpecificField >= 9 && this->actorTypeSpecificField < 0x13) {
+                                is_refresher = ability_isUnlocked(moleTable[this->actorTypeSpecificField - 9].ability);
+                            }
+                            if (is_refresher) {
+                                bkrecomp_net_bottles_send_lock_refresher();
+                            } else {
+                                bkrecomp_net_bottles_send_lock();
+                            }
+                            local_talking_actor = this;
+                            local_talking_prev_state = this->state;
                         }
                         chmole_startingDialog(this);
                     }

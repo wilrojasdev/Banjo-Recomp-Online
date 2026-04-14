@@ -39,8 +39,9 @@ extern void bitfield_set_n_bits(u8 *array, s32 startIndex, s32 set, s32 length);
 #define NET_FLAG_BOTTLES_ACTION 6
 
 // Bottles lock actions
-#define BOTTLES_ACTION_LOCK   0
-#define BOTTLES_ACTION_UNLOCK 1
+#define BOTTLES_ACTION_LOCK            0
+#define BOTTLES_ACTION_UNLOCK          1
+#define BOTTLES_ACTION_LOCK_REFRESHER  2
 
 // Jigsaw sync (from network_jigsaw_sync.c)
 extern void bkrecomp_net_process_jigsaw_event(u32 flag_index, u32 value, u32 map_id);
@@ -105,6 +106,13 @@ RECOMP_EXPORT void bkrecomp_net_bottles_send_lock(void) {
     u32 my_id = recomp_net_get_local_player_id();
     net_bottles_lock((u8)my_id);
     recomp_net_send_flag_change(NET_FLAG_BOTTLES_ACTION, BOTTLES_ACTION_LOCK, my_id, (u32)map_get());
+}
+
+RECOMP_EXPORT void bkrecomp_net_bottles_send_lock_refresher(void) {
+    if (!recomp_net_is_connected()) return;
+    u32 my_id = recomp_net_get_local_player_id();
+    net_bottles_lock((u8)my_id);
+    recomp_net_send_flag_change(NET_FLAG_BOTTLES_ACTION, BOTTLES_ACTION_LOCK_REFRESHER, my_id, (u32)map_get());
 }
 
 RECOMP_EXPORT void bkrecomp_net_bottles_send_unlock(void) {
@@ -271,20 +279,19 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
     u16 idx = evt->flag_index;
     s32 val = (s32)evt->flag_value;
 
-    recomp_printf("[FLAG-EVENT] type=%d idx=%d val=%d map=%d\n", ft, idx, val, evt->flag_map_id);
+    // Only log non-spammy flag types (bottles, ability, jigsaw)
+    if (ft >= NET_FLAG_JIGSAW_ACTION) {
+        recomp_printf("[FLAG-EVENT] type=%d idx=%d val=%d map=%d\n", ft, idx, val, evt->flag_map_id);
+    }
 
     if (ft == NET_FLAG_FILE_PROGRESS) {
         fileProgressFlag_set((enum file_progress_e)idx, val);
-        recomp_printf("[FLAG-SYNC] applied file_progress[%d] = %d\n", idx, val);
     } else if (ft == NET_FLAG_LEVEL_SPECIFIC) {
         levelSpecificFlags_set((s32)idx, val);
-        recomp_printf("[FLAG-SYNC] applied level_specific[%d] = %d\n", idx, val);
     } else if (ft == NET_FLAG_VOLATILE) {
         volatileFlag_set((enum volatile_flags_e)idx, val);
-        recomp_printf("[FLAG-SYNC] applied volatile[%d] = %d\n", idx, val);
     } else if (ft == NET_FLAG_MAP_SPECIFIC) {
         mapSpecificFlags_set((s32)idx, val);
-        recomp_printf("[FLAG-SYNC] applied map_specific[%d] = %d\n", idx, val);
     } else if (ft == NET_FLAG_JIGSAW_ACTION) {
         // Delegate to jigsaw sync — it manages its own guard via bkrecomp_net_set_remote_flag_guard
         net_applying_remote_flag = FALSE;
@@ -297,9 +304,13 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
     } else if (ft == NET_FLAG_BOTTLES_ACTION) {
         if (idx == BOTTLES_ACTION_LOCK) {
             net_bottles_lock((u8)val);
-            // Show emerge animation on remote side
+            // First-time learn: show emerge animation on remote side
             bkrecomp_net_bottles_remote_emerge();
-            recomp_printf("[BOTTLES-SYNC] locked by player %d\n", val);
+            recomp_printf("[BOTTLES-SYNC] locked by player %d (emerge)\n", val);
+        } else if (idx == BOTTLES_ACTION_LOCK_REFRESHER) {
+            net_bottles_lock((u8)val);
+            // Refresher: lock only, no emerge animation
+            recomp_printf("[BOTTLES-SYNC] locked by player %d (refresher)\n", val);
         } else if (idx == BOTTLES_ACTION_UNLOCK) {
             net_bottles_unlock();
             // Show exit animation on remote side
