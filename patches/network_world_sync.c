@@ -309,8 +309,11 @@ static u8  prev_mumboscore[16] = {0};
 // Note/prop hiding (defined in note_saving.c)
 extern void bkrecomp_net_hide_note(u32 note_index);
 extern void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz);
+extern bool is_note_collected(s32 map_id, s32 level_id, u8 note_index);
 static u8  prev_honeycombscore[3] = {0};
 static s32 prev_lives = 0;
+// Debug: track jiggy total changes from ANY source
+static s32 dbg_prev_jiggy_total = -1;
 // Non-shared
 static s32 prev_eggs = 0;
 static s32 prev_red_feathers = 0;
@@ -384,72 +387,56 @@ static void poll_shared_collectibles(void) {
     }
 
     // --- Jigsaws ---
+    // BK uses unusual bit indexing: byte=(id-1)/8, bit=id&7
+    // (bit 0 of each byte = id that is a multiple of 8, NOT id*8+1)
+    // Iterate by jiggy_id to match the game's own layout.
     {
         u8 *score = jiggyscore_getPtr();
         if (score) {
-            s32 i;
-            for (i = 0; i < 0xD; i++) {
-                u8 new_bits = score[i] & ~prev_jiggyscore[i];
-                if (new_bits) {
-                    s32 bit;
-                    for (bit = 0; bit < 8; bit++) {
-                        if (new_bits & (1 << bit)) {
-                            s32 jiggy_id = i * 8 + bit + 1;
-                            if (jiggy_id > 0 && jiggy_id < 0x65) {
-                                recomp_net_send_collectible(COLLECTIBLE_JIGGY, (u32)jiggy_id, 1, cur_map, cur_level);
-                            }
-                        }
-                    }
+            s32 jid;
+            for (jid = 1; jid < 0x65; jid++) {
+                s32 byte_idx = (jid - 1) / 8;
+                u8 bit_mask = 1 << (jid & 7);
+                if ((score[byte_idx] & bit_mask) && !(prev_jiggyscore[byte_idx] & bit_mask)) {
+                    recomp_net_send_collectible(COLLECTIBLE_JIGGY, (u32)jid, 1, cur_map, cur_level);
                 }
-                prev_jiggyscore[i] = score[i];
             }
+            { s32 i; for (i = 0; i < 0xD; i++) prev_jiggyscore[i] = score[i]; }
         }
     }
 
-    // --- Mumbo tokens ---
+    // --- Mumbo tokens --- (same bit layout as jiggies: byte=(id-1)/8, bit=id&7)
     {
         u8 *score = func_80321538();
         if (score) {
-            s32 i;
-            for (i = 0; i < 16; i++) {
-                u8 new_bits = score[i] & ~prev_mumboscore[i];
-                if (new_bits) {
-                    s32 bit;
-                    for (bit = 0; bit < 8; bit++) {
-                        if (new_bits & (1 << bit)) {
-                            s32 token_id = i * 8 + bit + 1;
-                            recomp_net_send_collectible(COLLECTIBLE_MUMBO_TOKEN, (u32)token_id, 1, cur_map, cur_level);
-                        }
-                    }
+            s32 tid;
+            for (tid = 1; tid < 126; tid++) {
+                s32 byte_idx = (tid - 1) / 8;
+                u8 bit_mask = 1 << (tid & 7);
+                if ((score[byte_idx] & bit_mask) && !(prev_mumboscore[byte_idx] & bit_mask)) {
+                    recomp_net_send_collectible(COLLECTIBLE_MUMBO_TOKEN, (u32)tid, 1, cur_map, cur_level);
                 }
-                prev_mumboscore[i] = score[i];
             }
+            { s32 i; for (i = 0; i < 16; i++) prev_mumboscore[i] = score[i]; }
         }
     }
 
     // Notes: sent directly from note_saving.c (no polling needed)
 
     // --- Empty honeycombs (panel pieces, 2 per world) ---
+    // Same bit layout: byte=(id-1)/8, bit=id&7
     {
         u8 *score = honeycombscore_get_ptr();
         if (score) {
-            s32 i;
-            for (i = 0; i < 3; i++) {
-                u8 new_bits = score[i] & ~prev_honeycombscore[i];
-                if (new_bits) {
-                    recomp_printf("[HC-POLL] byte[%d] score=0x%X prev=0x%X new=0x%X\n", i, score[i], prev_honeycombscore[i], new_bits);
-                    s32 bit;
-                    for (bit = 0; bit < 8; bit++) {
-                        if (new_bits & (1 << bit)) {
-                            s32 hc_id = i * 8 + bit + 1;
-                            if (hc_id > 0 && hc_id < 0x19) {
-                                recomp_net_send_collectible(COLLECTIBLE_EMPTY_HONEYCOMB, (u32)hc_id, 1, cur_map, cur_level);
-                            }
-                        }
-                    }
+            s32 hid;
+            for (hid = 1; hid < 0x19; hid++) {
+                s32 byte_idx = (hid - 1) / 8;
+                u8 bit_mask = 1 << (hid & 7);
+                if ((score[byte_idx] & bit_mask) && !(prev_honeycombscore[byte_idx] & bit_mask)) {
+                    recomp_net_send_collectible(COLLECTIBLE_EMPTY_HONEYCOMB, (u32)hid, 1, cur_map, cur_level);
                 }
-                prev_honeycombscore[i] = score[i];
             }
+            { s32 i; for (i = 0; i < 3; i++) prev_honeycombscore[i] = score[i]; }
         }
     }
 
@@ -705,14 +692,31 @@ static void process_collectible_event(WorldEventData *evt) {
                 item_adjustByDiffWithoutHud(ITEM_1C_MUMBO_TOKEN, 1);
                 { u8 *s = func_80321538(); if (s) { s32 i; for(i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
             }
-            if (cur_map == evt->coll_map_id) {
-                despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
+            // Despawn mumbo token actors whose uid matches a collected token.
+            // Can't use despawn_actor_by_marker_id (despawns wrong one).
+            // Must check each actor's local uid against mumboscore bitfield.
+            if (cur_map == evt->coll_map_id && suBaddieActorArray) {
+                s32 i;
+                for (i = 0; i < suBaddieActorArray->cnt; i++) {
+                    Actor *actor = &suBaddieActorArray->data[i];
+                    if (!actor->marker) continue;
+                    if (actor->marker->id != MARKER_39_MUMBO_TOKEN) continue;
+                    s32 uid = *(s32*)&actor->local;  // ActorLocal_MumboToken.uid at offset 0
+                    if (mumboscore_get(uid)) {
+                        marker_despawn(actor->marker);
+                    }
+                }
             }
         } else if (ct == COLLECTIBLE_JIGGY) {
             if (!jiggyscore_isCollected(evt->coll_id)) {
+                recomp_printf("[JIGGY-DEBUG] RESYNC adding jiggy %d (was NOT collected), total before=%d\n",
+                    evt->coll_id, item_getCount(ITEM_26_JIGGY_TOTAL));
                 jiggyscore_setCollected(evt->coll_id, TRUE);
                 item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+                dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
                 { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for(i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
+            } else {
+                recomp_printf("[JIGGY-DEBUG] RESYNC skip jiggy %d (already collected)\n", evt->coll_id);
             }
             if (cur_map == evt->coll_map_id) {
                 despawn_actor_by_marker_id(MARKER_52_JIGGY);
@@ -725,6 +729,23 @@ static void process_collectible_event(WorldEventData *evt) {
             }
             if (cur_map == evt->coll_map_id) {
                 despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
+            }
+        } else if (ct == COLLECTIBLE_NOTE) {
+            // Notes are per-level — only apply + hide if on the same map
+            if (cur_map == evt->coll_map_id) {
+                // Only increment counter if note wasn't already collected
+                // (prevents host double-counting its own notes via resync)
+                if (evt->coll_id != 0xFFFE
+                    && !is_note_collected((s32)cur_map, (s32)level_get(), (u8)evt->coll_id)) {
+                    item_adjustByDiffWithoutHud(ITEM_C_NOTE, 1);
+                }
+                if (evt->coll_id == 0xFFFE) {
+                    // Dynamic note — no specific index, just despawn actor
+                    despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
+                } else {
+                    // Static note — hide by index (also marks as collected)
+                    bkrecomp_net_hide_note(evt->coll_id);
+                }
             }
         } else if (ct == COLLECTIBLE_EXTRA_LIFE) {
             // Don't adjust lives on resync — just despawn
@@ -751,6 +772,8 @@ static void process_collectible_event(WorldEventData *evt) {
 
         if (ct == COLLECTIBLE_JIGGY) {
             if (!jiggyscore_isCollected(evt->coll_id)) {
+                recomp_printf("[JIGGY-DEBUG] REALTIME adding jiggy %d from player %d, total before=%d, same_lvl=%d\n",
+                    evt->coll_id, evt->sender_id, item_getCount(ITEM_26_JIGGY_TOTAL), same_level);
                 jiggyscore_setCollected(evt->coll_id, TRUE);
                 // Jiggy total is global — always adjust.
                 // Show HUD counter when on same level, silent when different.
@@ -759,6 +782,7 @@ static void process_collectible_event(WorldEventData *evt) {
                 } else {
                     item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
                 }
+                dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
                 { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
                 if (same_map) {
                     despawn_actor_by_marker_id(MARKER_52_JIGGY);
@@ -794,11 +818,13 @@ static void process_collectible_event(WorldEventData *evt) {
                 if (marker_id) despawn_actor_by_marker_id(marker_id);
             }
         } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
-            // Mumbo tokens: global bitfield always, HUD counter on same level
+            // Mumbo tokens: global bitfield + counter always (not per-level)
             if (!mumboscore_get(evt->coll_id)) {
                 mumboscore_set(evt->coll_id, TRUE);
                 if (same_level) {
                     item_inc(ITEM_1C_MUMBO_TOKEN);
+                } else {
+                    item_adjustByDiffWithoutHud(ITEM_1C_MUMBO_TOKEN, 1);
                 }
                 { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
                 if (same_map) {
@@ -812,11 +838,13 @@ static void process_collectible_event(WorldEventData *evt) {
                     evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
             }
         } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
-            // Empty honeycombs: global bitfield always, HUD counter on same level
+            // Empty honeycombs: global bitfield + counter always (not per-level)
             if (!honeycombscore_get(evt->coll_id)) {
                 honeycombscore_set(evt->coll_id, TRUE);
                 if (same_level) {
                     item_inc(ITEM_13_EMPTY_HONEYCOMB);
+                } else {
+                    item_adjustByDiffWithoutHud(ITEM_13_EMPTY_HONEYCOMB, 1);
                 }
                 { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
                 if (same_map) {
@@ -1150,20 +1178,17 @@ static void check_full_sync_receive(void) {
 
     processing_remote = TRUE;
 
-    // Apply jiggy scores
+    // Apply jiggy scores — use game's bit layout: byte=(id-1)/8, bit=id&7
     {
-        s32 i;
-        for (i = 0; i < 13; i++) {
-            s32 bit;
-            for (bit = 0; bit < 8; bit++) {
-                if (data.jiggy_score[i] & (1 << bit)) {
-                    s32 jiggy_id = i * 8 + bit + 1;
-                    if (jiggy_id > 0 && jiggy_id < 0x65) {
-                        if (!jiggyscore_isCollected(jiggy_id)) {
-                            jiggyscore_setCollected(jiggy_id, TRUE);
-                            item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
-                        }
-                    }
+        s32 jid;
+        for (jid = 1; jid < 0x65; jid++) {
+            s32 byte_idx = (jid - 1) / 8;
+            u8 bit_mask = 1 << (jid & 7);
+            if (data.jiggy_score[byte_idx] & bit_mask) {
+                if (!jiggyscore_isCollected(jid)) {
+                    jiggyscore_setCollected(jid, TRUE);
+                    item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, 1);
+                    dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
                 }
             }
         }
@@ -1172,18 +1197,16 @@ static void check_full_sync_receive(void) {
         if (s) { s32 j; for (j = 0; j < 0xD; j++) prev_jiggyscore[j] = s[j]; }
     }
 
-    // Apply mumbo token scores
+    // Apply mumbo token scores — use game's bit layout: byte=(id-1)/8, bit=id&7
     {
-        s32 i;
-        for (i = 0; i < 16; i++) {
-            s32 bit;
-            for (bit = 0; bit < 8; bit++) {
-                if (data.mumbo_score[i] & (1 << bit)) {
-                    s32 token_id = i * 8 + bit + 1;
-                    if (!mumboscore_get(token_id)) {
-                        mumboscore_set(token_id, TRUE);
-                        item_inc(ITEM_1C_MUMBO_TOKEN);
-                    }
+        s32 tid;
+        for (tid = 1; tid < 126; tid++) {
+            s32 byte_idx = (tid - 1) / 8;
+            u8 bit_mask = 1 << (tid & 7);
+            if (data.mumbo_score[byte_idx] & bit_mask) {
+                if (!mumboscore_get(tid)) {
+                    mumboscore_set(tid, TRUE);
+                    item_inc(ITEM_1C_MUMBO_TOKEN);
                 }
             }
         }
@@ -1191,20 +1214,16 @@ static void check_full_sync_receive(void) {
         if (s) { s32 j; for (j = 0; j < 16; j++) prev_mumboscore[j] = s[j]; }
     }
 
-    // Apply honeycomb scores
+    // Apply honeycomb scores — use game's bit layout: byte=(id-1)/8, bit=id&7
     {
-        s32 i;
-        for (i = 0; i < 3; i++) {
-            s32 bit;
-            for (bit = 0; bit < 8; bit++) {
-                if (data.honeycomb_score[i] & (1 << bit)) {
-                    s32 hc_id = i * 8 + bit + 1;
-                    if (hc_id > 0 && hc_id < 0x19) {
-                        if (!honeycombscore_get(hc_id)) {
-                            honeycombscore_set(hc_id, TRUE);
-                            item_inc(ITEM_13_EMPTY_HONEYCOMB);
-                        }
-                    }
+        s32 hid;
+        for (hid = 1; hid < 0x19; hid++) {
+            s32 byte_idx = (hid - 1) / 8;
+            u8 bit_mask = 1 << (hid & 7);
+            if (data.honeycomb_score[byte_idx] & bit_mask) {
+                if (!honeycombscore_get(hid)) {
+                    honeycombscore_set(hid, TRUE);
+                    item_inc(ITEM_13_EMPTY_HONEYCOMB);
                 }
             }
         }
@@ -1252,6 +1271,23 @@ static void check_full_sync_receive(void) {
         recomp_printf("[STATE-SYNC] applied flag state from host\n");
     }
 
+    // Re-snapshot ALL polling state AFTER full sync.
+    // The game engine may react to bulk flags by auto-setting score bitfields
+    // (e.g., progression flags imply certain jiggies collected). Without this,
+    // the poll would detect these engine-generated bits as "new" and re-send them,
+    // causing duplicate items on the host.
+    {
+        u8 *js = jiggyscore_getPtr();
+        if (js) { s32 i; for (i = 0; i < 0xD; i++) prev_jiggyscore[i] = js[i]; }
+        u8 *ms = func_80321538();
+        if (ms) { s32 i; for (i = 0; i < 16; i++) prev_mumboscore[i] = ms[i]; }
+        u8 *hs = honeycombscore_get_ptr();
+        if (hs) { s32 i; for (i = 0; i < 3; i++) prev_honeycombscore[i] = hs[i]; }
+        prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+        prev_lives = item_getCount(ITEM_16_LIFE);
+        dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
+    }
+
     processing_remote = FALSE;
 }
 
@@ -1265,19 +1301,36 @@ static u32 prev_global_map = 0xFFFFFFFF;
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     if (!recomp_net_is_connected()) return;
 
+    // Detect any JIGGY_TOTAL change (including from game engine itself)
+    {
+        s32 cur_total = item_getCount(ITEM_26_JIGGY_TOTAL);
+        if (dbg_prev_jiggy_total >= 0 && cur_total != dbg_prev_jiggy_total) {
+            recomp_printf("[JIGGY-DEBUG] *** TOTAL CHANGED %d -> %d (outside net code!) ***\n",
+                dbg_prev_jiggy_total, cur_total);
+        }
+        dbg_prev_jiggy_total = cur_total;
+    }
+
     // Reset cached enemy functions on ANY map or level change (ALL players).
     // Enemies are map-specific — when map changes, all saved function pointers
     // become stale and must be cleared to prevent bus errors.
+    // CRITICAL: Skip all processing on the transition frame — game data structures
+    // (actors, markers, score pointers) may be in an inconsistent/stale state
+    // during the loading frame, causing bus errors on access.
     {
         u32 cur_level = (u32)level_get();
         u32 cur_map = (u32)map_get();
         if (cur_level != prev_global_level || cur_map != prev_global_map) {
+            recomp_printf("[NET] Level/map change: level %d->%d map %d->%d, JIGGY_TOTAL=%d\n",
+                prev_global_level, cur_level, prev_global_map, cur_map, item_getCount(ITEM_26_JIGGY_TOTAL));
             saved_diefunc_count = 0;
             dying_count = 0;
             prev_global_level = cur_level;
             prev_global_map = cur_map;
             // Reset per-level polling state to match game's level reset
             prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+            // Skip the rest of this frame — let the game finish loading first
+            return;
         }
     }
 

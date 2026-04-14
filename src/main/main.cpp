@@ -1198,7 +1198,8 @@ static recompui::TextInput* ip_input = nullptr;
 static recompui::TextInput* join_port_input = nullptr;
 static recompui::TextInput* join_password_input = nullptr;
 static recompui::Element* join_lobby_container = nullptr;
-static recompui::Label* join_lobby_status_label = nullptr; // "Searching..." / "No lobbies found"
+static recompui::Label* join_lobby_status_label = nullptr;
+static std::vector<recompui::Element*> join_lobby_rows; // Track created lobby rows for cleanup
 
 static void ensure_join_panel();
 
@@ -1716,7 +1717,13 @@ static void populate_lobby_list_ui() {
         }
     }
 
-    // Create lobby entries (appended to container)
+    // Hide old lobby rows
+    for (auto* row : join_lobby_rows) {
+        row->display_hide();
+    }
+    join_lobby_rows.clear();
+
+    // Create lobby entries
     auto context = recompui::get_launcher_context_id();
     for (const auto& lobby : cached_lobby_list) {
         auto row = context.create_element<recompui::Element>(join_lobby_container);
@@ -1748,6 +1755,8 @@ static void populate_lobby_list_ui() {
         join_btn->add_pressed_callback([lid]() {
             begin_coopnet_join(lid);
         });
+
+        join_lobby_rows.push_back(row);
     }
 
     // Make sure lobby list view is visible

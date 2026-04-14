@@ -305,14 +305,16 @@ static void bottlesInstructionsCallback(ActorMarker *marker, enum asset_e text_i
     jigsawPicture_setState_net(this, (text_id == ASSET_F58_DIALOG_FIRST_PICTURE_INSTRUCTION) ? JIGSAW_PICTURE_LEAVE_PODIUM : JIGSAW_PICTURE_WAITING);
 }
 
-// Exact replica of func_8038EDBC — using s32 for pointer values (matching original MIPS types)
+// Fixed replica of func_8038EDBC — original decomp has sp28[3] + sp34 as separate vars,
+// but on the original MIPS stack they are contiguous, so func_8034DF30 reads sp28 as a
+// 4-element array where [3] = opacity. The MIPS cross-compiler doesn't guarantee this
+// layout, so we use an explicit f32[4] array with sp28[3] as the alpha channel.
 static void jigsaw_opacity_update(Actor *this) {
     s32 sp44;
     s32 sp40;
     JigsawPictureActorData *local;
     s32 sp38;
-    f32 sp34;
-    f32 sp28[3];
+    f32 sp28[4];
 
     local = (JigsawPictureActorData*)&this->local;
     sp38 = (this->modelCacheIndex == 0x3B7) ? 0x190 : 0x192;
@@ -330,12 +332,10 @@ static void jigsaw_opacity_update(Actor *this) {
             local->unk8 = (local->unk8 - 8 > 0) ? local->unk8 - 8 : 0;
         }
 
-        sp34 = (0xFF - local->unk8) / 255.0;
+        sp28[3] = (0xFF - local->unk8) / 255.0f;
         func_8034DF30(sp44, sp28, sp28, 0);
-        sp34 = 1.0 - sp34;
+        sp28[3] = 1.0f - sp28[3];
         func_8034DF30(sp40, sp28, sp28, 0);
-
-        if (sp34); // match original exactly
     }
 }
 
@@ -423,6 +423,8 @@ static void jigsawPicture_setState_net(Actor *this, s32 nextState) {
                 local->placedPieces |= (1 << piece_position);
                 fileProgressFlag_setN(PICTURE_INFO[this->actorTypeSpecificField - 1].progressFlag, local->placedJiggyCount, PICTURE_INFO[this->actorTypeSpecificField - 1].sizeBits);
                 item_adjustByDiffWithoutHud(ITEM_26_JIGGY_TOTAL, -1);
+                recomp_printf("[JIGGY-DEBUG] Placed piece on puzzle %d, JIGGY_TOTAL now=%d\n",
+                    this->actorTypeSpecificField, item_getCount(ITEM_26_JIGGY_TOTAL));
                 unlockAdditionalActions(this);
                 // NET: Send piece added
                 if (recomp_net_is_connected()) {
@@ -604,7 +606,7 @@ RECOMP_PATCH void updateJigsawPictureActor(Actor *this) {
     controller_copyFaceButtons(0, face_buttons);
     controller_copySideButtons(0, side_buttons);
 
-    // jigsaw_opacity_update(this); // DISABLED - testing if this is what hides the golden pedestal
+    jigsaw_opacity_update(this);
 
     switch (this->state) {
         case JIGSAW_PICTURE_LEAVE_PODIUM:
