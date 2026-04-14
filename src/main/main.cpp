@@ -28,6 +28,7 @@ extern char **environ;
 #include "nfd.h"
 #include "../net/net_manager.h"
 #include "../net/net_config.h"
+#include "../net/net_coopnet.h"
 #include "../net/net_chat.h"
 #include "../net/net_chat_ui.h"
 
@@ -289,7 +290,7 @@ void update_gfx(void*) {
 
     // Pump network events and send/receive state
     auto& net = bknet::NetworkManager::instance();
-    if (net.is_connected()) {
+    if (net.is_connected() || net.is_coopnet_mode()) {
         net.update();
     }
 
@@ -953,25 +954,88 @@ static std::string make_slot_label(int slot_index) {
     return "Save " + std::to_string(slot_index + 1) + "  -  Empty";
 }
 
+// ===================== COOPNET FORWARD DECLARATIONS =====================
+
+enum class CoopNetState : int { Idle = 0, Connecting = 1, CreatingLobby = 2, JoiningLobby = 3, Connected = 4, Failed = 5 };
+static std::atomic<int> coopnet_state{0};
+static std::chrono::steady_clock::time_point coopnet_start_time;
+
+enum class CoopNetPendingAction : int { None = 0, Host = 1, Browse = 2, Join = 3 };
+static std::atomic<int> coopnet_pending_action{0};
+static uint64_t coopnet_pending_lobby_id = 0;
+
+// Hardcoded CoopNet signaling server
+static constexpr const char* COOPNET_SERVER = "34.73.10.222";
+static constexpr uint16_t COOPNET_PORT = 34197;
+
+static std::vector<bknet::LobbyInfo> cached_lobby_list;
+static std::atomic<bool> lobby_list_dirty{false};
+
+static void begin_coopnet_connect();
+static void begin_coopnet_host();
+static void begin_coopnet_join(uint64_t lobby_id);
+
 // ===================== HOST PANEL =====================
 
 static void ensure_host_panel();
 
 static recompui::TextInput* host_port_input = nullptr;
+static recompui::TextInput* host_password_input = nullptr;
+static recompui::Element* host_port_section = nullptr;
+static recompui::Element* host_password_section = nullptr;
+static recompui::Element* host_ip_section = nullptr;
+static recompui::Button* host_mode_direct_btn = nullptr;
+static recompui::Button* host_mode_coopnet_btn = nullptr;
+static bool host_coopnet_mode = false; // false = Direct, true = CoopNet
+
+static void host_set_mode(bool coopnet) {
+    host_coopnet_mode = coopnet;
+    if (host_mode_direct_btn) host_mode_direct_btn->set_opacity(coopnet ? 0.5f : 1.0f);
+    if (host_mode_coopnet_btn) host_mode_coopnet_btn->set_opacity(coopnet ? 1.0f : 0.5f);
+    if (host_port_section) { if (coopnet) host_port_section->display_hide(); else host_port_section->display_show(); }
+    if (host_password_section) { if (coopnet) host_password_section->display_show(); else host_password_section->display_hide(); }
+    if (host_ip_section) { if (coopnet) host_ip_section->display_hide(); else host_ip_section->display_show(); }
+}
 
 static void start_host_game() {
-    bknet::set_mode(bknet::NetworkMode::Host);
     bknet::get_config().save_slot = selected_save_slot;
-    // Apply port from UI
-    if (host_port_input) {
-        int port = std::atoi(host_port_input->get_text().c_str());
-        if (port > 0 && port < 65536) bknet::set_port(static_cast<uint16_t>(port));
+
+    if (host_coopnet_mode) {
+        // CoopNet host
+        bknet::set_mode(bknet::NetworkMode::CoopNetHost);
+        std::string pass = host_password_input ? host_password_input->get_text() : "";
+        bknet::set_coopnet_server(COOPNET_SERVER);
+        bknet::set_coopnet_port(COOPNET_PORT);
+
+        auto& net = bknet::NetworkManager::instance();
+        if (!net.is_coopnet_signaling_connected()) {
+            coopnet_pending_action.store(static_cast<int>(CoopNetPendingAction::Host));
+            coopnet_state.store(static_cast<int>(CoopNetState::Connecting));
+            coopnet_start_time = std::chrono::steady_clock::now();
+            net.coopnet_begin(COOPNET_SERVER, COOPNET_PORT);
+            // Will chain to host after connect via update_coopnet_state
+        } else {
+            coopnet_state.store(static_cast<int>(CoopNetState::CreatingLobby));
+            bool ok = net.coopnet_host_lobby(pass, "");
+            if (ok) {
+                coopnet_state.store(static_cast<int>(CoopNetState::Connected));
+            } else {
+                coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+            }
+        }
+    } else {
+        // Direct (ENet) host
+        bknet::set_mode(bknet::NetworkMode::Host);
+        if (host_port_input) {
+            int port = std::atoi(host_port_input->get_text().c_str());
+            if (port > 0 && port < 65536) bknet::set_port(static_cast<uint16_t>(port));
+        }
+        bknet::NetworkManager::instance().host_game();
+        recompui::set_online_session(true);
+        recompui::update_game_mod_id(supported_games[0].mod_game_id);
+        recomp::start_game(supported_games[0].game_id, {});
+        recompui::hide_all_contexts();
     }
-    bknet::NetworkManager::instance().host_game();
-    recompui::set_online_session(true);
-    recompui::update_game_mod_id(supported_games[0].mod_game_id);
-    recomp::start_game(supported_games[0].game_id, {});
-    recompui::hide_all_contexts();
 }
 
 static void ensure_host_panel() {
@@ -981,7 +1045,7 @@ static void ensure_host_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     host_panel = backdrop;
 
-    // --- Title (centered) ---
+    // --- Title ---
     auto title_row = context.create_element<recompui::Element>(card);
     title_row->set_display(recompui::Display::Flex);
     title_row->set_justify_content(recompui::JustifyContent::Center);
@@ -989,45 +1053,65 @@ static void ensure_host_panel() {
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Host Game", recompui::theme::Typography::Header2);
 
-    // --- Connection info section ---
-    auto conn_section = create_section(context, card, "Your IP Address");
+    // --- Network System selector ---
+    auto mode_section = create_section(context, card, "Network System");
+    auto mode_row = context.create_element<recompui::Element>(mode_section);
+    mode_row->set_display(recompui::Display::Flex);
+    mode_row->set_flex_direction(recompui::FlexDirection::Row);
+    mode_row->set_gap(8.0f);
+    mode_row->set_width(100.0f, recompui::Unit::Percent);
+    mode_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
+    host_mode_coopnet_btn = context.create_element<recompui::Button>(
+        mode_row, "CoopNet", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    host_mode_coopnet_btn->set_flex_grow(1.0f);
+    host_mode_coopnet_btn->set_overflow(recompui::Overflow::Visible);
+    host_mode_coopnet_btn->add_pressed_callback([]() { host_set_mode(true); });
+
+    host_mode_direct_btn = context.create_element<recompui::Button>(
+        mode_row, "Direct Connection", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    host_mode_direct_btn->set_flex_grow(1.0f);
+    host_mode_direct_btn->set_overflow(recompui::Overflow::Visible);
+    host_mode_direct_btn->add_pressed_callback([]() { host_set_mode(false); });
+
+    // --- IP Address section (Direct only) ---
+    host_ip_section = create_section(context, card, "Your IP Address");
     std::string local_ip = get_local_ip();
-
-    // IP row: [IP label] [Copy button]
-    auto ip_row = context.create_element<recompui::Element>(conn_section);
+    auto ip_row = context.create_element<recompui::Element>(host_ip_section);
     ip_row->set_display(recompui::Display::Flex);
     ip_row->set_flex_direction(recompui::FlexDirection::Row);
     ip_row->set_align_items(recompui::AlignItems::Center);
     ip_row->set_gap(12.0f);
     ip_row->set_width(100.0f, recompui::Unit::Percent);
-
     context.create_element<recompui::Label>(ip_row, local_ip, recompui::theme::Typography::LabelLG);
-
     auto copy_btn = context.create_element<recompui::Button>(
         ip_row, "Copy", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
     );
     copy_btn->set_overflow(recompui::Overflow::Visible);
     copy_btn->add_pressed_callback([local_ip]() {
         SDL_SetClipboardText(local_ip.c_str());
-        printf("[Launcher] Copied IP to clipboard: %s\n", local_ip.c_str());
     });
 
-    context.create_element<recompui::Label>(conn_section, "Share this IP with the player who wants to join.", recompui::theme::Typography::LabelXS);
-
-    // Port section
-    auto port_section = create_section(context, card, "Port");
-    host_port_input = context.create_element<recompui::TextInput>(port_section);
+    // --- Port section (Direct only) ---
+    host_port_section = create_section(context, card, "Port");
+    host_port_input = context.create_element<recompui::TextInput>(host_port_section);
     host_port_input->set_text("7777");
     host_port_input->set_width(100.0f, recompui::Unit::Percent);
 
-    // --- Save slot section ---
-    auto slots_section = create_section(context, card, "Select Save Slot");
+    // --- Password section (CoopNet only, hidden by default) ---
+    host_password_section = create_section(context, card, "Password");
+    host_password_input = context.create_element<recompui::TextInput>(host_password_section);
+    host_password_input->set_text("");
+    host_password_input->set_width(100.0f, recompui::Unit::Percent);
+    host_password_section->display_hide();
 
+    // --- Save slot section ---
+    auto slots_section = create_section(context, card, "Save Slot");
     static recompui::Button* erase_buttons[3] = {};
 
     for (int i = 0; i < 3; i++) {
-        // Row: [slot button] [erase button]
         auto slot_row = context.create_element<recompui::Element>(slots_section);
         slot_row->set_display(recompui::Display::Flex);
         slot_row->set_flex_direction(recompui::FlexDirection::Row);
@@ -1036,13 +1120,10 @@ static void ensure_host_panel() {
         slot_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
         slot_buttons[i] = context.create_element<recompui::Button>(
-            slot_row, make_slot_label(i),
-            recompui::ButtonStyle::Secondary,
-            recompui::ButtonSize::Large
+            slot_row, make_slot_label(i), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
         );
         slot_buttons[i]->set_width(100.0f, recompui::Unit::Percent);
         slot_buttons[i]->set_opacity(i == 0 ? 1.0f : 0.5f);
-
         slot_buttons[i]->add_pressed_callback([i]() {
             selected_save_slot = i;
             for (int j = 0; j < 3; j++) {
@@ -1051,26 +1132,18 @@ static void ensure_host_panel() {
         });
 
         erase_buttons[i] = context.create_element<recompui::Button>(
-            slot_row, "Erase",
-            recompui::ButtonStyle::Danger,
-            recompui::ButtonSize::Large
+            slot_row, "Erase", recompui::ButtonStyle::Danger, recompui::ButtonSize::Large
         );
         erase_buttons[i]->set_min_width(120.0f);
         erase_buttons[i]->set_overflow(recompui::Overflow::Visible);
-
         erase_buttons[i]->add_pressed_callback([i]() {
             recompui::open_choice_prompt(
                 "Erase Save " + std::to_string(i + 1),
                 "All progress in this slot will be permanently deleted.",
                 "Erase", "Cancel",
-                [i]() {
-                    erase_save_slot(i);
-                    host_slots_dirty = true;
-                },
+                [i]() { erase_save_slot(i); host_slots_dirty = true; },
                 []() {},
-                recompui::ButtonStyle::Danger,
-                recompui::ButtonStyle::Secondary,
-                true
+                recompui::ButtonStyle::Danger, recompui::ButtonStyle::Secondary, true
             );
         });
     }
@@ -1093,40 +1166,79 @@ static void ensure_host_panel() {
     back_btn->add_pressed_callback([]() { hide_panel(host_panel); });
 
     auto start_btn = context.create_element<recompui::Button>(
-        buttons_row, "Start", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
+        buttons_row, "Host", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
     start_btn->set_min_width(160.0f);
     start_btn->set_overflow(recompui::Overflow::Visible);
     start_btn->add_pressed_callback([]() { start_host_game(); });
+
+    // Default: CoopNet mode
+    host_set_mode(true);
 }
 
 // ===================== JOIN PANEL =====================
 
-// Async join state machine
+// Async join state machine (for Direct Connection)
 enum class JoinState : int { Idle = 0, Connecting = 1, Connected = 2, Failed = 3 };
 static std::atomic<int> join_state{0};
 static std::string join_target_ip;
 static std::chrono::steady_clock::time_point join_start_time;
 
-// Join panel UI elements (need per-frame access)
-static recompui::Element* join_form = nullptr;      // the form card content
-static recompui::Element* join_status_view = nullptr; // connecting/result screen
+// Join panel sub-views
+static recompui::Element* join_menu_view = nullptr;     // Main: Private Lobbies / Direct / Back
+static recompui::Element* join_direct_view = nullptr;    // Direct: IP + Port
+static recompui::Element* join_private_view = nullptr;   // Private: password input
+static recompui::Element* join_lobby_list_view = nullptr; // Lobby list results
+static recompui::Element* join_status_view = nullptr;    // Connecting status
 static recompui::Label* join_status_label = nullptr;
 static recompui::Label* join_timer_label = nullptr;
 static recompui::Button* join_cancel_btn = nullptr;
 static recompui::Button* join_retry_btn = nullptr;
 static recompui::TextInput* ip_input = nullptr;
 static recompui::TextInput* join_port_input = nullptr;
+static recompui::TextInput* join_password_input = nullptr;
+static recompui::Element* join_lobby_container = nullptr;
+static recompui::Label* join_lobby_status_label = nullptr; // "Searching..." / "No lobbies found"
 
 static void ensure_join_panel();
 
-static void join_show_form() {
-    if (join_form) join_form->display_show();
+static void join_show_menu() {
+    if (join_menu_view) join_menu_view->display_show();
+    if (join_direct_view) join_direct_view->display_hide();
+    if (join_private_view) join_private_view->display_hide();
+    if (join_lobby_list_view) join_lobby_list_view->display_hide();
+    if (join_status_view) join_status_view->display_hide();
+}
+
+static void join_show_direct() {
+    if (join_menu_view) join_menu_view->display_hide();
+    if (join_direct_view) join_direct_view->display_show();
+    if (join_private_view) join_private_view->display_hide();
+    if (join_lobby_list_view) join_lobby_list_view->display_hide();
+    if (join_status_view) join_status_view->display_hide();
+}
+
+static void join_show_private() {
+    if (join_menu_view) join_menu_view->display_hide();
+    if (join_direct_view) join_direct_view->display_hide();
+    if (join_private_view) join_private_view->display_show();
+    if (join_lobby_list_view) join_lobby_list_view->display_hide();
+    if (join_status_view) join_status_view->display_hide();
+}
+
+static void join_show_lobby_list() {
+    if (join_menu_view) join_menu_view->display_hide();
+    if (join_direct_view) join_direct_view->display_hide();
+    if (join_private_view) join_private_view->display_hide();
+    if (join_lobby_list_view) join_lobby_list_view->display_show();
     if (join_status_view) join_status_view->display_hide();
 }
 
 static void join_show_status() {
-    if (join_form) join_form->display_hide();
+    if (join_menu_view) join_menu_view->display_hide();
+    if (join_direct_view) join_direct_view->display_hide();
+    if (join_private_view) join_private_view->display_hide();
+    if (join_lobby_list_view) join_lobby_list_view->display_hide();
     if (join_status_view) join_status_view->display_show();
 }
 
@@ -1134,7 +1246,6 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
     join_target_ip = ip.empty() ? "127.0.0.1" : ip;
     save_last_join_ip(join_target_ip);
 
-    // Apply port
     int port = std::atoi(port_str.c_str());
     if (port > 0 && port < 65536) bknet::set_port(static_cast<uint16_t>(port));
 
@@ -1147,7 +1258,6 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
     if (join_retry_btn) join_retry_btn->display_hide();
     join_show_status();
 
-    // Spawn async connection thread
     std::thread([]() {
         bknet::set_mode(bknet::NetworkMode::Join);
         bknet::set_join_ip(join_target_ip);
@@ -1161,12 +1271,46 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
     }).detach();
 }
 
-// Called every frame from launcher update callback
+static void begin_private_search() {
+    std::string pass = join_password_input ? join_password_input->get_text() : "";
+
+    auto& net = bknet::NetworkManager::instance();
+    bknet::set_coopnet_server(COOPNET_SERVER);
+    bknet::set_coopnet_port(COOPNET_PORT);
+
+    if (!net.is_coopnet_signaling_connected()) {
+        // Connect first, then search
+        coopnet_pending_action.store(static_cast<int>(CoopNetPendingAction::Browse));
+        coopnet_state.store(static_cast<int>(CoopNetState::Connecting));
+        coopnet_start_time = std::chrono::steady_clock::now();
+        net.coopnet_begin(COOPNET_SERVER, COOPNET_PORT);
+        join_show_status();
+        if (join_status_label) join_status_label->set_text("Connecting to server...");
+        return;
+    }
+
+    // Already connected — search with password
+    net.set_lobby_list_callback([](const std::vector<bknet::LobbyInfo>& lobbies) {
+        cached_lobby_list = lobbies;
+        lobby_list_dirty.store(true);
+    });
+
+    // Show searching state
+    if (join_lobby_status_label) {
+        join_lobby_status_label->set_text("Searching...");
+        join_lobby_status_label->display_show();
+    }
+    join_show_lobby_list();
+
+    // Use password filter via CoopNet transport
+    bknet::get_config().lobby_password = pass;
+    net.coopnet_request_lobby_list();
+}
+
 static void update_join_state() {
     int state = join_state.load();
 
     if (state == static_cast<int>(JoinState::Connecting)) {
-        // Update elapsed timer
         auto elapsed = std::chrono::steady_clock::now() - join_start_time;
         int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         if (join_timer_label) {
@@ -1175,7 +1319,6 @@ static void update_join_state() {
     }
     else if (state == static_cast<int>(JoinState::Connected)) {
         join_state.store(static_cast<int>(JoinState::Idle));
-        // Start the game
         recompui::set_online_session(true);
         recompui::update_game_mod_id(supported_games[0].mod_game_id);
         recomp::start_game(supported_games[0].game_id, {});
@@ -1183,7 +1326,6 @@ static void update_join_state() {
     }
     else if (state == static_cast<int>(JoinState::Failed)) {
         join_state.store(static_cast<int>(JoinState::Idle));
-        // Show failure
         if (join_status_label) join_status_label->set_text("Connection failed");
         if (join_timer_label) join_timer_label->set_text("Host not found or not responding.");
         if (join_cancel_btn) join_cancel_btn->display_hide();
@@ -1198,61 +1340,192 @@ static void ensure_join_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     join_panel = backdrop;
 
-    // ========== FORM VIEW ==========
-    join_form = context.create_element<recompui::Element>(card);
-    join_form->set_display(recompui::Display::Flex);
-    join_form->set_flex_direction(recompui::FlexDirection::Column);
-    join_form->set_align_items(recompui::AlignItems::FlexStart);
-    join_form->set_gap(12.0f);
-    join_form->set_width(100.0f, recompui::Unit::Percent);
+    // ========== MENU VIEW (main join screen) ==========
+    join_menu_view = context.create_element<recompui::Element>(card);
+    join_menu_view->set_display(recompui::Display::Flex);
+    join_menu_view->set_flex_direction(recompui::FlexDirection::Column);
+    join_menu_view->set_align_items(recompui::AlignItems::Center);
+    join_menu_view->set_gap(16.0f);
+    join_menu_view->set_width(100.0f, recompui::Unit::Percent);
 
-    // Title (centered)
-    auto title_row = context.create_element<recompui::Element>(join_form);
+    auto title_row = context.create_element<recompui::Element>(join_menu_view);
     title_row->set_display(recompui::Display::Flex);
     title_row->set_justify_content(recompui::JustifyContent::Center);
     title_row->set_width(100.0f, recompui::Unit::Percent);
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Join Game", recompui::theme::Typography::Header2);
 
-    // IP section
-    auto ip_section = create_section(context, join_form, "Host IP Address");
+    auto private_btn = context.create_element<recompui::Button>(
+        join_menu_view, "Private Lobbies", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    private_btn->set_width(100.0f, recompui::Unit::Percent);
+    private_btn->set_overflow(recompui::Overflow::Visible);
+    private_btn->add_pressed_callback([]() { join_show_private(); });
+
+    auto direct_btn = context.create_element<recompui::Button>(
+        join_menu_view, "Direct Connection", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    direct_btn->set_width(100.0f, recompui::Unit::Percent);
+    direct_btn->set_overflow(recompui::Overflow::Visible);
+    direct_btn->add_pressed_callback([]() { join_show_direct(); });
+
+    auto menu_back = context.create_element<recompui::Button>(
+        join_menu_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    menu_back->set_width(100.0f, recompui::Unit::Percent);
+    menu_back->set_overflow(recompui::Overflow::Visible);
+    menu_back->add_pressed_callback([]() { hide_panel(join_panel); });
+
+    // ========== PRIVATE LOBBIES VIEW (password search) ==========
+    join_private_view = context.create_element<recompui::Element>(card);
+    join_private_view->set_display(recompui::Display::Flex);
+    join_private_view->set_flex_direction(recompui::FlexDirection::Column);
+    join_private_view->set_align_items(recompui::AlignItems::FlexStart);
+    join_private_view->set_gap(12.0f);
+    join_private_view->set_width(100.0f, recompui::Unit::Percent);
+    join_private_view->display_hide();
+
+    auto priv_title = context.create_element<recompui::Element>(join_private_view);
+    priv_title->set_display(recompui::Display::Flex);
+    priv_title->set_justify_content(recompui::JustifyContent::Center);
+    priv_title->set_width(100.0f, recompui::Unit::Percent);
+    priv_title->set_margin_bottom(8.0f);
+    context.create_element<recompui::Label>(priv_title, "Private Lobbies", recompui::theme::Typography::Header2);
+
+    context.create_element<recompui::Label>(join_private_view, "Enter the private lobby's password:", recompui::theme::Typography::Body);
+    join_password_input = context.create_element<recompui::TextInput>(join_private_view);
+    join_password_input->set_text("");
+    join_password_input->set_width(100.0f, recompui::Unit::Percent);
+
+    auto priv_btns = context.create_element<recompui::Element>(join_private_view);
+    priv_btns->set_display(recompui::Display::Flex);
+    priv_btns->set_flex_direction(recompui::FlexDirection::Row);
+    priv_btns->set_gap(20.0f);
+    priv_btns->set_justify_content(recompui::JustifyContent::Center);
+    priv_btns->set_width(100.0f, recompui::Unit::Percent);
+    priv_btns->set_margin_top(16.0f);
+    priv_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
+    auto priv_back = context.create_element<recompui::Button>(
+        priv_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    priv_back->set_min_width(160.0f);
+    priv_back->set_overflow(recompui::Overflow::Visible);
+    priv_back->add_pressed_callback([]() { join_show_menu(); });
+
+    auto search_btn = context.create_element<recompui::Button>(
+        priv_btns, "Search", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
+    );
+    search_btn->set_min_width(160.0f);
+    search_btn->set_overflow(recompui::Overflow::Visible);
+    search_btn->add_pressed_callback([]() { begin_private_search(); });
+
+    // ========== LOBBY LIST VIEW ==========
+    join_lobby_list_view = context.create_element<recompui::Element>(card);
+    join_lobby_list_view->set_display(recompui::Display::Flex);
+    join_lobby_list_view->set_flex_direction(recompui::FlexDirection::Column);
+    join_lobby_list_view->set_align_items(recompui::AlignItems::FlexStart);
+    join_lobby_list_view->set_gap(12.0f);
+    join_lobby_list_view->set_width(100.0f, recompui::Unit::Percent);
+    join_lobby_list_view->display_hide();
+
+    auto list_title = context.create_element<recompui::Element>(join_lobby_list_view);
+    list_title->set_display(recompui::Display::Flex);
+    list_title->set_justify_content(recompui::JustifyContent::Center);
+    list_title->set_width(100.0f, recompui::Unit::Percent);
+    list_title->set_margin_bottom(8.0f);
+    context.create_element<recompui::Label>(list_title, "Private Lobbies", recompui::theme::Typography::Header2);
+
+    join_lobby_status_label = context.create_element<recompui::Label>(
+        join_lobby_list_view, "Searching...", recompui::theme::Typography::Body
+    );
+
+    join_lobby_container = context.create_element<recompui::Element>(join_lobby_list_view);
+    join_lobby_container->set_display(recompui::Display::Flex);
+    join_lobby_container->set_flex_direction(recompui::FlexDirection::Column);
+    join_lobby_container->set_gap(8.0f);
+    join_lobby_container->set_width(100.0f, recompui::Unit::Percent);
+    join_lobby_container->set_min_height(100.0f);
+    join_lobby_container->set_max_height(400.0f);
+    join_lobby_container->set_overflow_y(recompui::Overflow::Scroll);
+
+    auto list_btns = context.create_element<recompui::Element>(join_lobby_list_view);
+    list_btns->set_display(recompui::Display::Flex);
+    list_btns->set_flex_direction(recompui::FlexDirection::Row);
+    list_btns->set_gap(20.0f);
+    list_btns->set_justify_content(recompui::JustifyContent::Center);
+    list_btns->set_width(100.0f, recompui::Unit::Percent);
+    list_btns->set_margin_top(16.0f);
+    list_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
+
+    auto list_back = context.create_element<recompui::Button>(
+        list_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    );
+    list_back->set_min_width(140.0f);
+    list_back->set_overflow(recompui::Overflow::Visible);
+    list_back->add_pressed_callback([]() { join_show_private(); });
+
+    auto refresh_btn = context.create_element<recompui::Button>(
+        list_btns, "Refresh", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
+    );
+    refresh_btn->set_min_width(140.0f);
+    refresh_btn->set_overflow(recompui::Overflow::Visible);
+    refresh_btn->add_pressed_callback([]() { begin_private_search(); });
+
+    // ========== DIRECT CONNECTION VIEW ==========
+    join_direct_view = context.create_element<recompui::Element>(card);
+    join_direct_view->set_display(recompui::Display::Flex);
+    join_direct_view->set_flex_direction(recompui::FlexDirection::Column);
+    join_direct_view->set_align_items(recompui::AlignItems::FlexStart);
+    join_direct_view->set_gap(12.0f);
+    join_direct_view->set_width(100.0f, recompui::Unit::Percent);
+    join_direct_view->display_hide();
+
+    auto dir_title = context.create_element<recompui::Element>(join_direct_view);
+    dir_title->set_display(recompui::Display::Flex);
+    dir_title->set_justify_content(recompui::JustifyContent::Center);
+    dir_title->set_width(100.0f, recompui::Unit::Percent);
+    dir_title->set_margin_bottom(8.0f);
+    context.create_element<recompui::Label>(dir_title, "Direct Connection", recompui::theme::Typography::Header2);
+
+    context.create_element<recompui::Label>(join_direct_view, "Enter direct connection IP and port:", recompui::theme::Typography::Body);
+
+    auto ip_section = create_section(context, join_direct_view, "Host IP Address");
     ip_input = context.create_element<recompui::TextInput>(ip_section);
     ip_input->set_text(load_last_join_ip());
     ip_input->set_width(100.0f, recompui::Unit::Percent);
 
-    // Port section
-    auto port_section = create_section(context, join_form, "Port");
+    auto port_section = create_section(context, join_direct_view, "Port");
     join_port_input = context.create_element<recompui::TextInput>(port_section);
     join_port_input->set_text("7777");
     join_port_input->set_width(100.0f, recompui::Unit::Percent);
 
-    // Action buttons
-    auto buttons_row = context.create_element<recompui::Element>(join_form);
-    buttons_row->set_display(recompui::Display::Flex);
-    buttons_row->set_flex_direction(recompui::FlexDirection::Row);
-    buttons_row->set_gap(20.0f);
-    buttons_row->set_justify_content(recompui::JustifyContent::Center);
-    buttons_row->set_width(100.0f, recompui::Unit::Percent);
-    buttons_row->set_margin_top(16.0f);
-    buttons_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
+    auto dir_btns = context.create_element<recompui::Element>(join_direct_view);
+    dir_btns->set_display(recompui::Display::Flex);
+    dir_btns->set_flex_direction(recompui::FlexDirection::Row);
+    dir_btns->set_gap(20.0f);
+    dir_btns->set_justify_content(recompui::JustifyContent::Center);
+    dir_btns->set_width(100.0f, recompui::Unit::Percent);
+    dir_btns->set_margin_top(16.0f);
+    dir_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
-    auto back_btn = context.create_element<recompui::Button>(
-        buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+    auto dir_back = context.create_element<recompui::Button>(
+        dir_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    back_btn->set_min_width(160.0f);
-    back_btn->set_overflow(recompui::Overflow::Visible);
-    back_btn->add_pressed_callback([]() { hide_panel(join_panel); });
+    dir_back->set_min_width(160.0f);
+    dir_back->set_overflow(recompui::Overflow::Visible);
+    dir_back->add_pressed_callback([]() { join_show_menu(); });
 
-    auto connect_btn = context.create_element<recompui::Button>(
-        buttons_row, "Connect", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
+    auto join_btn = context.create_element<recompui::Button>(
+        dir_btns, "Join", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
-    connect_btn->set_min_width(160.0f);
-    connect_btn->set_overflow(recompui::Overflow::Visible);
-    connect_btn->add_pressed_callback([]() {
+    join_btn->set_min_width(160.0f);
+    join_btn->set_overflow(recompui::Overflow::Visible);
+    join_btn->add_pressed_callback([]() {
         begin_join(ip_input->get_text(), join_port_input ? join_port_input->get_text() : "7777");
     });
 
-    // ========== STATUS VIEW (hidden by default) ==========
+    // ========== STATUS VIEW (shared for all connection types) ==========
     join_status_view = context.create_element<recompui::Element>(card);
     join_status_view->set_display(recompui::Display::Flex);
     join_status_view->set_flex_direction(recompui::FlexDirection::Column);
@@ -1266,34 +1539,222 @@ static void ensure_join_panel() {
     join_status_label = context.create_element<recompui::Label>(
         join_status_view, "Connecting...", recompui::theme::Typography::Header3
     );
-
     join_timer_label = context.create_element<recompui::Label>(
         join_status_view, "0s", recompui::theme::Typography::Body
     );
 
-    // Cancel button (shown during connecting)
     join_cancel_btn = context.create_element<recompui::Button>(
         join_status_view, "Cancel", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     join_cancel_btn->set_min_width(160.0f);
     join_cancel_btn->set_overflow(recompui::Overflow::Visible);
     join_cancel_btn->add_pressed_callback([]() {
-        // Set state to idle so thread result is ignored
         join_state.store(static_cast<int>(JoinState::Idle));
-        join_show_form();
+        coopnet_state.store(static_cast<int>(CoopNetState::Idle));
+        join_show_menu();
     });
 
-    // Retry/Back button (shown on failure)
     join_retry_btn = context.create_element<recompui::Button>(
         join_status_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     join_retry_btn->set_min_width(160.0f);
     join_retry_btn->set_overflow(recompui::Overflow::Visible);
     join_retry_btn->display_hide();
-    join_retry_btn->add_pressed_callback([]() {
-        join_show_form();
-    });
+    join_retry_btn->add_pressed_callback([]() { join_show_menu(); });
 }
+
+// ===================== COOPNET STATE MANAGEMENT =====================
+
+static void populate_lobby_list_ui();
+
+static void begin_coopnet_connect() {
+    bknet::set_coopnet_server(COOPNET_SERVER);
+    bknet::set_coopnet_port(COOPNET_PORT);
+
+    coopnet_state.store(static_cast<int>(CoopNetState::Connecting));
+    coopnet_start_time = std::chrono::steady_clock::now();
+
+    if (join_status_label) join_status_label->set_text("Connecting to server...");
+    if (join_timer_label) join_timer_label->set_text("");
+    if (join_cancel_btn) join_cancel_btn->display_show();
+    if (join_retry_btn) join_retry_btn->display_hide();
+    join_show_status();
+
+    auto& net = bknet::NetworkManager::instance();
+    bool ok = net.coopnet_begin(COOPNET_SERVER, COOPNET_PORT);
+    if (!ok) {
+        coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+    }
+}
+
+static void begin_coopnet_host() {
+    auto& net = bknet::NetworkManager::instance();
+    if (!net.is_coopnet_signaling_connected()) {
+        coopnet_pending_action.store(static_cast<int>(CoopNetPendingAction::Host));
+        begin_coopnet_connect();
+        return;
+    }
+
+    std::string pass = host_password_input ? host_password_input->get_text() : "";
+
+    bknet::get_config().save_slot = selected_save_slot;
+    bknet::set_mode(bknet::NetworkMode::CoopNetHost);
+
+    coopnet_state.store(static_cast<int>(CoopNetState::CreatingLobby));
+
+    bool ok = net.coopnet_host_lobby(pass, "");
+    if (ok) {
+        coopnet_state.store(static_cast<int>(CoopNetState::Connected));
+    } else {
+        coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+    }
+}
+
+static void begin_coopnet_join(uint64_t lobby_id) {
+    auto& net = bknet::NetworkManager::instance();
+    if (!net.is_coopnet_signaling_connected()) {
+        coopnet_pending_action.store(static_cast<int>(CoopNetPendingAction::Join));
+        coopnet_pending_lobby_id = lobby_id;
+        begin_coopnet_connect();
+        return;
+    }
+
+    std::string pass = join_password_input ? join_password_input->get_text() : "";
+    bknet::set_mode(bknet::NetworkMode::CoopNetJoin);
+
+    coopnet_state.store(static_cast<int>(CoopNetState::JoiningLobby));
+    coopnet_start_time = std::chrono::steady_clock::now(); // Reset timer for join timeout
+    if (join_status_label) join_status_label->set_text("Joining lobby...");
+    join_show_status();
+
+    bool ok = net.coopnet_join_lobby(lobby_id, pass);
+    if (!ok) {
+        coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+    }
+    // If ok, state transitions to Connected when NetworkManager detects PlayerAssignment
+}
+
+static void update_coopnet_state() {
+    int state = coopnet_state.load();
+    auto& net = bknet::NetworkManager::instance();
+
+    if (state == static_cast<int>(CoopNetState::Connecting)) {
+        if (net.is_coopnet_signaling_connected()) {
+            // Connected to signaling server — execute pending action
+            int pending = coopnet_pending_action.exchange(static_cast<int>(CoopNetPendingAction::None));
+            if (pending == static_cast<int>(CoopNetPendingAction::Host)) {
+                begin_coopnet_host();
+            } else if (pending == static_cast<int>(CoopNetPendingAction::Browse)) {
+                coopnet_state.store(static_cast<int>(CoopNetState::Idle));
+                // Now connected — run the search that was deferred
+                begin_private_search();
+            } else if (pending == static_cast<int>(CoopNetPendingAction::Join)) {
+                begin_coopnet_join(coopnet_pending_lobby_id);
+            } else {
+                coopnet_state.store(static_cast<int>(CoopNetState::Idle));
+                join_show_menu();
+            }
+            return;
+        }
+
+        // Check timeout (10 seconds)
+        auto elapsed = std::chrono::steady_clock::now() - coopnet_start_time;
+        int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        if (join_status_label) {
+            join_status_label->set_text("Connecting... " + std::to_string(secs) + "s");
+        }
+        if (secs > 10) {
+            coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+            net.disconnect();
+        }
+    }
+    else if (state == static_cast<int>(CoopNetState::JoiningLobby)) {
+        // Check if NetworkManager transitioned to Connected (got PlayerAssignment)
+        if (net.get_state() == bknet::ConnectionState::Connected) {
+            coopnet_state.store(static_cast<int>(CoopNetState::Connected));
+        }
+        // Timeout after 15 seconds
+        auto elapsed = std::chrono::steady_clock::now() - coopnet_start_time;
+        int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        if (secs > 15) {
+            coopnet_state.store(static_cast<int>(CoopNetState::Failed));
+            net.disconnect();
+        }
+    }
+    else if (state == static_cast<int>(CoopNetState::Connected)) {
+        coopnet_state.store(static_cast<int>(CoopNetState::Idle));
+        recompui::set_online_session(true);
+        recompui::update_game_mod_id(supported_games[0].mod_game_id);
+        recomp::start_game(supported_games[0].game_id, {});
+        recompui::hide_all_contexts();
+    }
+    else if (state == static_cast<int>(CoopNetState::Failed)) {
+        coopnet_state.store(static_cast<int>(CoopNetState::Idle));
+        if (join_status_label) join_status_label->set_text("Connection failed.");
+        if (join_cancel_btn) join_cancel_btn->display_hide();
+        if (join_retry_btn) join_retry_btn->display_show();
+        join_show_status();
+    }
+
+    // Deferred lobby list UI update (must happen in launcher context)
+    if (lobby_list_dirty.exchange(false)) {
+        populate_lobby_list_ui();
+    }
+
+}
+
+static void populate_lobby_list_ui() {
+    if (!join_lobby_container) return;
+
+    // Update the status label based on results
+    if (join_lobby_status_label) {
+        if (cached_lobby_list.empty()) {
+            join_lobby_status_label->set_text("No lobbies found.");
+            join_lobby_status_label->display_show();
+        } else {
+            join_lobby_status_label->display_hide();
+        }
+    }
+
+    // Create lobby entries (appended to container)
+    auto context = recompui::get_launcher_context_id();
+    for (const auto& lobby : cached_lobby_list) {
+        auto row = context.create_element<recompui::Element>(join_lobby_container);
+        row->set_display(recompui::Display::Flex);
+        row->set_flex_direction(recompui::FlexDirection::Row);
+        row->set_align_items(recompui::AlignItems::Center);
+        row->set_gap(12.0f);
+        row->set_width(100.0f, recompui::Unit::Percent);
+        row->set_padding_top(8.0f);
+        row->set_padding_bottom(8.0f);
+        row->set_background_color(recompui::Color{30, 34, 50, 200});
+        row->set_border_radius(8.0f);
+        row->set_padding_left(16.0f);
+        row->set_padding_right(16.0f);
+
+        std::string label = lobby.host_name;
+        if (label.empty()) label = "Lobby";
+        label += "  (" + std::to_string(lobby.player_count) + "/" + std::to_string(lobby.max_players) + ")";
+
+        auto info_label = context.create_element<recompui::Label>(row, label, recompui::theme::Typography::Body);
+        info_label->set_flex_grow(1.0f);
+
+        uint64_t lid = lobby.lobby_id;
+        auto join_btn = context.create_element<recompui::Button>(
+            row, "Join", recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
+        );
+        join_btn->set_min_width(80.0f);
+        join_btn->set_overflow(recompui::Overflow::Visible);
+        join_btn->add_pressed_callback([lid]() {
+            begin_coopnet_join(lid);
+        });
+    }
+
+    // Make sure lobby list view is visible
+    join_show_lobby_list();
+}
+
+// (Online panel removed — merged into Host and Join panels)
 
 void on_launcher_init(recompui::LauncherMenu *menu) {
     auto game_options_menu = menu->init_game_options_menu(
@@ -1518,6 +1979,7 @@ int main(int argc, char** argv) {
     recompui::register_launcher_update_callback([](recompui::LauncherMenu* menu) {
         refresh_host_slots();
         update_join_state();
+        update_coopnet_state();
         banjo::launcher_animation_update(menu);
     });
 

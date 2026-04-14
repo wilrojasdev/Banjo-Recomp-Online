@@ -65,6 +65,37 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(enet)
 
+# CoopNet library for NAT traversal / lobby-based online multiplayer
+set(COOPNET_DIR ${CMAKE_SOURCE_DIR}/lib/coopnet)
+file(GLOB COOPNET_SOURCES ${COOPNET_DIR}/common/*.cpp)
+add_library(coopnet STATIC ${COOPNET_SOURCES})
+target_include_directories(coopnet PUBLIC ${COOPNET_DIR}/common ${COOPNET_DIR}/lib/include)
+target_compile_definitions(coopnet PRIVATE JUICE_STATIC LOGGING $<$<PLATFORM_ID:Darwin>:OSX_BUILD=1>)
+target_compile_features(coopnet PRIVATE cxx_std_11)
+if (APPLE)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_arm)
+    else()
+        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_intel)
+    endif()
+elseif (WIN32)
+    if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/win64)
+    else()
+        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/win32)
+    endif()
+else()
+    set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/linux)
+endif()
+target_link_directories(coopnet PUBLIC ${COOPNET_LIB_DIR})
+if (APPLE)
+    target_link_libraries(coopnet PUBLIC "${COOPNET_LIB_DIR}/libjuice.1.6.2.dylib")
+elseif (WIN32)
+    target_link_libraries(coopnet PUBLIC juice ws2_32 iphlpapi bcrypt)
+else()
+    target_link_libraries(coopnet PUBLIC juice pthread)
+endif()
+
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 
 # RecompiledFuncs - Library containing the primary recompiler output
@@ -175,11 +206,13 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/net/net_recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_chat.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_chat_ui.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_coopnet.cpp
 )
 
 target_include_directories(BanjoRecompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${enet_SOURCE_DIR}/include
+    ${COOPNET_DIR}/common
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty/sse2neon
     ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib
@@ -226,6 +259,12 @@ elseif (APPLE)
     # to make our executable memory writable (required for mod function patching)
     target_link_options(BanjoRecompiled PRIVATE
         "-fuse-ld=${CMAKE_SOURCE_DIR}/.github/macos/ld64"
+    )
+    # Copy libjuice dylib to output folder for CoopNet
+    add_custom_command(TARGET BanjoRecompiled POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${COOPNET_LIB_DIR}/libjuice.1.6.2.dylib"
+            $<TARGET_FILE_DIR:BanjoRecompiled>/libjuice.1.6.2.dylib
     )
 endif()
 
@@ -366,6 +405,7 @@ target_link_libraries(BanjoRecompiled PRIVATE
     rt64
     nfd
     enet
+    coopnet
 )
 
 # Embed all .nrm files in the "mods" directory

@@ -13,6 +13,7 @@
 #include "net_packets.h"
 #include "net_server.h"
 #include "net_client.h"
+#include "net_coopnet.h"
 #include "net_state_sync.h"
 #include "net_interpolation.h"
 #include "net_config.h"
@@ -36,6 +37,18 @@ public:
     bool host_game();
     bool join_game();
     void disconnect();
+
+    // CoopNet lobby operations
+    bool coopnet_begin(const std::string& server, uint16_t port);
+    bool coopnet_host_lobby(const std::string& password = "", const std::string& description = "");
+    bool coopnet_join_lobby(uint64_t lobby_id, const std::string& password = "");
+    void coopnet_leave_lobby();
+    void coopnet_request_lobby_list();
+    void set_lobby_list_callback(CoopNetTransport::LobbyListCallback cb);
+    void set_lobby_created_callback(CoopNetTransport::LobbyCreatedCallback cb);
+    void set_coopnet_error_callback(CoopNetTransport::ErrorCallback cb);
+    bool is_coopnet_mode() const { return coopnet_ != nullptr; }
+    bool is_coopnet_signaling_connected() const { return coopnet_ && coopnet_->is_connected(); }
 
     // Called every frame from update_gfx
     void update();
@@ -120,7 +133,7 @@ public:
 
     // Accessors
     bool is_connected() const { return state_ == ConnectionState::Hosting || state_ == ConnectionState::Connected; }
-    bool is_host() const { return state_ == ConnectionState::Hosting; }
+    bool is_host() const { return state_ == ConnectionState::Hosting || (coopnet_ && coopnet_->is_lobby_host()); }
     ConnectionState get_state() const { return state_; }
     uint8_t local_player_id() const { return local_player_id_; }
     uint8_t player_count() const;
@@ -133,6 +146,10 @@ private:
 
     void send_local_state();
     void handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size);
+
+    // Unified send helpers (dispatch to ENet or CoopNet)
+    void net_broadcast(const void* data, size_t size, uint8_t channel, bool reliable);
+    void net_send_to(uint8_t player_id, const void* data, size_t size, uint8_t channel, bool reliable);
     void handle_position_packet(const PlayerPositionPacket& pkt);
     void handle_state_packet(const PlayerStatePacket& pkt);
     void handle_map_change_packet(const MapChangePacket& pkt);
@@ -149,6 +166,12 @@ private:
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
+    std::unique_ptr<CoopNetTransport> coopnet_;
+
+    // CoopNet callbacks stored for UI
+    CoopNetTransport::LobbyListCallback lobby_list_callback_;
+    CoopNetTransport::LobbyCreatedCallback lobby_created_callback_;
+    CoopNetTransport::ErrorCallback coopnet_error_callback_;
 
     StateSync state_sync_;
     InterpolationManager interpolation_;

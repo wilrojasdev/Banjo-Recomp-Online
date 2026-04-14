@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 
 namespace bknet {
@@ -117,7 +118,161 @@ bool NetworkManager::join_game() {
     return true;
 }
 
+// === CoopNet lobby operations ===
+
+bool NetworkManager::coopnet_begin(const std::string& server, uint16_t port) {
+    if (coopnet_ && coopnet_->is_connected()) return true;
+
+    disconnect();
+
+    const auto& config = get_config();
+    coopnet_ = std::make_unique<CoopNetTransport>();
+
+    coopnet_->set_packet_callback([this](uint8_t player_id, const uint8_t* data, size_t size) {
+        handle_packet(player_id, data, size);
+    });
+
+    // Don't set signaling_disconnect_callback here — only set it after we're in a lobby
+    // to avoid race conditions during initial connection
+
+    if (lobby_list_callback_) coopnet_->set_lobby_list_callback(lobby_list_callback_);
+    if (lobby_created_callback_) coopnet_->set_lobby_created_callback(lobby_created_callback_);
+    if (coopnet_error_callback_) coopnet_->set_error_callback(coopnet_error_callback_);
+
+    if (!coopnet_->begin(server, port, config.player_name)) {
+        coopnet_.reset();
+        return false;
+    }
+
+    // Non-blocking: coopnet_->update() is called from NetworkManager::update() on SDL thread
+    // Connection status is checked via is_coopnet_signaling_connected()
+    std::printf("[CoopNet] Connection initiated to %s:%u (async)\n", server.c_str(), port);
+    return true;
+}
+
+bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::string& description) {
+    if (!coopnet_ || !coopnet_->is_connected()) return false;
+
+    coopnet_->set_connect_callback([this](uint8_t player_id) {
+        std::printf("[CoopNet] Player %u joined the game\n", player_id);
+        request_full_sync(player_id);
+    });
+
+    coopnet_->set_disconnect_callback([this](uint8_t player_id) {
+        std::printf("[CoopNet] Player %u left the game\n", player_id);
+        interpolation_.remove_player(player_id);
+        uint32_t level;
+        {
+            std::lock_guard<std::mutex> lock(ownership_mutex_);
+            level = player_levels_[player_id];
+            player_levels_[player_id] = 0xFFFFFFFF;
+        }
+        if (level != 0xFFFFFFFF) {
+            release_world_owner(level, player_id);
+        }
+    });
+
+    coopnet_->set_signaling_disconnect_callback([this]() {
+        state_ = ConnectionState::Disconnected;
+        interpolation_.reset();
+        unexpected_disconnect_.store(true);
+        std::printf("[CoopNet] Lost connection\n");
+    });
+
+    if (!coopnet_->create_lobby(password, description, MAX_PLAYERS)) {
+        return false;
+    }
+
+    local_player_id_ = 0;
+    state_ = ConnectionState::Hosting;
+    interpolation_.reset();
+
+    std::printf("[CoopNet] Hosting lobby\n");
+    return true;
+}
+
+bool NetworkManager::coopnet_join_lobby(uint64_t lobby_id, const std::string& password) {
+    if (!coopnet_ || !coopnet_->is_connected()) return false;
+
+    coopnet_->set_disconnect_callback([this](uint8_t player_id) {
+        if (player_id == 0) {
+            state_ = ConnectionState::Disconnected;
+            interpolation_.reset();
+            unexpected_disconnect_.store(true);
+        } else {
+            interpolation_.remove_player(player_id);
+            std::printf("[CoopNet] Player %u left\n", player_id);
+        }
+    });
+
+    coopnet_->set_signaling_disconnect_callback([this]() {
+        state_ = ConnectionState::Disconnected;
+        interpolation_.reset();
+        unexpected_disconnect_.store(true);
+        std::printf("[CoopNet] Lost connection\n");
+    });
+
+    if (!coopnet_->join_lobby(lobby_id, password)) {
+        return false;
+    }
+
+    state_ = ConnectionState::Connecting;
+    std::printf("[CoopNet] Joining lobby %llu (async)\n", (unsigned long long)lobby_id);
+    return true;
+}
+
+void NetworkManager::coopnet_leave_lobby() {
+    if (coopnet_) {
+        coopnet_->leave_lobby();
+    }
+}
+
+void NetworkManager::coopnet_request_lobby_list() {
+    if (coopnet_) {
+        coopnet_->request_lobby_list(get_config().lobby_password);
+    }
+}
+
+void NetworkManager::set_lobby_list_callback(CoopNetTransport::LobbyListCallback cb) {
+    lobby_list_callback_ = cb;
+    if (coopnet_) coopnet_->set_lobby_list_callback(cb);
+}
+
+void NetworkManager::set_lobby_created_callback(CoopNetTransport::LobbyCreatedCallback cb) {
+    lobby_created_callback_ = cb;
+    if (coopnet_) coopnet_->set_lobby_created_callback(cb);
+}
+
+void NetworkManager::set_coopnet_error_callback(CoopNetTransport::ErrorCallback cb) {
+    coopnet_error_callback_ = cb;
+    if (coopnet_) coopnet_->set_error_callback(cb);
+}
+
+// === Unified send helpers ===
+
+void NetworkManager::net_broadcast(const void* data, size_t size, uint8_t channel, bool reliable) {
+    if (coopnet_) {
+        coopnet_->broadcast(data, size);
+    } else if (server_) {
+        server_->broadcast(data, size, channel, reliable);
+    } else if (client_) {
+        client_->send(data, size, channel, reliable);
+    }
+}
+
+void NetworkManager::net_send_to(uint8_t player_id, const void* data, size_t size, uint8_t channel, bool reliable) {
+    if (coopnet_) {
+        coopnet_->send_to(player_id, data, size);
+    } else if (server_) {
+        server_->send_to(player_id, data, size, channel, reliable);
+    }
+}
+
 void NetworkManager::disconnect() {
+    if (coopnet_) {
+        coopnet_->shutdown();
+        coopnet_.reset();
+    }
     if (server_) {
         server_->stop();
         server_.reset();
@@ -151,11 +306,25 @@ void NetworkManager::disconnect() {
 }
 
 void NetworkManager::update() {
-    if (!is_connected()) return;
+    // CoopNet needs update() even before is_connected() (for signaling handshake)
+    if (coopnet_) {
+        coopnet_->update();
+        // Check if joiner got PlayerAssignment (async join completion)
+        if (state_ == ConnectionState::Connecting && coopnet_->local_player_id() != 0) {
+            local_player_id_ = coopnet_->local_player_id();
+            state_ = ConnectionState::Connected;
+            interpolation_.reset();
+            std::printf("[CoopNet] Joined game as player %u\n", local_player_id_);
+        }
+    }
 
-    // Pump ENet events
-    if (server_) server_->update();
-    if (client_) client_->update();
+    if (!is_connected() && !coopnet_) return;
+
+    // Pump network events
+    if (!coopnet_) {
+        if (server_) server_->update();
+        if (client_) client_->update();
+    }
 
     // Flush ALL queued packets from game thread (ENet only safe from SDL thread)
     {
@@ -185,11 +354,7 @@ void NetworkManager::update() {
                 pkt.health = 0;
 
                 // Send to remote players via network
-                if (server_) {
-                    server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-                } else if (client_) {
-                    client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-                }
+                net_broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 
                 // Also queue locally so the HOST's own game thread processes it
                 {
@@ -232,11 +397,7 @@ void NetworkManager::update() {
                 pkt.pos_z = 0.0f;
 
                 // Send to remote players
-                if (server_) {
-                    server_->broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-                } else if (client_) {
-                    client_->send(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-                }
+                net_broadcast(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 
                 // Also queue locally (HOST needs it too)
                 {
@@ -255,11 +416,7 @@ void NetworkManager::update() {
         // Flush regular queued packets
         while (!packet_send_queue_.empty()) {
             auto& qp = packet_send_queue_.front();
-            if (server_) {
-                server_->broadcast(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
-            } else if (client_) {
-                client_->send(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
-            }
+            net_broadcast(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
             packet_send_queue_.pop_front();
         }
     }
@@ -296,6 +453,7 @@ InterpolatedState NetworkManager::get_remote_player(uint8_t player_id) const {
 }
 
 uint8_t NetworkManager::player_count() const {
+    if (coopnet_) return coopnet_->peer_count();
     if (server_) return server_->client_count() + 1;
     if (client_ && client_->is_connected()) return 2;
     return 1;
@@ -308,11 +466,7 @@ void NetworkManager::send_local_state() {
         return;
     }
 
-    if (server_) {
-        server_->broadcast(&pkt, sizeof(pkt), CHANNEL_UNRELIABLE, false);
-    } else if (client_) {
-        client_->send(&pkt, sizeof(pkt), CHANNEL_UNRELIABLE, false);
-    }
+    net_broadcast(&pkt, sizeof(pkt), CHANNEL_UNRELIABLE, false);
 }
 
 void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size) {
@@ -721,7 +875,7 @@ bool NetworkManager::should_send_full_sync(uint8_t& out_player_id) {
 }
 
 void NetworkManager::send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player) {
-    if (!is_connected() || !server_) return;
+    if (!is_connected() || (!server_ && !coopnet_)) return;
 
     // Enqueue for SDL thread (game thread cannot call ENet directly)
     enqueue_packet(data, size, CHANNEL_RELIABLE, true);
