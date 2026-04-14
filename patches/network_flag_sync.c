@@ -35,9 +35,83 @@ extern void bitfield_set_n_bits(u8 *array, s32 startIndex, s32 set, s32 length);
 #define NET_FLAG_FILE_PROGRESS  2
 #define NET_FLAG_VOLATILE       3
 #define NET_FLAG_JIGSAW_ACTION  4
+#define NET_FLAG_ABILITY        5
+#define NET_FLAG_BOTTLES_ACTION 6
+
+// Bottles lock actions
+#define BOTTLES_ACTION_LOCK   0
+#define BOTTLES_ACTION_UNLOCK 1
 
 // Jigsaw sync (from network_jigsaw_sync.c)
 extern void bkrecomp_net_process_jigsaw_event(u32 flag_index, u32 value, u32 map_id);
+
+// Bottles visual sync (from network_bottles_sync.c)
+extern void bkrecomp_net_bottles_remote_emerge(void);
+extern void bkrecomp_net_bottles_remote_hide(void);
+
+// Ability system
+extern s32 ability_hasLearned(s32 ability);
+extern void ability_getSizeAndPtr(s32 *size, u8 **addr);
+extern s32 learnedAbilities;
+extern s32 usedAbilities;
+
+// Lair storage — saves abilities across level transitions.
+// D_8037DCB8->unlockedMoves (offset 0x1C) must be updated when abilities change,
+// otherwise the lair restore at level entry overwrites network-synced abilities.
+extern struct FF_StorageStruct *D_8037DCB8;
+struct FF_StorageStruct { u8 _pad[0x1C]; u32 unlockedMoves; };
+
+static void sync_lair_ability_state(void) {
+    if (D_8037DCB8) {
+        D_8037DCB8->unlockedMoves = (u32)learnedAbilities;
+    }
+}
+
+// Network bridge for local player ID
+extern u32 recomp_net_get_local_player_id(void);
+
+// Bottles NPC lock (one player at a time, like jigsaw pedestal)
+static struct {
+    bool locked;
+    u8   owner_player_id;
+} bottles_lock_state = { FALSE, 0 };
+
+static void net_bottles_lock(u8 player_id) {
+    bottles_lock_state.locked = TRUE;
+    bottles_lock_state.owner_player_id = player_id;
+}
+
+static void net_bottles_unlock(void) {
+    bottles_lock_state.locked = FALSE;
+    bottles_lock_state.owner_player_id = 0;
+}
+
+// Exported for use from network_bottles_sync or other patches
+RECOMP_EXPORT bool bkrecomp_net_bottles_is_locked(void) {
+    return bottles_lock_state.locked;
+}
+
+RECOMP_EXPORT bool bkrecomp_net_bottles_is_local_owner(void) {
+    if (!bottles_lock_state.locked) return FALSE;
+    return bottles_lock_state.owner_player_id == (u8)recomp_net_get_local_player_id();
+}
+
+RECOMP_EXPORT u8 bkrecomp_net_bottles_get_lock_owner(void) {
+    return bottles_lock_state.owner_player_id;
+}
+
+RECOMP_EXPORT void bkrecomp_net_bottles_send_lock(void) {
+    if (!recomp_net_is_connected()) return;
+    u32 my_id = recomp_net_get_local_player_id();
+    net_bottles_lock((u8)my_id);
+    recomp_net_send_flag_change(NET_FLAG_BOTTLES_ACTION, BOTTLES_ACTION_LOCK, my_id, (u32)map_get());
+}
+
+RECOMP_EXPORT void bkrecomp_net_bottles_send_unlock(void) {
+    if (!recomp_net_is_connected()) return;
+    net_bottles_unlock();
+    recomp_net_send_flag_change(NET_FLAG_BOTTLES_ACTION, BOTTLES_ACTION_UNLOCK, 0, (u32)map_get());
+}
 
 // Guard: prevents echo loop when applying remote flag changes
 static bool net_applying_remote_flag = FALSE;
@@ -45,6 +119,25 @@ static bool net_applying_remote_flag = FALSE;
 // Allow other modules (jigsaw sync) to set/clear the remote flag guard
 RECOMP_EXPORT void bkrecomp_net_set_remote_flag_guard(bool val) {
     net_applying_remote_flag = val;
+}
+
+// === RECOMP_PATCH: Intercept ability learn ===
+
+RECOMP_PATCH void ability_setLearned(s32 ability, bool hasLearned) {
+    s32 old = ability_hasLearned(ability) ? 1 : 0;
+
+    // Apply locally
+    if (hasLearned) {
+        learnedAbilities |= (1 << ability);
+    } else {
+        learnedAbilities &= ~(1 << ability);
+    }
+
+    s32 new_val = hasLearned ? 1 : 0;
+    if (!net_applying_remote_flag && recomp_net_is_connected() && old != new_val) {
+        recomp_net_send_flag_change(NET_FLAG_ABILITY, (u32)ability, (u32)new_val, (u32)map_get());
+        recomp_printf("[ABILITY-SYNC] sent ability %d = %d\n", ability, new_val);
+    }
 }
 
 // === RECOMP_PATCH: Intercept flag set functions ===
@@ -197,6 +290,22 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
         net_applying_remote_flag = FALSE;
         bkrecomp_net_process_jigsaw_event((u32)idx, (u32)evt->flag_value, evt->flag_map_id);
         return;
+    } else if (ft == NET_FLAG_ABILITY) {
+        ability_setLearned((s32)idx, val);
+        sync_lair_ability_state();
+        recomp_printf("[ABILITY-SYNC] applied ability[%d] = %d\n", idx, val);
+    } else if (ft == NET_FLAG_BOTTLES_ACTION) {
+        if (idx == BOTTLES_ACTION_LOCK) {
+            net_bottles_lock((u8)val);
+            // Show emerge animation on remote side
+            bkrecomp_net_bottles_remote_emerge();
+            recomp_printf("[BOTTLES-SYNC] locked by player %d\n", val);
+        } else if (idx == BOTTLES_ACTION_UNLOCK) {
+            net_bottles_unlock();
+            // Show exit animation on remote side
+            bkrecomp_net_bottles_remote_hide();
+            recomp_printf("[BOTTLES-SYNC] unlocked\n");
+        }
     }
 
     net_applying_remote_flag = FALSE;
@@ -207,7 +316,8 @@ RECOMP_EXPORT void bkrecomp_net_apply_flag_bulk(
     u8 *file_progress, s32 fp_size,
     u8 *level_specific, s32 ls_size,
     u8 *volatile_flags, s32 vf_size,
-    u32 map_flags)
+    u32 map_flags,
+    u8 *abilities, s32 ab_size)
 {
     net_applying_remote_flag = TRUE;
 
@@ -245,7 +355,22 @@ RECOMP_EXPORT void bkrecomp_net_apply_flag_bulk(
     D_80367000 = map_flags;
     _mapSpecificFlags_updateCRCs();
 
+    // Abilities (8 bytes: learnedAbilities + usedAbilities)
+    // OR remote abilities into local — never lose locally learned abilities
+    // (e.g., SM abilities from empty slot boot should persist)
+    if (abilities && ab_size >= 8) {
+        s32 ab_sz;
+        u8 *ab_ptr;
+        ability_getSizeAndPtr(&ab_sz, &ab_ptr);
+        // OR byte-by-byte (both sides are MIPS big-endian, same layout)
+        s32 i;
+        for (i = 0; i < 8 && i < ab_size; i++) {
+            ab_ptr[i] |= abilities[i];
+        }
+        sync_lair_ability_state();
+    }
+
     net_applying_remote_flag = FALSE;
-    recomp_printf("[FLAG-SYNC] applied bulk flags (fp=%d ls=%d vf=%d map=0x%X)\n",
-        fp_size, ls_size, vf_size, map_flags);
+    recomp_printf("[FLAG-SYNC] applied bulk flags (fp=%d ls=%d vf=%d map=0x%X ab=%d)\n",
+        fp_size, ls_size, vf_size, map_flags, ab_size);
 }

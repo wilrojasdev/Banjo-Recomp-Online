@@ -95,7 +95,9 @@ extern void bkrecomp_net_apply_flag_bulk(
     u8 *file_progress, s32 fp_size,
     u8 *level_specific, s32 ls_size,
     u8 *volatile_flags, s32 vf_size,
-    u32 map_flags);
+    u32 map_flags,
+    u8 *abilities, s32 ab_size);
+extern void ability_getSizeAndPtr(s32 *size, u8 **addr);
 
 static bool processing_remote = FALSE;
 
@@ -1117,7 +1119,8 @@ typedef struct {
     u32 map_specific_flags;      // 0x74 (4-byte aligned)
     u8  has_flags;               // 0x78 (1 if flag data present)
     u8  _pad4[3];                // 0x79
-} WorldStateFullData;            // 0x7C = 124 bytes
+    u8  abilities[8];            // 0x7C (learnedAbilities + usedAbilities)
+} WorldStateFullData;            // 0x84 = 132 bytes
 
 // Host: snapshot and send current state when a new player joins
 static void check_full_sync_send(void) {
@@ -1159,6 +1162,15 @@ static void check_full_sync_send(void) {
         for (i = 0; i < 25; i++) data.volatile_flags[i] = gVolatileFlags.unk8[i];
         data.map_specific_flags = D_80367000;
         data.has_flags = 1;
+    }
+
+    // Abilities (learned + used, 8 bytes)
+    {
+        s32 ab_sz;
+        u8 *ab_ptr;
+        ability_getSizeAndPtr(&ab_sz, &ab_ptr);
+        s32 i;
+        for (i = 0; i < 8; i++) data.abilities[i] = ab_ptr[i];
     }
 
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
@@ -1261,14 +1273,15 @@ static void check_full_sync_receive(void) {
         prev_lives = item_getCount(ITEM_16_LIFE);
     }
 
-    // Apply flag state from host
+    // Apply flag state + abilities from host
     if (data.has_flags) {
         bkrecomp_net_apply_flag_bulk(
             data.file_progress_flags, 37,
             data.level_specific_flags, 8,
             data.volatile_flags, 25,
-            data.map_specific_flags);
-        recomp_printf("[STATE-SYNC] applied flag state from host\n");
+            data.map_specific_flags,
+            data.abilities, 8);
+        recomp_printf("[STATE-SYNC] applied flag state + abilities from host\n");
     }
 
     // Re-snapshot ALL polling state AFTER full sync.

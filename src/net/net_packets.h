@@ -193,6 +193,8 @@ enum WorldFlagType : uint8_t {
     FLAG_FILE_PROGRESS  = 2,      // Global file/save progress (jiggy doors, note doors, witch switches)
     FLAG_VOLATILE       = 3,      // Runtime volatile flags (witch switch pressed, sandcastle doors)
     FLAG_JIGSAW_ACTION  = 4,      // Jigsaw puzzle pedestal sync (lock/unlock/add/remove/complete)
+    FLAG_ABILITY        = 5,      // Ability learned/unlearned sync
+    FLAG_BOTTLES_ACTION = 6,      // Bottles NPC lock/unlock (one player at a time)
 };
 
 struct WorldFlagPacket {
@@ -260,6 +262,7 @@ struct WorldStateFullPacket {
     uint32_t map_specific_flags;     // mapSpecificFlags (single u32)
     uint8_t has_flags;               // 1 if flag data is present (backwards compat)
     uint8_t _pad4[3];
+    uint8_t abilities[8];            // learnedAbilities (4 bytes) + usedAbilities (4 bytes)
 };
 
 // --- Chat ---

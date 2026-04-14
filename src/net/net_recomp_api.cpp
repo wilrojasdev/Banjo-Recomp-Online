@@ -324,6 +324,8 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
     for (int i = 0; i < 25; i++) pkt.volatile_flags[i] = MEM_BU(0x5B + i, data_ptr);
     pkt.map_specific_flags = MEM_W(0x74, data_ptr);
     pkt.has_flags = MEM_BU(0x78, data_ptr);
+    // Abilities at 0x7C (8 bytes)
+    for (int i = 0; i < 8; i++) pkt.abilities[i] = MEM_BU(0x7C + i, data_ptr);
 
     bknet::NetworkManager::instance().send_world_state_full(
         reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt), static_cast<uint8_t>(target));
@@ -348,6 +350,8 @@ extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
         for (int i = 0; i < 25; i++) MEM_BU(0x5B + i, out_ptr) = pkt.volatile_flags[i];
         MEM_W(0x74, out_ptr) = pkt.map_specific_flags;
         MEM_BU(0x78, out_ptr) = pkt.has_flags;
+        // Abilities at 0x7C (8 bytes)
+        for (int i = 0; i < 8; i++) MEM_BU(0x7C + i, out_ptr) = pkt.abilities[i];
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);
