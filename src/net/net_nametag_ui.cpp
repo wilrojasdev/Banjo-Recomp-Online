@@ -8,6 +8,12 @@
 #include "elements/ui_label.h"
 #include "elements/ui_types.h"
 
+#ifdef _WIN32
+#include "SDL.h"
+#else
+#include "SDL2/SDL.h"
+#endif
+
 #include <cmath>
 #include <string>
 #include <cstdio>
@@ -20,6 +26,19 @@
 namespace bknet {
 
 using namespace recompui;
+
+// ---- Get real window aspect ratio from SDL ----
+
+static float get_window_aspect() {
+    SDL_Window* window = SDL_GetMouseFocus();
+    if (!window) window = SDL_GetKeyboardFocus();
+    if (window) {
+        int w, h;
+        SDL_GetWindowSize(window, &w, &h);
+        if (h > 0) return (float)w / (float)h;
+    }
+    return 16.0f / 9.0f; // fallback
+}
 
 // ---- Camera state (thread-safe, written by game thread) ----
 
@@ -36,7 +55,7 @@ CameraState nametag_get_camera_state() {
     return s_camera_state;
 }
 
-// ---- 3D -> 2D projection (replicates viewport_func_8024E030) ----
+// ---- 3D -> 2D projection ----
 
 static void vec3f_yaw_rotate(float out[3], const float in[3], float yaw_deg) {
     float rad = yaw_deg * (float)(M_PI / 180.0);
@@ -56,8 +75,14 @@ static void vec3f_pitch_rotate(float out[3], const float in[3], float pitch_deg)
     out[2] = in[1] * s + in[2] * c;
 }
 
+// Standard perspective projection (same approach as SM64 Coop DX):
+// 1. Transform world pos to camera space (rotate by -yaw, -pitch)
+// 2. Perspective divide (x/z, y/z)
+// 3. FOV + aspect correction
+// 4. Normalize to 0..1 screen coords
 static bool project_world_to_screen(const float pos[3], const CameraState& cam,
                                      float* out_norm_x, float* out_norm_y) {
+    // World to camera space
     float delta[3] = {
         pos[0] - cam.position[0],
         pos[1] - cam.position[1],
@@ -68,23 +93,24 @@ static bool project_world_to_screen(const float pos[3], const CameraState& cam,
     vec3f_yaw_rotate(temp, delta, -cam.rotation[1]);
     vec3f_pitch_rotate(delta, temp, -cam.rotation[0]);
 
-    if (-cam.near_plane <= delta[2]) return false;
+    // Behind camera check (in BK camera space, -Z is forward)
+    if (delta[2] >= -cam.near_plane) return false;
 
-    float fovy_radians = cam.fov_y * (float)M_PI / 360.0f;
+    // Perspective divide
+    float inv_z = 1.0f / -delta[2];
+    float proj_x = delta[0] * inv_z;
+    float proj_y = delta[1] * inv_z;
 
-    // Use the real viewport aspect ratio (accounts for widescreen)
-    float aspect = cam.viewport_aspect;
-    if (aspect <= 0.0f) aspect = 16.0f / 9.0f;
+    // FOV correction: tan(fov_y/2) maps the vertical visible range
+    float tan_half_fov = tanf(cam.fov_y * (float)M_PI / 360.0f);
+    if (tan_half_fov <= 0.0f) return false;
 
-    float temp_f2 = sqrtf(delta[1] * delta[1] + delta[2] * delta[2]) * sinf(fovy_radians);
-    if (temp_f2 == 0.0f) return false;
+    // Use the REAL window aspect ratio (not the game's internal 4:3)
+    float aspect = get_window_aspect();
 
-    float temp_f2_2 = aspect * temp_f2;
-    if (temp_f2_2 == 0.0f) return false;
-
-    // Project to normalized screen coords (0..1)
-    *out_norm_x = (delta[0] / temp_f2_2 + 1.0f) * 0.5f;
-    *out_norm_y = (1.0f - delta[1] / temp_f2) * 0.5f;
+    // Normalize: divide by the visible range at depth=1
+    *out_norm_x = (proj_x / (tan_half_fov * aspect) + 1.0f) * 0.5f;
+    *out_norm_y = (1.0f - proj_y / tan_half_fov) * 0.5f;
 
     if (*out_norm_x < -0.5f || *out_norm_x > 1.5f) return false;
     if (*out_norm_y < -0.5f || *out_norm_y > 1.5f) return false;
@@ -118,7 +144,7 @@ struct NametagRow {
 };
 static NametagRow nametag_rows[MAX_PLAYERS];
 
-static constexpr float SMOOTH_SPEED = 0.35f; // 0=frozen, 1=instant
+static constexpr float SMOOTH_SPEED = 0.5f; // 0=frozen, 1=instant
 
 void nametag_ui_init() {
     nametag_initialized = false;
@@ -159,7 +185,7 @@ static void ensure_init() {
         pill->set_padding_right(8, Unit::Dp);
 
         // Player name
-        nr.name_label = nametag_context.create_element<Label>(pill, "", theme::Typography::LabelXS);
+        nr.name_label = nametag_context.create_element<Label>(pill, "", theme::Typography::LabelSM);
         nr.name_label->set_color(player_colors[i]);
         nr.name_label->set_font_weight(600);
     }
