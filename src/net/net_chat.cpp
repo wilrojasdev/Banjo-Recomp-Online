@@ -1,5 +1,7 @@
 #include "net_chat.h"
 #include "net_manager.h"
+#include "net_playerlist_ui.h"
+#include "net_nametag_ui.h"
 #include <cstdio>
 
 #ifdef _WIN32
@@ -25,6 +27,20 @@ static int chat_event_filter(void* userdata, SDL_Event* event) {
     if (!net.is_connected()) {
         if (original_filter) return original_filter(original_filter_data, event);
         return 1;
+    }
+
+    // CTRL hold: show/hide player list
+    if (event->type == SDL_KEYDOWN && !event->key.repeat) {
+        if (event->key.keysym.sym == SDLK_LCTRL || event->key.keysym.sym == SDLK_RCTRL) {
+            if (net.is_connected() && !chat.is_active()) {
+                bknet::playerlist_ui_set_visible(true);
+            }
+        }
+    }
+    if (event->type == SDL_KEYUP) {
+        if (event->key.keysym.sym == SDLK_LCTRL || event->key.keysym.sym == SDLK_RCTRL) {
+            bknet::playerlist_ui_set_visible(false);
+        }
     }
 
     if (event->type == SDL_KEYDOWN && !event->key.repeat) {

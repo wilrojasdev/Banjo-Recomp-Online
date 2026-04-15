@@ -206,6 +206,8 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/net/net_recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_chat.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_chat_ui.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_playerlist_ui.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/net_nametag_ui.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_coopnet.cpp
 )
 

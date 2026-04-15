@@ -31,6 +31,8 @@ extern char **environ;
 #include "../net/net_coopnet.h"
 #include "../net/net_chat.h"
 #include "../net/net_chat_ui.h"
+#include "../net/net_playerlist_ui.h"
+#include "../net/net_nametag_ui.h"
 
 // Network recomp API functions (defined in net_recomp_api.cpp)
 #include "recomp.h"
@@ -55,6 +57,7 @@ extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_is_online_mode(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_get_save_slot(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_push_camera_state(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -309,6 +312,12 @@ void update_gfx(void*) {
 
     // Update chat overlay UI
     bknet::chat_ui_update();
+
+    // Update player list overlay UI
+    bknet::playerlist_ui_update();
+
+    // Update floating nametags above remote players
+    bknet::nametag_ui_update();
 }
 
 static SDL_AudioCVT audio_convert;
@@ -979,6 +988,7 @@ static void begin_coopnet_join(uint64_t lobby_id);
 
 static void ensure_host_panel();
 
+static recompui::TextInput* host_name_input = nullptr;
 static recompui::TextInput* host_port_input = nullptr;
 static recompui::TextInput* host_password_input = nullptr;
 static recompui::Element* host_port_section = nullptr;
@@ -998,6 +1008,11 @@ static void host_set_mode(bool coopnet) {
 }
 
 static void start_host_game() {
+    // Set player name from input
+    if (host_name_input) {
+        std::string name = host_name_input->get_text();
+        if (!name.empty()) bknet::set_player_name(name);
+    }
     bknet::get_config().save_slot = selected_save_slot;
 
     if (host_coopnet_mode) {
@@ -1052,6 +1067,12 @@ static void ensure_host_panel() {
     title_row->set_width(100.0f, recompui::Unit::Percent);
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Host Game", recompui::theme::Typography::Header2);
+
+    // --- Player Name ---
+    auto host_name_section = create_section(context, card, "Player Name");
+    host_name_input = context.create_element<recompui::TextInput>(host_name_section);
+    host_name_input->set_text(bknet::get_config().player_name);
+    host_name_input->set_width(100.0f, recompui::Unit::Percent);
 
     // --- Network System selector ---
     auto mode_section = create_section(context, card, "Network System");
@@ -1197,6 +1218,7 @@ static recompui::Button* join_retry_btn = nullptr;
 static recompui::TextInput* ip_input = nullptr;
 static recompui::TextInput* join_port_input = nullptr;
 static recompui::TextInput* join_password_input = nullptr;
+static recompui::TextInput* join_name_input = nullptr;
 static recompui::Element* join_lobby_container = nullptr;
 static recompui::Label* join_lobby_status_label = nullptr;
 static std::vector<recompui::Element*> join_lobby_rows; // Track created lobby rows for cleanup
@@ -1243,7 +1265,15 @@ static void join_show_status() {
     if (join_status_view) join_status_view->display_show();
 }
 
+static void apply_join_player_name() {
+    if (join_name_input) {
+        std::string name = join_name_input->get_text();
+        if (!name.empty()) bknet::set_player_name(name);
+    }
+}
+
 static void begin_join(const std::string& ip, const std::string& port_str) {
+    apply_join_player_name();
     join_target_ip = ip.empty() ? "127.0.0.1" : ip;
     save_last_join_ip(join_target_ip);
 
@@ -1273,6 +1303,7 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
 }
 
 static void begin_private_search() {
+    apply_join_player_name();
     std::string pass = join_password_input ? join_password_input->get_text() : "";
 
     auto& net = bknet::NetworkManager::instance();
@@ -1355,6 +1386,13 @@ static void ensure_join_panel() {
     title_row->set_width(100.0f, recompui::Unit::Percent);
     title_row->set_margin_bottom(8.0f);
     context.create_element<recompui::Label>(title_row, "Join Game", recompui::theme::Typography::Header2);
+
+    // --- Player Name ---
+    auto join_name_section = create_section(context, join_menu_view, "Player Name");
+    join_name_section->set_align_items(recompui::AlignItems::FlexStart);
+    join_name_input = context.create_element<recompui::TextInput>(join_name_section);
+    join_name_input->set_text(bknet::get_config().player_name);
+    join_name_input->set_width(100.0f, recompui::Unit::Percent);
 
     auto private_btn = context.create_element<recompui::Button>(
         join_menu_view, "Private Lobbies", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
@@ -1960,6 +1998,7 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_is_online_mode);
     REGISTER_FUNC(recomp_net_get_save_slot);
     REGISTER_FUNC(recomp_net_is_join_mode);
+    REGISTER_FUNC(recomp_net_push_camera_state);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();
@@ -1982,6 +2021,12 @@ int main(int argc, char** argv) {
 
     // Initialize chat input system (SDL event watcher)
     bknet::ChatInput::instance().init();
+
+    // Initialize player list overlay
+    bknet::playerlist_ui_init();
+
+    // Initialize floating nametag overlay
+    bknet::nametag_ui_init();
 
     recompui::register_launcher_init_callback(on_launcher_init);
     recompui::set_quit_to_launcher_callback([]() { return_to_launcher(); });
