@@ -13,8 +13,18 @@ extern void commonParticle_add(s32 actorMarker, s32 arg1, s32 arg2);
 u32 recomp_net_is_connected(void);
 u32 recomp_net_get_remote_state(u32 player_id, void* out);
 u32 recomp_net_get_local_player_id(void);
+void recomp_net_push_camera_state(void* cam_data);
 
 extern enum map_e map_get(void);
+extern s32 gFramebufferWidth;
+extern s32 gFramebufferHeight;
+
+// Viewport functions for camera state bridge
+extern void viewport_getPosition_vec3f(f32 arg0[3]);
+extern void viewport_getRotation_vec3f(f32 arg0[3]);
+extern f32 viewport_getFOVy(void);
+extern f32 viewport_getNear(void);
+extern f32 viewport_getAspectRatio(void);
 extern s32 cur_drawn_model_transform_id;
 
 #define GHOST_TRANSFORM_ID_START  0x20000000
@@ -61,6 +71,20 @@ extern void func_80352CF4(f32 pos[3], f32 vel[3], f32 startScale, f32 endScale);
 extern void func_802589E4(f32 dst[3], f32 angle, f32 magnitude);
 extern f32 mlNormalizeAngle(f32 angle);
 
+// Transformation particles (from dronexform.c / particle system)
+extern void partEmitMgr_freeEmitter(ParticleEmitter *this);
+extern void func_802EFF50(ParticleEmitter *, f32);
+extern f32 ml_interpolate_f(f32 t, f32 a, f32 b);
+extern f32 ml_remainder_f(f32 a, f32 b);
+extern f32 func_80257A44(f32 a, f32 b);
+
+// Mumbo lock state (from network_flag_sync.c)
+extern bool bkrecomp_net_mumbo_is_locked(void);
+extern u8 bkrecomp_net_mumbo_get_lock_owner(void);
+
+// Asset cache (assetcache_get already in functions.h)
+extern void assetcache_release(void *bin);
+
 #define MAX_PLAYERS 4
 
 typedef struct {
@@ -75,6 +99,15 @@ typedef struct {
     u8 dust_cooldown;
     bool bbuster_dust_done; // Prevent bbuster dust from firing twice (impact + bounce)
     bool initialized;
+    // Transformation particle emitters
+    ParticleEmitter *xform_emit_blue;
+    ParticleEmitter *xform_emit_yellow;
+    f32 xform_orbit_progress;  // 0..1 orbit rotation
+    bool xform_particles_active;
+    // Transformation model cache
+    void *xform_model_bin;        // Loaded model binary (NULL = use baModelBin)
+    u8    cached_transformation;  // Which transformation is currently cached
+    enum asset_e cached_model_id; // Asset ID of the cached model (for skinning)
 } GhostModel;
 
 static GhostModel ghost_models[MAX_PLAYERS] = {0};
@@ -96,65 +129,97 @@ extern s32 func_8033A0F0(s32 index);
 
 // Full model node setup for ghost — replaces func_8029DD6C entirely.
 // We can't rely on func_8029DD6C because it uses baModel_getModelId()
-// and global eye state from the LOCAL player. The ghost always renders
-// as BK model and needs its own node configuration.
-// Mirrors func_8029DD6C + func_8029DBF0 for ASSET_34D/34E (BK model).
-static void ghost_setup_all_model_nodes(bool kazooie_head, bool kazooie_wings, bool kazooie_feet) {
+// and global eye state from the LOCAL player.
+// Mirrors func_8029DD6C + func_8029DBF0 for each model type.
+static void ghost_setup_all_model_nodes(u8 transformation, bool kazooie_head, bool kazooie_wings, bool kazooie_feet) {
     // Clear all 42 nodes
     func_8033A1FC();
 
-    // Kazooie head/beak (D_8037D238 equivalent)
-    s32 k_h = kazooie_head ? 1 : 0;
-    func_8033A45C(1, k_h);
-    func_8033A45C(9, k_h);
-    func_8033A45C(0xC, k_h);
-    func_8033A45C(0xF, k_h);
+    switch (transformation) {
+        case TRANSFORM_4_WALRUS:
+            // Walrus model: node 3 = mouth (D_8037D23A equivalent, always visible)
+            func_8033A45C(3, 1);
+            // Eyes: nodes 0x1A, 0x1B (from func_8029DBF0, always open = 1)
+            func_8033A45C(0x1A, 1);
+            func_8033A45C(0x1B, 1);
+            break;
 
-    // Kazooie wings (D_8037D236 equivalent)
-    s32 k_w = kazooie_wings ? 1 : 0;
-    func_8033A45C(2, k_w);
-    func_8033A45C(0xA, k_w);
-    func_8033A45C(0xD, k_w);
-    func_8033A45C(0x10, k_w);
+        case TRANSFORM_5_CROC:
+            // Croc model: nodes 4-7 = tail segments (D_8037D237 equivalent, visible)
+            func_8033A45C(4, 1);
+            func_8033A45C(5, 1);
+            func_8033A45C(6, 1);
+            func_8033A45C(7, 1);
+            // Eyes: nodes 0x1A, 0x1B (from func_8029DBF0, always open = 1)
+            func_8033A45C(0x1A, 1);
+            func_8033A45C(0x1B, 1);
+            break;
 
-    // Kazooie feet (D_8037D235 equivalent)
-    s32 k_f = kazooie_feet ? 1 : 0;
-    func_8033A45C(8, k_f);
-    func_8033A45C(0xB, k_f);
-    func_8033A45C(0xE, k_f);
-    func_8033A45C(0x11, k_f);
+        case TRANSFORM_2_TERMITE:
+        case TRANSFORM_3_PUMPKIN:
+        case TRANSFORM_6_BEE:
+            // Eyes: nodes 0x1A, 0x1B (from func_8029DBF0, always open = 1)
+            func_8033A45C(0x1A, 1);
+            func_8033A45C(0x1B, 1);
+            break;
 
-    // Tails (D_8037D237 equivalent): visible (value = 0 + 1 = 1)
-    func_8033A45C(0x12, 1);
-    func_8033A45C(0x14, 1);
-    func_8033A45C(0x16, 1);
-    func_8033A45C(0x18, 1);
-    func_8033A45C(0x13, 1);
-    func_8033A45C(0x15, 1);
-    func_8033A45C(0x17, 1);
-    func_8033A45C(0x19, 1);
+        case TRANSFORM_7_WISHWASHY:
+            // WishyWashy eyes: node 1 (from func_8029DBF0, always open = 1)
+            func_8033A45C(1, 1);
+            break;
 
-    // Eyes (from func_8029DBF0): always open for ghost (value = 1)
-    // D_8037D23C=0.0 → ml_interpolate_f(0.0,1.0,8.0) = 1
-    // D_8037D240=0.0 → ml_interpolate_f(0.0,1.0,8.0) = 1
-    func_8033A45C(0x1B, 1);
-    func_8033A45C(0x1D, 1);
-    func_8033A45C(0x1F, 1);
-    func_8033A45C(0x21, 1);
-    func_8033A45C(0x1A, 1);
-    func_8033A45C(0x1C, 1);
-    func_8033A45C(0x1E, 1);
-    func_8033A45C(0x20, 1);
+        default: {
+            // Banjo-Kazooie model — full node setup
+            s32 k_h = kazooie_head ? 1 : 0;
+            func_8033A45C(1, k_h);
+            func_8033A45C(9, k_h);
+            func_8033A45C(0xC, k_h);
+            func_8033A45C(0xF, k_h);
 
-    // Body parts (D_8037D239 equivalent): visible (value = 0 + 1 = 1)
-    func_8033A45C(0x22, 1);
-    func_8033A45C(0x24, 1);
-    func_8033A45C(0x26, 1);
-    func_8033A45C(0x28, 1);
-    func_8033A45C(0x23, 1);
-    func_8033A45C(0x25, 1);
-    func_8033A45C(0x27, 1);
-    func_8033A45C(0x29, 1);
+            s32 k_w = kazooie_wings ? 1 : 0;
+            func_8033A45C(2, k_w);
+            func_8033A45C(0xA, k_w);
+            func_8033A45C(0xD, k_w);
+            func_8033A45C(0x10, k_w);
+
+            s32 k_f = kazooie_feet ? 1 : 0;
+            func_8033A45C(8, k_f);
+            func_8033A45C(0xB, k_f);
+            func_8033A45C(0xE, k_f);
+            func_8033A45C(0x11, k_f);
+
+            // Tails: visible
+            func_8033A45C(0x12, 1);
+            func_8033A45C(0x14, 1);
+            func_8033A45C(0x16, 1);
+            func_8033A45C(0x18, 1);
+            func_8033A45C(0x13, 1);
+            func_8033A45C(0x15, 1);
+            func_8033A45C(0x17, 1);
+            func_8033A45C(0x19, 1);
+
+            // Eyes: always open for ghost
+            func_8033A45C(0x1B, 1);
+            func_8033A45C(0x1D, 1);
+            func_8033A45C(0x1F, 1);
+            func_8033A45C(0x21, 1);
+            func_8033A45C(0x1A, 1);
+            func_8033A45C(0x1C, 1);
+            func_8033A45C(0x1E, 1);
+            func_8033A45C(0x20, 1);
+
+            // Body parts: visible
+            func_8033A45C(0x22, 1);
+            func_8033A45C(0x24, 1);
+            func_8033A45C(0x26, 1);
+            func_8033A45C(0x28, 1);
+            func_8033A45C(0x23, 1);
+            func_8033A45C(0x25, 1);
+            func_8033A45C(0x27, 1);
+            func_8033A45C(0x29, 1);
+            break;
+        }
+    }
 }
 
 
@@ -173,12 +238,145 @@ static void ghost_ensure_init(u32 pid) {
     gm->initialized = TRUE;
 }
 
+// === Transformation model helpers ===
+
+// Returns the model asset ID for a given transformation.
+// Always returns a valid asset — ghosts must never fall back to baModelBin
+// because baModelBin reflects the LOCAL player's transformation, not the ghost's.
+static enum asset_e ghost_model_for_transformation(u8 transformation) {
+    switch (transformation) {
+        case TRANSFORM_2_TERMITE:   return ASSET_34F_MODEL_BANJO_TERMITE;
+        case TRANSFORM_3_PUMPKIN:   return ASSET_36F_MODEL_BANJO_PUMPKIN;
+        case TRANSFORM_4_WALRUS:    return ASSET_359_MODEL_BANJO_WALRUS;
+        case TRANSFORM_5_CROC:      return ASSET_374_MODEL_BANJO_CROC;
+        case TRANSFORM_6_BEE:       return ASSET_362_MODEL_BANJO_BEE;
+        case TRANSFORM_7_WISHWASHY: return ASSET_356_MODEL_BANJO_WISHYWASHY;
+        default:                    return ASSET_34D_MODEL_BANJOKAZOOIE_LOW_POLY;
+    }
+}
+
+// Update the cached transformation model for a ghost.
+// Always loads an explicit model — never relies on baModelBin, which
+// reflects the LOCAL player's state and would bleed transformations.
+static void ghost_update_xform_model(GhostModel *gm, u8 transformation) {
+    if (gm->cached_transformation == transformation && gm->xform_model_bin) return;
+
+    // Release old model if any
+    if (gm->xform_model_bin) {
+        assetcache_release(gm->xform_model_bin);
+        gm->xform_model_bin = (void*)0;
+    }
+
+    gm->cached_transformation = transformation;
+    enum asset_e asset_id = ghost_model_for_transformation(transformation);
+    gm->xform_model_bin = assetcache_get(asset_id);
+    gm->cached_model_id = asset_id;
+}
+
+// === Ghost transformation particles ===
+
+static void ghost_xform_particles_start(GhostModel *gm) {
+    if (gm->xform_particles_active) return;
+
+    gm->xform_emit_blue = partEmitMgr_newEmitter(0x32);
+    particleEmitter_setSprite(gm->xform_emit_blue, ASSET_476_SPRITE_BLUE_GLOW);
+    particleEmitter_setAccelerationRange(gm->xform_emit_blue, 0.0f, -50.0f, 0.0f, 0.0f, -50.0f, 0.0f);
+    particleEmitter_setFade(gm->xform_emit_blue, 0.4f, 0.8f);
+    particleEmitter_setFinalScaleRange(gm->xform_emit_blue, 0.03f, 0.03f);
+    particleEmitter_setAngularVelocityRange(gm->xform_emit_blue, 0.0f, 0.0f, 300.0f, 0.0f, 0.0f, 300.0f);
+    particleEmitter_setParticleLifeTimeRange(gm->xform_emit_blue, 0.65f, 0.65f);
+    particleEmitter_setStartingScaleRange(gm->xform_emit_blue, 0.35f, 0.35f);
+    func_802EFF50(gm->xform_emit_blue, 1.0f);
+
+    gm->xform_emit_yellow = partEmitMgr_newEmitter(0x32);
+    particleEmitter_setSprite(gm->xform_emit_yellow, ASSET_477_SPRITE_YELLOW_GLOW);
+    particleEmitter_setAccelerationRange(gm->xform_emit_yellow, 0.0f, -50.0f, 0.0f, 0.0f, -50.0f, 0.0f);
+    particleEmitter_setFade(gm->xform_emit_yellow, 0.4f, 0.8f);
+    particleEmitter_setFinalScaleRange(gm->xform_emit_yellow, 0.03f, 0.03f);
+    particleEmitter_setAngularVelocityRange(gm->xform_emit_yellow, 0.0f, 0.0f, 300.0f, 0.0f, 0.0f, 300.0f);
+    particleEmitter_setParticleLifeTimeRange(gm->xform_emit_yellow, 0.65f, 0.65f);
+    particleEmitter_setStartingScaleRange(gm->xform_emit_yellow, 0.35f, 0.35f);
+    func_802EFF50(gm->xform_emit_yellow, 1.0f);
+
+    gm->xform_orbit_progress = 0.0f;
+    gm->xform_particles_active = TRUE;
+}
+
+static void ghost_xform_particles_stop(GhostModel *gm) {
+    if (!gm->xform_particles_active) return;
+    partEmitMgr_freeEmitter(gm->xform_emit_blue);
+    partEmitMgr_freeEmitter(gm->xform_emit_yellow);
+    gm->xform_emit_blue = (ParticleEmitter*)0;
+    gm->xform_emit_yellow = (ParticleEmitter*)0;
+    gm->xform_particles_active = FALSE;
+}
+
+// Update orbiting particles at ghost position (replicates func_802AF900 from dronexform.c)
+static void ghost_xform_particles_update(GhostModel *gm, f32 gx, f32 gy, f32 gz) {
+    if (!gm->xform_particles_active) return;
+
+    f32 dt = time_getDelta();
+    gm->xform_orbit_progress += dt * 0.36f;  // ~0.36 = matches original orbit speed
+    if (gm->xform_orbit_progress > 1.0f) gm->xform_orbit_progress -= 1.0f;
+
+    f32 t = gm->xform_orbit_progress;
+    f32 radius = 55.0f;
+    f32 angle1 = t * 6.2831853f;
+    f32 s1 = sinf(angle1);
+    f32 c1 = cosf(angle1);
+
+    // Yellow glow — orbit position 1
+    f32 pos1[3];
+    pos1[0] = gx + s1 * radius;
+    pos1[1] = gy + ml_interpolate_f(t, 0.0f, 130.0f);
+    pos1[2] = gz + c1 * radius;
+    particleEmitter_setParticleVelocityRange(gm->xform_emit_yellow, s1*30.0f, 10.0f, c1*30.0f, s1*30.0f, 10.0f, c1*30.0f);
+    particleEmitter_setPosition(gm->xform_emit_yellow, pos1);
+    particleEmitter_emitN(gm->xform_emit_yellow, 1);
+
+    // Blue glow — orbit position 2 (opposite side)
+    f32 angle2 = (1.0f - ml_remainder_f(t + 0.5f, 1.0f)) * 6.2831853f;
+    f32 pos2[3];
+    pos2[0] = gx - sinf(angle2) * radius;
+    pos2[1] = gy + ml_interpolate_f(t, 130.0f, 0.0f);
+    pos2[2] = gz - cosf(angle2) * radius;
+    particleEmitter_setParticleVelocityRange(gm->xform_emit_blue, s1*30.0f, 10.0f, c1*30.0f, s1*30.0f, 10.0f, c1*30.0f);
+    particleEmitter_setPosition(gm->xform_emit_blue, pos2);
+    particleEmitter_emitN(gm->xform_emit_blue, 1);
+}
+
 void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     if (!recomp_net_is_connected()) return;
     if (!baModelBin) return;
 
     u32 local_id = recomp_net_get_local_player_id();
     u32 local_map = (u32)map_get();
+
+    // Push camera state to C++ for nametag projection
+    {
+        f32 cam_pos[3], cam_rot[3];
+        viewport_getPosition_vec3f(cam_pos);
+        viewport_getRotation_vec3f(cam_rot);
+        struct {
+            f32 pos[3];
+            f32 rot[3];
+            f32 fov_y;
+            f32 near_plane;
+            s32 fb_width;
+            s32 fb_height;
+            f32 viewport_aspect;
+            u32 map_id;
+        } cam_data;
+        cam_data.pos[0] = cam_pos[0]; cam_data.pos[1] = cam_pos[1]; cam_data.pos[2] = cam_pos[2];
+        cam_data.rot[0] = cam_rot[0]; cam_data.rot[1] = cam_rot[1]; cam_data.rot[2] = cam_rot[2];
+        cam_data.fov_y = viewport_getFOVy();
+        cam_data.near_plane = viewport_getNear();
+        cam_data.fb_width = gFramebufferWidth;
+        cam_data.fb_height = gFramebufferHeight;
+        cam_data.viewport_aspect = viewport_getAspectRatio();
+        cam_data.map_id = local_map;
+        recomp_net_push_camera_state(&cam_data);
+    }
 
     // Snapshot ALL local player render state BEFORE any ghost rendering.
     s32 saved_nodes[0x2A];
@@ -195,6 +393,9 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         ghost_ensure_init(pid);
         GhostModel *gm = &ghost_models[pid];
         if (!gm->initialized) continue;
+
+        // === Update transformation model cache ===
+        ghost_update_xform_model(gm, rs.transformation);
 
         // === Direct animation mirror from local player's AnimCtrl ===
         // Direct mirror: animation and timer come straight from sender's AnimCtrl.
@@ -313,6 +514,23 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             }
         }
 
+        // === Transformation particles for ghost ===
+        // Use Mumbo lock state: if this ghost's player owns the lock, they're transforming
+        {
+            bool is_transforming = bkrecomp_net_mumbo_is_locked()
+                                   && bkrecomp_net_mumbo_get_lock_owner() == (u8)pid;
+
+            if (is_transforming && !gm->xform_particles_active) {
+                ghost_xform_particles_start(gm);
+            } else if (!is_transforming && gm->xform_particles_active) {
+                ghost_xform_particles_stop(gm);
+            }
+
+            if (gm->xform_particles_active) {
+                ghost_xform_particles_update(gm, rs.x, rs.y, rs.z);
+            }
+        }
+
         gm->prev_bs_state = rs.bs_state;
         gm->prev_y = rs.y;
 
@@ -405,9 +623,9 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         func_8033A280(2.0f);
         // NOTE: func_8033A450 intentionally omitted — corrupts collision system.
         modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
-        ghost_setup_all_model_nodes(kazooie_head, kazooie_wings, kazooie_feet);
-        bkrecomp_setup_custom_skinning(&ghost_skinning_data[pid], baModel_getModelId());
-        modelRender_draw(gfx, mtx, pos, rot, baModelScale, ref, baModelBin);
+        ghost_setup_all_model_nodes(rs.transformation, kazooie_head, kazooie_wings, kazooie_feet);
+        bkrecomp_setup_custom_skinning(&ghost_skinning_data[pid], (u32)gm->cached_model_id);
+        modelRender_draw(gfx, mtx, pos, rot, rs.scale, ref, gm->xform_model_bin);
 
         // Restore local bones
         {

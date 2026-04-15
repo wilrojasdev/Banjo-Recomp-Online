@@ -37,11 +37,20 @@ extern void bitfield_set_n_bits(u8 *array, s32 startIndex, s32 set, s32 length);
 #define NET_FLAG_JIGSAW_ACTION  4
 #define NET_FLAG_ABILITY        5
 #define NET_FLAG_BOTTLES_ACTION 6
+#define NET_FLAG_MUMBO_ACTION   7
 
 // Bottles lock actions
 #define BOTTLES_ACTION_LOCK            0
 #define BOTTLES_ACTION_UNLOCK          1
 #define BOTTLES_ACTION_LOCK_REFRESHER  2
+
+// Mumbo lock actions
+#define MUMBO_ACTION_LOCK           0
+#define MUMBO_ACTION_UNLOCK         1
+#define MUMBO_ACTION_DEDUCT_TOKENS  2
+
+// Mumbo token deduction (from item system)
+extern void item_adjustByDiffWithHud(s32 item, s32 diff);
 
 // Jigsaw sync (from network_jigsaw_sync.c)
 extern void bkrecomp_net_process_jigsaw_event(u32 flag_index, u32 value, u32 map_id);
@@ -49,6 +58,10 @@ extern void bkrecomp_net_process_jigsaw_event(u32 flag_index, u32 value, u32 map
 // Bottles visual sync (from network_bottles_sync.c)
 extern void bkrecomp_net_bottles_remote_emerge(void);
 extern void bkrecomp_net_bottles_remote_hide(void);
+
+// Mumbo visual sync (from network_mumbo_sync.c)
+extern void bkrecomp_net_mumbo_remote_transform(void);
+extern void bkrecomp_net_mumbo_remote_idle(void);
 
 // Ability system
 extern s32 ability_hasLearned(s32 ability);
@@ -119,6 +132,55 @@ RECOMP_EXPORT void bkrecomp_net_bottles_send_unlock(void) {
     if (!recomp_net_is_connected()) return;
     net_bottles_unlock();
     recomp_net_send_flag_change(NET_FLAG_BOTTLES_ACTION, BOTTLES_ACTION_UNLOCK, 0, (u32)map_get());
+}
+
+// Mumbo NPC lock (one player at a time for transformation)
+static struct {
+    bool locked;
+    u8   owner_player_id;
+} mumbo_lock_state = { FALSE, 0 };
+
+// Returns TRUE if lock was acquired, FALSE if already held by someone else
+static bool net_mumbo_lock(u8 player_id) {
+    if (mumbo_lock_state.locked && mumbo_lock_state.owner_player_id != player_id) {
+        return FALSE;  // Already locked by another player
+    }
+    mumbo_lock_state.locked = TRUE;
+    mumbo_lock_state.owner_player_id = player_id;
+    return TRUE;
+}
+
+static void net_mumbo_unlock(void) {
+    mumbo_lock_state.locked = FALSE;
+    mumbo_lock_state.owner_player_id = 0;
+}
+
+RECOMP_EXPORT bool bkrecomp_net_mumbo_is_locked(void) {
+    return mumbo_lock_state.locked;
+}
+
+RECOMP_EXPORT bool bkrecomp_net_mumbo_is_local_owner(void) {
+    if (!mumbo_lock_state.locked) return FALSE;
+    return mumbo_lock_state.owner_player_id == (u8)recomp_net_get_local_player_id();
+}
+
+RECOMP_EXPORT u8 bkrecomp_net_mumbo_get_lock_owner(void) {
+    return mumbo_lock_state.owner_player_id;
+}
+
+// Returns TRUE if lock was acquired and sent
+RECOMP_EXPORT bool bkrecomp_net_mumbo_send_lock(void) {
+    if (!recomp_net_is_connected()) return FALSE;
+    u32 my_id = recomp_net_get_local_player_id();
+    if (!net_mumbo_lock((u8)my_id)) return FALSE;  // Already held by someone else
+    recomp_net_send_flag_change(NET_FLAG_MUMBO_ACTION, MUMBO_ACTION_LOCK, my_id, (u32)map_get());
+    return TRUE;
+}
+
+RECOMP_EXPORT void bkrecomp_net_mumbo_send_unlock(void) {
+    if (!recomp_net_is_connected()) return;
+    net_mumbo_unlock();
+    recomp_net_send_flag_change(NET_FLAG_MUMBO_ACTION, MUMBO_ACTION_UNLOCK, 0, (u32)map_get());
 }
 
 // Guard: prevents echo loop when applying remote flag changes
@@ -316,6 +378,25 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
             // Show exit animation on remote side
             bkrecomp_net_bottles_remote_hide();
             recomp_printf("[BOTTLES-SYNC] unlocked\n");
+        }
+    } else if (ft == NET_FLAG_MUMBO_ACTION) {
+        if (idx == MUMBO_ACTION_LOCK) {
+            if (net_mumbo_lock((u8)val)) {
+                bkrecomp_net_mumbo_remote_transform();
+                recomp_printf("[MUMBO-SYNC] locked by player %d\n", val);
+            } else {
+                recomp_printf("[MUMBO-SYNC] lock REJECTED (already held) from player %d\n", val);
+            }
+        } else if (idx == MUMBO_ACTION_UNLOCK) {
+            net_mumbo_unlock();
+            bkrecomp_net_mumbo_remote_idle();
+            recomp_printf("[MUMBO-SYNC] unlocked\n");
+        } else if (idx == MUMBO_ACTION_DEDUCT_TOKENS) {
+            s32 cost = (s32)val;
+            if (cost > 0) {
+                item_adjustByDiffWithHud(ITEM_1C_MUMBO_TOKEN, -cost);
+                recomp_printf("[MUMBO-SYNC] deducted %d tokens (remote transform)\n", cost);
+            }
         }
     }
 
