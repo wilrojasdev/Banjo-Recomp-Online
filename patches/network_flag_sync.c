@@ -2,6 +2,8 @@
 #include "functions.h"
 #include "enums.h"
 
+extern Actor *actorArray_findActorFromMarkerId(s32);
+
 // Network bridge
 void recomp_net_send_flag_change(u32 flag_type, u32 flag_index, u32 value, u32 map_id);
 u32  recomp_net_is_connected(void);
@@ -38,6 +40,8 @@ extern void bitfield_set_n_bits(u8 *array, s32 startIndex, s32 set, s32 length);
 #define NET_FLAG_ABILITY        5
 #define NET_FLAG_BOTTLES_ACTION 6
 #define NET_FLAG_MUMBO_ACTION   7
+#define NET_FLAG_HUT_ACTION     8
+#define NET_FLAG_JUJU_ACTION    9
 
 // Bottles lock actions
 #define BOTTLES_ACTION_LOCK            0
@@ -62,6 +66,12 @@ extern void bkrecomp_net_bottles_remote_hide(void);
 // Mumbo visual sync (from network_mumbo_sync.c)
 extern void bkrecomp_net_mumbo_remote_transform(void);
 extern void bkrecomp_net_mumbo_remote_idle(void);
+
+// Hut destruction sync (from network_hut_sync.c)
+extern void bkrecomp_net_hut_remote_destroy(u32 spawn_index, u32 smash_count, u32 map_id);
+
+// Juju totem sync (from network_juju_sync.c)
+extern void bkrecomp_net_juju_remote_hit(u32 hit_count, u32 map_id);
 
 // Ability system
 extern s32 ability_hasLearned(s32 ability);
@@ -354,6 +364,13 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
         volatileFlag_set((enum volatile_flags_e)idx, val);
     } else if (ft == NET_FLAG_MAP_SPECIFIC) {
         mapSpecificFlags_set((s32)idx, val);
+        /* MM orange collectible: despawn when remote player picks it up */
+        if (idx == MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED && val) {
+            Actor *orange = actorArray_findActorFromMarkerId(MARKER_36_ORANGE_COLLECTIBLE);
+            if (orange && orange->marker) {
+                marker_despawn(orange->marker);
+            }
+        }
     } else if (ft == NET_FLAG_JIGSAW_ACTION) {
         // Delegate to jigsaw sync — it manages its own guard via bkrecomp_net_set_remote_flag_guard
         net_applying_remote_flag = FALSE;
@@ -379,6 +396,12 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
             bkrecomp_net_bottles_remote_hide();
             recomp_printf("[BOTTLES-SYNC] unlocked\n");
         }
+    } else if (ft == NET_FLAG_HUT_ACTION) {
+        bkrecomp_net_hut_remote_destroy((u32)idx, (u32)val, evt->flag_map_id);
+        recomp_printf("[HUT-SYNC] remote destroy spawn=%d smash=%d map=%d\n", idx, val, evt->flag_map_id);
+    } else if (ft == NET_FLAG_JUJU_ACTION) {
+        bkrecomp_net_juju_remote_hit((u32)idx, evt->flag_map_id);
+        recomp_printf("[JUJU-SYNC] remote hit count=%d map=%d\n", idx, evt->flag_map_id);
     } else if (ft == NET_FLAG_MUMBO_ACTION) {
         if (idx == MUMBO_ACTION_LOCK) {
             if (net_mumbo_lock((u8)val)) {

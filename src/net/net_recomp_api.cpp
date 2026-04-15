@@ -435,3 +435,42 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
         _return(ctx, 0u);
     }
 }
+
+// === Conga orange projectile sync ===
+
+// Send orange spawn event from world owner.
+// Args: r4=spawn_pos_ptr (3 floats), r5=vel_ptr (3 floats), r6=map_id
+extern "C" void recomp_net_send_conga_orange(uint8_t* rdram, recomp_context* ctx) {
+    gpr spawn_ptr = ctx->r4;
+    gpr vel_ptr = ctx->r5;
+    uint32_t map_id = ctx->r6;
+
+    float sx = read_f32(rdram, spawn_ptr, 0x00);
+    float sy = read_f32(rdram, spawn_ptr, 0x04);
+    float sz = read_f32(rdram, spawn_ptr, 0x08);
+    float vx = read_f32(rdram, vel_ptr, 0x00);
+    float vy = read_f32(rdram, vel_ptr, 0x04);
+    float vz = read_f32(rdram, vel_ptr, 0x08);
+
+    bknet::NetworkManager::instance().send_conga_orange(sx, sy, sz, vx, vy, vz, map_id);
+}
+
+// Pop orange spawn event on non-owner side.
+// Args: r4=out_ptr (6 floats: spawn_x/y/z + vel_x/y/z)
+// Returns: 1 if event popped, 0 if empty
+extern "C" void recomp_net_pop_conga_orange(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+
+    bknet::NetworkManager::CongaOrangeEvent evt;
+    if (bknet::NetworkManager::instance().pop_conga_orange(evt)) {
+        write_f32(rdram, out_ptr, 0x00, evt.spawn_x);
+        write_f32(rdram, out_ptr, 0x04, evt.spawn_y);
+        write_f32(rdram, out_ptr, 0x08, evt.spawn_z);
+        write_f32(rdram, out_ptr, 0x0C, evt.vel_x);
+        write_f32(rdram, out_ptr, 0x10, evt.vel_y);
+        write_f32(rdram, out_ptr, 0x14, evt.vel_z);
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}

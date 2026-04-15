@@ -84,3 +84,7 @@ recomp_net_is_online_mode = 0x8F00011C;
 recomp_net_get_save_slot = 0x8F000120;
 recomp_net_is_join_mode = 0x8F000124;
 recomp_net_push_camera_state = 0x8F000128;
+
+/* Conga orange projectile sync */
+recomp_net_send_conga_orange = 0x8F00012C;
+recomp_net_pop_conga_orange = 0x8F000130;

@@ -40,6 +40,7 @@ enum class PacketType : uint8_t {
     WorldOwnership   = 0x35,  // Host broadcasts ownership assignments
     WorldOwnerTransfer = 0x36, // State handoff when owner leaves world
     WorldKillResync  = 0x37,  // Request owner to re-broadcast killed enemies
+    CongaOrangeSpawn = 0x38,  // Conga orange projectile spawn (world owner → others)
     WorldStateFull   = 0x3F,
 };
 
@@ -195,6 +196,8 @@ enum WorldFlagType : uint8_t {
     FLAG_JIGSAW_ACTION  = 4,      // Jigsaw puzzle pedestal sync (lock/unlock/add/remove/complete)
     FLAG_ABILITY        = 5,      // Ability learned/unlearned sync
     FLAG_BOTTLES_ACTION = 6,      // Bottles NPC lock/unlock (one player at a time)
+    FLAG_HUT_ACTION     = 8,      // MM hut destruction sync (spawn_index in flag_index, smashCount in value)
+    FLAG_JUJU_ACTION    = 9,      // MM Juju totem segment hit sync (hit_count in flag_index)
 };
 
 struct WorldFlagPacket {
@@ -263,6 +266,15 @@ struct WorldStateFullPacket {
     uint8_t has_flags;               // 1 if flag data is present (backwards compat)
     uint8_t _pad4[3];
     uint8_t abilities[8];            // learnedAbilities (4 bytes) + usedAbilities (4 bytes)
+};
+
+// --- Conga orange projectile sync (world owner broadcasts spawn events) ---
+
+struct CongaOrangeSpawnPacket {
+    PacketHeader header;
+    uint32_t map_id;
+    float spawn_x, spawn_y, spawn_z;
+    float vel_x, vel_y, vel_z;
 };
 
 // --- Chat ---

@@ -114,6 +114,14 @@ public:
     bool pop_world_event(WorldEvent& out);  // Called from game thread
     bool pop_full_state(WorldStateFullPacket& out);  // Called from game thread
 
+    // Conga orange projectile sync (world owner spawns, broadcasts to others)
+    struct CongaOrangeEvent {
+        float spawn_x, spawn_y, spawn_z;
+        float vel_x, vel_y, vel_z;
+    };
+    void send_conga_orange(float sx, float sy, float sz, float vx, float vy, float vz, uint32_t map_id);
+    bool pop_conga_orange(CongaOrangeEvent& out);
+
     struct ChatEntry {
         uint8_t player_id;
         std::string message;
@@ -171,6 +179,7 @@ private:
     void handle_flag_packet(const WorldFlagPacket& pkt);
     void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
     void handle_ownership_packet(const WorldOwnershipPacket& pkt);
+    void handle_conga_orange_packet(const CongaOrangeSpawnPacket& pkt);
     void assign_world_owner(uint32_t level_id, uint8_t player_id);
     void release_world_owner(uint32_t level_id, uint8_t leaving_player_id);
     void send_kill_list_for_level(uint32_t level_id);
@@ -214,6 +223,7 @@ private:
     std::atomic<bool> pending_full_sync_{false};
     uint8_t sync_target_player_ = 0;
     std::deque<WorldStateFullPacket> full_state_queue_;
+    std::deque<CongaOrangeEvent> conga_orange_queue_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;
 

@@ -676,6 +676,13 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             }
             break;
         }
+        case PacketType::CongaOrangeSpawn: {
+            CongaOrangeSpawnPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_conga_orange_packet(pkt);
+            }
+            break;
+        }
         // WorldOwnerTransfer and WorldKillResync — no longer used
         // (centralized kill tracking in C++ replaces these)
         default:
@@ -881,6 +888,47 @@ void NetworkManager::send_flag_change(uint8_t flag_type, uint16_t flag_index, ui
     pkt.map_id = map_id;
 
     enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+}
+
+// === Conga orange projectile sync ===
+
+void NetworkManager::send_conga_orange(float sx, float sy, float sz, float vx, float vy, float vz, uint32_t map_id) {
+    if (!is_connected()) return;
+
+    CongaOrangeSpawnPacket pkt{};
+    pkt.header.type = PacketType::CongaOrangeSpawn;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    pkt.map_id = map_id;
+    pkt.spawn_x = sx;
+    pkt.spawn_y = sy;
+    pkt.spawn_z = sz;
+    pkt.vel_x = vx;
+    pkt.vel_y = vy;
+    pkt.vel_z = vz;
+
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+}
+
+void NetworkManager::handle_conga_orange_packet(const CongaOrangeSpawnPacket& pkt) {
+    if (pkt.header.player_id == local_player_id_) return;
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    CongaOrangeEvent evt{};
+    evt.spawn_x = pkt.spawn_x;
+    evt.spawn_y = pkt.spawn_y;
+    evt.spawn_z = pkt.spawn_z;
+    evt.vel_x = pkt.vel_x;
+    evt.vel_y = pkt.vel_y;
+    evt.vel_z = pkt.vel_z;
+    conga_orange_queue_.push_back(evt);
+}
+
+bool NetworkManager::pop_conga_orange(CongaOrangeEvent& out) {
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    if (conga_orange_queue_.empty()) return false;
+    out = conga_orange_queue_.front();
+    conga_orange_queue_.pop_front();
+    return true;
 }
 
 void NetworkManager::handle_collectible_packet(const WorldCollectiblePacket& pkt) {
