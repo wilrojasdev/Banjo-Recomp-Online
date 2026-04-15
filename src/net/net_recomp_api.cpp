@@ -3,6 +3,7 @@
 #include "librecomp/helpers.hpp"
 #include "net_manager.h"
 #include "net_chat.h"
+#include "net_nametag_ui.h"
 
 // These functions are called from game patches (game thread) via REGISTER_FUNC.
 
@@ -79,6 +80,37 @@ extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx) 
 extern "C" void recomp_net_push_level_id(uint8_t* rdram, recomp_context* ctx) {
     u32 level_id = static_cast<u32>(ctx->r4);
     bknet::NetworkManager::instance().set_local_level_id(level_id);
+}
+
+// Push camera state from game thread for nametag projection.
+// Args: cam_data_ptr(r4) - pointer to struct:
+//   0x00: f32 pos[3]           (12 bytes)
+//   0x0C: f32 rot[3]           (12 bytes) - pitch, yaw, roll
+//   0x18: f32 fov_y            (4 bytes)
+//   0x1C: f32 near             (4 bytes)
+//   0x20: s32 fb_width         (4 bytes)
+//   0x24: s32 fb_height        (4 bytes)
+//   0x28: f32 viewport_aspect  (4 bytes)
+//   0x2C: u32 map_id           (4 bytes)
+extern "C" void recomp_net_push_camera_state(uint8_t* rdram, recomp_context* ctx) {
+    gpr data_ptr = ctx->r4;
+
+    bknet::CameraState cam{};
+    cam.position[0] = read_f32(rdram, data_ptr, 0x00);
+    cam.position[1] = read_f32(rdram, data_ptr, 0x04);
+    cam.position[2] = read_f32(rdram, data_ptr, 0x08);
+    cam.rotation[0] = read_f32(rdram, data_ptr, 0x0C);
+    cam.rotation[1] = read_f32(rdram, data_ptr, 0x10);
+    cam.rotation[2] = read_f32(rdram, data_ptr, 0x14);
+    cam.fov_y       = read_f32(rdram, data_ptr, 0x18);
+    cam.near_plane  = read_f32(rdram, data_ptr, 0x1C);
+    cam.framebuffer_width  = static_cast<int>(MEM_W(0x20, data_ptr));
+    cam.framebuffer_height = static_cast<int>(MEM_W(0x24, data_ptr));
+    cam.viewport_aspect = read_f32(rdram, data_ptr, 0x28);
+    cam.map_id = MEM_W(0x2C, data_ptr);
+    cam.valid = true;
+
+    bknet::nametag_set_camera_state(cam);
 }
 
 // Backwards-compat: position-only push (Phase 1)

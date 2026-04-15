@@ -49,10 +49,44 @@ bool NetworkManager::host_game() {
     server_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[Network] Player %u joined the game\n", player_id);
         request_full_sync(player_id);
+        // Send host's name directly to the new player
+        {
+            const auto& config = get_config();
+            PlayerJoinPacket host_pkt{};
+            host_pkt.header.type = PacketType::PlayerJoin;
+            host_pkt.header.player_id = 0; // host
+            host_pkt.header.sequence = send_sequence_++;
+            std::strncpy(host_pkt.player_name, config.player_name.c_str(), 31);
+            host_pkt.player_name[31] = '\0';
+            server_->send_to(player_id, &host_pkt, sizeof(host_pkt), CHANNEL_RELIABLE, true);
+        }
+        // Send existing players' names to the new joiner
+        for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
+            if (i == player_id) continue;
+            auto info = get_player_info(i);
+            if (!info.connected) continue;
+            PlayerJoinPacket njp{};
+            njp.header.type = PacketType::PlayerJoin;
+            njp.header.player_id = i;
+            njp.header.sequence = send_sequence_++;
+            std::strncpy(njp.player_name, info.name.c_str(), 31);
+            njp.player_name[31] = '\0';
+            server_->send_to(player_id, &njp, sizeof(njp), CHANNEL_RELIABLE, true);
+        }
     });
 
     server_->set_disconnect_callback([this](uint8_t player_id) {
         std::printf("[Network] Player %u left the game\n", player_id);
+        std::string leave_name;
+        {
+            std::lock_guard<std::mutex> lock(roster_mutex_);
+            if (player_id < MAX_PLAYERS) {
+                leave_name = player_roster_[player_id].name;
+                player_roster_[player_id].connected = false;
+            }
+        }
+        if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
+        add_system_message(leave_name + " left the game");
         interpolation_.remove_player(player_id);
         // Release world ownership for this player's level
         uint32_t level;
@@ -74,6 +108,9 @@ bool NetworkManager::host_game() {
     local_player_id_ = 0;
     state_ = ConnectionState::Hosting;
     interpolation_.reset();
+    clear_player_roster();
+    set_player_name(0, config.player_name);
+    initial_sync_done_.store(true); // Host is always "synced"
 
     std::printf("[Network] Hosting game on port %u\n", config.port);
     return true;
@@ -103,6 +140,8 @@ bool NetworkManager::join_game() {
     });
 
     state_ = ConnectionState::Connecting;
+    clear_player_roster();
+    initial_sync_done_.store(false); // Don't show join messages during roster sync
 
     if (!client_->connect(config.join_ip, config.port)) {
         client_.reset();
@@ -113,6 +152,8 @@ bool NetworkManager::join_game() {
     local_player_id_ = client_->assigned_player_id();
     state_ = ConnectionState::Connected;
     interpolation_.reset();
+    set_player_name(local_player_id_, config.player_name);
+    broadcast_local_name();
 
     std::printf("[Network] Joined game as player %u\n", local_player_id_);
     return true;
@@ -156,10 +197,44 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
     coopnet_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[CoopNet] Player %u joined the game\n", player_id);
         request_full_sync(player_id);
+        // Send host's name directly to the new player
+        {
+            const auto& config = get_config();
+            PlayerJoinPacket host_pkt{};
+            host_pkt.header.type = PacketType::PlayerJoin;
+            host_pkt.header.player_id = 0;
+            host_pkt.header.sequence = send_sequence_++;
+            std::strncpy(host_pkt.player_name, config.player_name.c_str(), 31);
+            host_pkt.player_name[31] = '\0';
+            net_send_to(player_id, &host_pkt, sizeof(host_pkt), CHANNEL_RELIABLE, true);
+        }
+        // Send existing players' names to the new joiner
+        for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
+            if (i == player_id) continue;
+            auto info = get_player_info(i);
+            if (!info.connected) continue;
+            PlayerJoinPacket njp{};
+            njp.header.type = PacketType::PlayerJoin;
+            njp.header.player_id = i;
+            njp.header.sequence = send_sequence_++;
+            std::strncpy(njp.player_name, info.name.c_str(), 31);
+            njp.player_name[31] = '\0';
+            net_send_to(player_id, &njp, sizeof(njp), CHANNEL_RELIABLE, true);
+        }
     });
 
     coopnet_->set_disconnect_callback([this](uint8_t player_id) {
         std::printf("[CoopNet] Player %u left the game\n", player_id);
+        std::string leave_name;
+        {
+            std::lock_guard<std::mutex> lock(roster_mutex_);
+            if (player_id < MAX_PLAYERS) {
+                leave_name = player_roster_[player_id].name;
+                player_roster_[player_id].connected = false;
+            }
+        }
+        if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
+        add_system_message(leave_name + " left the game");
         interpolation_.remove_player(player_id);
         uint32_t level;
         {
@@ -186,6 +261,9 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
     local_player_id_ = 0;
     state_ = ConnectionState::Hosting;
     interpolation_.reset();
+    clear_player_roster();
+    set_player_name(0, get_config().player_name);
+    initial_sync_done_.store(true);
 
     std::printf("[CoopNet] Hosting lobby\n");
     return true;
@@ -200,8 +278,18 @@ bool NetworkManager::coopnet_join_lobby(uint64_t lobby_id, const std::string& pa
             interpolation_.reset();
             unexpected_disconnect_.store(true);
         } else {
+            std::string leave_name;
+            {
+                std::lock_guard<std::mutex> lock(roster_mutex_);
+                if (player_id < MAX_PLAYERS) {
+                    leave_name = player_roster_[player_id].name;
+                    player_roster_[player_id].connected = false;
+                }
+            }
+            if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
+            add_system_message(leave_name + " left the game");
             interpolation_.remove_player(player_id);
-            std::printf("[CoopNet] Player %u left\n", player_id);
+            std::printf("[CoopNet] Player %u (%s) left\n", player_id, leave_name.c_str());
         }
     });
 
@@ -303,6 +391,8 @@ void NetworkManager::disconnect() {
         level_kills_.clear();
         level_collectibles_.clear();
     }
+    clear_player_roster();
+    initial_sync_done_.store(false);
 }
 
 void NetworkManager::update() {
@@ -314,6 +404,8 @@ void NetworkManager::update() {
             local_player_id_ = coopnet_->local_player_id();
             state_ = ConnectionState::Connected;
             interpolation_.reset();
+            set_player_name(local_player_id_, get_config().player_name);
+            broadcast_local_name();
             std::printf("[CoopNet] Joined game as player %u\n", local_player_id_);
         }
     }
@@ -421,6 +513,11 @@ void NetworkManager::update() {
         }
     }
 
+    // Mark initial sync as done after first update (roster packets already processed)
+    if (!initial_sync_done_.load() && is_connected()) {
+        initial_sync_done_.store(true);
+    }
+
     // Send local state at ~20Hz
     frame_counter_++;
     if (frame_counter_ % SEND_INTERVAL_FRAMES == 0) {
@@ -507,15 +604,36 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
         case PacketType::PlayerJoin: {
             PlayerJoinPacket pkt;
             if (deserialize(data, size, pkt)) {
-                std::printf("[Network] Player %u joined\n", pkt.header.player_id);
+                pkt.player_name[31] = '\0'; // safety
+                std::string name(pkt.player_name);
+                if (name.empty()) name = "Player";
+                set_player_name(pkt.header.player_id, name);
+                // Only show "joined" if: not ourselves, AND initial roster sync is done
+                // (prevents showing "host joined" when joiner receives roster)
+                if (pkt.header.player_id != local_player_id_ && initial_sync_done_.load()) {
+                    add_system_message(name + " joined the game");
+                }
+                std::printf("[Network] Player %u joined as '%s' (sync_done=%d)\n",
+                    pkt.header.player_id, name.c_str(), initial_sync_done_.load() ? 1 : 0);
             }
             break;
         }
         case PacketType::PlayerLeave: {
             PlayerLeavePacket pkt;
             if (deserialize(data, size, pkt)) {
+                // Get name before clearing
+                std::string leave_name;
+                {
+                    std::lock_guard<std::mutex> lock(roster_mutex_);
+                    if (pkt.header.player_id < MAX_PLAYERS) {
+                        leave_name = player_roster_[pkt.header.player_id].name;
+                        player_roster_[pkt.header.player_id].connected = false;
+                    }
+                }
+                if (leave_name.empty()) leave_name = "Player " + std::to_string(pkt.header.player_id + 1);
                 interpolation_.remove_player(pkt.header.player_id);
-                std::printf("[Network] Player %u left\n", pkt.header.player_id);
+                add_system_message(leave_name + " left the game");
+                std::printf("[Network] Player %u (%s) left\n", pkt.header.player_id, leave_name.c_str());
             }
             break;
         }
@@ -601,6 +719,13 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
     snap.horizontal_velocity = pkt.horizontal_velocity;
 
     interpolation_.push_full_state(pid, snap);
+}
+
+void NetworkManager::add_system_message(const std::string& message) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    chat_history_.push_back({0xFF, message, get_time()}); // 0xFF = system
+    if (chat_history_.size() > MAX_CHAT_HISTORY) chat_history_.pop_front();
+    new_messages_ = true;
 }
 
 void NetworkManager::send_chat(const std::string& message) {
@@ -1105,6 +1230,44 @@ void NetworkManager::record_collectible(uint32_t level_id, uint8_t type, uint16_
 void NetworkManager::clear_level_collectibles(uint32_t level_id) {
     std::lock_guard<std::mutex> lock(kill_mutex_);
     level_collectibles_.erase(level_id);
+}
+
+// === Player roster ===
+
+void NetworkManager::set_player_name(uint8_t player_id, const std::string& name) {
+    if (player_id >= MAX_PLAYERS) return;
+    std::lock_guard<std::mutex> lock(roster_mutex_);
+    player_roster_[player_id].name = name;
+    player_roster_[player_id].connected = true;
+    std::printf("[Roster] Player %u name set to '%s'\n", player_id, name.c_str());
+}
+
+NetworkManager::PlayerInfo NetworkManager::get_player_info(uint8_t player_id) const {
+    if (player_id >= MAX_PLAYERS) return {};
+    std::lock_guard<std::mutex> lock(roster_mutex_);
+    return player_roster_[player_id];
+}
+
+void NetworkManager::clear_player_roster() {
+    std::lock_guard<std::mutex> lock(roster_mutex_);
+    for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
+        player_roster_[i] = {};
+    }
+}
+
+void NetworkManager::broadcast_local_name() {
+    if (!is_connected()) return;
+
+    const auto& config = get_config();
+    PlayerJoinPacket pkt{};
+    pkt.header.type = PacketType::PlayerJoin;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    std::strncpy(pkt.player_name, config.player_name.c_str(), 31);
+    pkt.player_name[31] = '\0';
+
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    std::printf("[Roster] Broadcast name '%s' as player %u\n", config.player_name.c_str(), local_player_id_);
 }
 
 } // namespace bknet

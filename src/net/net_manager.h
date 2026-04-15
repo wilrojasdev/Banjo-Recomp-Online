@@ -62,6 +62,7 @@ public:
 
     // Chat
     void send_chat(const std::string& message);
+    void add_system_message(const std::string& message); // Local-only system message (join/leave)
 
     // World state sync (Phase 3)
     void send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id);
@@ -131,6 +132,16 @@ public:
     bool was_unexpectedly_disconnected() const { return unexpected_disconnect_.load(); }
     void clear_disconnect_flag() { unexpected_disconnect_.store(false); }
 
+    // Player roster (names)
+    struct PlayerInfo {
+        std::string name;
+        bool connected = false;
+    };
+    void set_player_name(uint8_t player_id, const std::string& name);
+    PlayerInfo get_player_info(uint8_t player_id) const;
+    void clear_player_roster();
+    void broadcast_local_name();  // Send PlayerJoinPacket with our name
+
     // Accessors
     bool is_connected() const { return state_ == ConnectionState::Hosting || state_ == ConnectionState::Connected; }
     bool is_host() const { return state_ == ConnectionState::Hosting || (coopnet_ && coopnet_->is_lobby_host()); }
@@ -185,6 +196,7 @@ private:
 
     bool initialized_ = false;
     std::atomic<bool> unexpected_disconnect_{false};
+    std::atomic<bool> initial_sync_done_{false}; // false during roster sync phase after join
 
     // Chat state
     mutable std::mutex chat_mutex_;
@@ -216,6 +228,10 @@ private:
     // Queue of level_ids that need state lists sent (flushed in update())
     std::deque<uint32_t> kill_sync_queue_;
     std::deque<uint32_t> collectible_sync_queue_;
+
+    // Player roster
+    mutable std::mutex roster_mutex_;
+    PlayerInfo player_roster_[MAX_PLAYERS];
 
     // Generic packet queue: game thread enqueues, SDL thread sends.
     // ENet is NOT thread-safe — all sends must go through this queue.
