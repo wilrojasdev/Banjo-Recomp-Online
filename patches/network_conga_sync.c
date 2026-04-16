@@ -15,6 +15,10 @@ u32  recomp_net_get_local_player_id(void);
 u32  recomp_net_am_i_world_owner(u32 level_id);
 void recomp_net_send_conga_orange(void *spawn_pos, void *velocity, u32 map_id);
 u32  recomp_net_pop_conga_orange(void *out);
+void recomp_net_send_flag_change(u32 flag_type, u32 flag_index, u32 value, u32 map_id);
+u32  recomp_net_is_host(void);
+
+#define NET_FLAG_CONGA_HIT 10
 
 /* ============================================================
  * Core game function declarations (NOT in headers)
@@ -98,6 +102,27 @@ typedef struct {
 #define CONGA_STATE_BEAT_CHEST_STOP 6
 #define CONGA_STATE_TARGET_BANJO  7
 #define CONGA_STATE_ROAR          8
+
+// TRUE when the LOCAL player triggered Conga's defeat (3rd hit).
+// Used to restrict camera cutscene + dialog to the attacker only.
+static bool local_defeated_conga = FALSE;
+
+/* ============================================================
+ * Helpers
+ * ============================================================ */
+
+/* Find Conga actor in suBaddieActorArray */
+static Actor *find_conga_actor(void) {
+    s32 i;
+    if (!suBaddieActorArray) return (Actor *)0;
+    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (actor->marker && actor->marker->id == MARKER_7_CONGA) {
+            return actor;
+        }
+    }
+    return (Actor *)0;
+}
 
 /* ============================================================
  * Helpers: remote player checks
@@ -255,6 +280,7 @@ static void net_conga_hit_callback(ActorMarker *marker, ActorMarker *other_marke
             actorPtr->unk10_12 = MIN(actorPtr->unk38_31, 0xA);
             if (actorPtr->unk38_31 == 3
                 && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
+                local_defeated_conga = TRUE;
                 subaddie_set_state_with_direction(actorPtr, CONGA_STATE_ROAR, 0, 1);
                 timed_setStaticCameraToNode(0.0f, 0x10);
                 func_80324E38(0.0f, 3);
@@ -267,6 +293,12 @@ static void net_conga_hit_callback(ActorMarker *marker, ActorMarker *other_marke
                     gcdialog_showDialog(ASSET_B39_DIALOG_CONGA_HIT_BY_EGG, 4,
                                          actorPtr->position, 0, 0, 0);
                 }
+            }
+
+            /* Sync hit count to other players */
+            if (recomp_net_is_connected()) {
+                recomp_net_send_flag_change(NET_FLAG_CONGA_HIT,
+                    (u32)actorPtr->unk38_31, (u32)actorPtr->unk10_12, (u32)map_get());
             }
         }
     }
@@ -281,13 +313,17 @@ static void net_conga_jiggy_partner(Actor *jiggy_actor, ActorMarker *conga_marke
 void __chConga_sendOrangeProjectile(ActorMarker *congaMarker);
 
 /* ============================================================
- * RECOMP_PATCH: func_80387100 (jiggy spawn on Conga defeat)
- * Both sides spawn the jiggy — collectible sync deduplicates.
+ * RECOMP_PATCH: func_80387100 (Conga jiggy spawn on defeat)
+ * Both sides spawn — collectible sync deduplicates.
+ * When one player collects, the other's jiggy is despawned by sync.
  * ============================================================ */
 RECOMP_PATCH void func_80387100(ActorMarker *thisMarker) {
     ActorMarker *m = *(ActorMarker **)&thisMarker;
     Actor *actorPtr;
     f32 position[3];
+
+    /* Don't spawn if already collected via network sync (timing race guard) */
+    if (jiggyscore_isCollected(JIGGY_A_MM_CONGA)) return;
 
     actorPtr = marker_getActor(m);
     position[0] = actorPtr->position_x;
@@ -295,6 +331,112 @@ RECOMP_PATCH void func_80387100(ActorMarker *thisMarker) {
     position[2] = actorPtr->position_z;
     bundle_setYaw(0.0f);
     func_80333270(JIGGY_A_MM_CONGA, position, net_conga_jiggy_partner, m);
+}
+
+/* ============================================================
+ * RECOMP_PATCH: __chlmonkey_complete (Chimpy tree cutscene)
+ * Camera + sound only for the local player nearby.
+ * Ghost just gets the state transition + jiggy spawn.
+ * ============================================================ */
+RECOMP_PATCH void __chlmonkey_spawnJiggy(s32 x, s32 y, s32 z); // forward decl
+
+RECOMP_PATCH void __chlmonkey_complete(ActorMarker *marker, enum asset_e unused_1, s32 unused_2) {
+    Actor *actor = marker_getActor(marker);
+
+    mapSpecificFlags_set(MM_SPECIFIC_FLAG_4_SHAKE, TRUE);
+    subaddie_set_state(actor, 3); // LMONKEY_STATE_3_WALKING
+
+    // Jiggy spawn runs on all sides (collectible sync deduplicates)
+    timedFunc_set_3(2.9f, (void *)__chlmonkey_spawnJiggy,
+        (s32)actor->position_x, (s32)(actor->position_y + 150.0f), (s32)actor->position_z);
+
+    // Camera cutscene only for the local player, not the ghost
+    if (!recomp_net_is_connected() || subaddie_playerIsWithinSphereAndActive(actor, 700)) {
+        timed_setStaticCameraToNode(2.3f, 0x12);
+        timed_exitStaticCamera(4.3f);
+        func_80324E38(4.3f, 0);
+    }
+}
+
+/* ============================================================
+ * RECOMP_PATCH: __chlmonkey_spawnJiggy (Chimpy jiggy spawn)
+ * Both sides spawn — collectible sync deduplicates.
+ * ============================================================ */
+RECOMP_PATCH void __chlmonkey_spawnJiggy(s32 x, s32 y, s32 z) {
+    f32 pos[3];
+    if (jiggyscore_isCollected(JIGGY_9_MM_CHIMPY)) return;
+    pos[0] = (f32)x;
+    pos[1] = (f32)y;
+    pos[2] = (f32)z;
+    jiggy_spawn(JIGGY_9_MM_CHIMPY, pos);
+}
+
+/* ============================================================
+ * RECOMP_PATCH: spawnJiggy (Orange Pad jiggy spawn)
+ * Both sides spawn — collectible sync deduplicates.
+ * ============================================================ */
+RECOMP_PATCH void spawnJiggy(s32 x, s32 y, s32 z) {
+    f32 pos[3];
+    if (jiggyscore_isCollected(JIGGY_8_MM_ORANGE_PADS)) return;
+    pos[0] = (f32)x;
+    pos[1] = (f32)y;
+    pos[2] = (f32)z;
+    jiggy_spawn(JIGGY_8_MM_ORANGE_PADS, pos);
+}
+
+/* ============================================================
+ * RECOMP_PATCH: __chjuju_spawnJiggy (Juju jiggy spawn)
+ * Both sides spawn — collectible sync deduplicates.
+ * ============================================================ */
+RECOMP_PATCH void __chjuju_spawnJiggy(s32 x, s32 y, s32 z, s32 yaw) {
+    f32 pos[3];
+    if (jiggyscore_isCollected(JIGGY_4_MM_JUJU)) return;
+    pos[0] = (f32)x;
+    pos[1] = (f32)y + 20.0f;
+    pos[2] = (f32)z;
+    jiggy_spawn(JIGGY_4_MM_JUJU, pos);
+}
+
+/* ============================================================
+ * RECOMP_PATCH: __chlmonkey_updateBringOrange (Chimpy delivery)
+ * In multiplayer, any player can deliver the orange to Chimpy
+ * once FLAG_1 (orange collected) is set — no need to carry it.
+ * ============================================================ */
+extern void player_setCarryObjectPoseInHorizontalRadius(f32 *, f32, s32, Actor **);
+extern s32  bacarry_get_markerId(void);
+extern s32  player_throwCarriedObject(void);
+extern void func_8028FA34(s32, Actor *);
+
+RECOMP_PATCH void __chlmonkey_updateBringOrange(Actor **this_ptr) {
+    /* Original: try to make player carry orange within radius */
+    player_setCarryObjectPoseInHorizontalRadius(
+        (*this_ptr)->position, 800.0f,
+        ACTOR_29_ORANGE_COLLECTIBLE, this_ptr);
+
+    /* Original: player carrying orange, near Chimpy, and throws it */
+    if (subaddie_playerIsWithinSphereAndActive(*this_ptr, 345)
+        && bacarry_get_markerId() == MARKER_36_ORANGE_COLLECTIBLE
+        && player_throwCarriedObject()) {
+        func_8028FA34(0xc6, *this_ptr);
+        (*this_ptr)->has_met_before = TRUE;
+        timed_setStaticCameraToNode(1.2f, 0xF);
+        func_80324E38(1.2f, 3);
+        return;
+    }
+
+    /* MULTIPLAYER: if orange was collected (by any player) and local player
+     * is near Chimpy, auto-deliver without needing to carry the orange. */
+    if (recomp_net_is_connected()
+        && mapSpecificFlags_get(MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED)
+        && !mapSpecificFlags_get(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED)
+        && !(*this_ptr)->has_met_before
+        && subaddie_playerIsWithinSphereAndActive(*this_ptr, 345)) {
+        func_8028FA34(0xc6, *this_ptr);
+        (*this_ptr)->has_met_before = TRUE;
+        timed_setStaticCameraToNode(1.2f, 0xF);
+        func_80324E38(1.2f, 3);
+        mapSpecificFlags_set(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED, TRUE);
+    }
 }
 
 /* ============================================================
@@ -459,8 +601,12 @@ RECOMP_PATCH void chConga_update(Actor *this) {
         actor_playAnimationOnce(this);
         if (actor_animationIsAt(this, 0.99f)) {
             subaddie_set_state_with_direction(this, CONGA_STATE_MOPEY, 0.0f, 1);
-            gcdialog_showDialog(ASSET_B38_DIALOG_CONGA_DEFEAT, 0xe, this->position,
-                                 this->marker, (void *)net_conga_defeat_dialog_cb, NULL);
+            // Only show defeat dialog + camera cutscene for the player who hit Conga,
+            // or in single-player. Ghost players just see the state transition.
+            if (!recomp_net_is_connected() || local_defeated_conga) {
+                gcdialog_showDialog(ASSET_B38_DIALOG_CONGA_DEFEAT, 0xe, this->position,
+                                     this->marker, (void *)net_conga_defeat_dialog_cb, NULL);
+            }
         }
 
     } else if (this->state == CONGA_STATE_MOPEY) {
@@ -563,39 +709,114 @@ RECOMP_PATCH void __chConga_sendOrangeProjectile(ActorMarker *congaMarker) {
     congaPtr->actor_specific_1_f = 2.0f;
     cur_map = (u32)map_get();
 
-    /* Spawn orange for LOCAL player — only if in Conga's throw sphere */
-    {
-        f32 plyr_pos[3];
-        player_getPosition(plyr_pos);
-        if (is_in_sphere(congaPtr, plyr_pos[0], plyr_pos[2], (f32)CONGA_THROW_SPHERE)) {
-            spawn_orange_at_target(conga_localPtr, congaPtr, plyr_pos, conga_state, cur_map);
+    if (conga_state == CONGA_STATE_TARGET_BANJO) {
+        /*
+         * TARGET_BANJO (tree-top fight): fire ONE orange at the nearest player
+         * in the tree zone. Shared boss fight — hits count for everyone.
+         */
+        f32 best_target[3];
+        f32 best_dist = 999999999.0f;
+        bool found = FALSE;
+
+        /* Check local player */
+        {
+            f32 plyr_pos[3];
+            player_getPosition(plyr_pos);
+            if (plyr_pos[1] >= 300.0f && plyr_pos[1] <= 600.0f
+                && (SQ(plyr_pos[0] - CONGA_TREE_X) + SQ(plyr_pos[2] - CONGA_TREE_Z)) < CONGA_TREE_RADIUS_SQ) {
+                f32 d = SQ(plyr_pos[0] - congaPtr->position_x) + SQ(plyr_pos[2] - congaPtr->position_z);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_target[0] = plyr_pos[0];
+                    best_target[1] = plyr_pos[1];
+                    best_target[2] = plyr_pos[2];
+                    found = TRUE;
+                }
+            }
         }
-    }
 
-    /* Spawn oranges for REMOTE players in zone */
-    if (recomp_net_is_connected()) {
-        u32 local_id = recomp_net_get_local_player_id();
-        RemoteState rs;
-
-        for (i = 0; i < 4; i++) {
-            if (i == local_id) continue;
-            if (!recomp_net_get_remote_state(i, &rs)) continue;
-            if (rs.map_id != cur_map) continue;
-            if (!is_in_sphere(congaPtr, rs.x, rs.z, (f32)CONGA_THROW_SPHERE)) continue;
-
-            if (conga_state == CONGA_STATE_TARGET_BANJO) {
+        /* Check remote players */
+        if (recomp_net_is_connected()) {
+            u32 local_id = recomp_net_get_local_player_id();
+            RemoteState rs;
+            for (i = 0; i < 4; i++) {
+                if (i == local_id) continue;
+                if (!recomp_net_get_remote_state(i, &rs)) continue;
+                if (rs.map_id != cur_map) continue;
                 if (rs.y < 300.0f || rs.y > 600.0f) continue;
                 if (SQ(rs.x - CONGA_TREE_X) + SQ(rs.z - CONGA_TREE_Z) >= CONGA_TREE_RADIUS_SQ) continue;
-            }
-
-            {
-                f32 remote_target[3];
-                remote_target[0] = rs.x;
-                remote_target[1] = rs.y;
-                remote_target[2] = rs.z;
-                spawn_orange_at_target(conga_localPtr, congaPtr, remote_target, conga_state, cur_map);
+                {
+                    f32 d = SQ(rs.x - congaPtr->position_x) + SQ(rs.z - congaPtr->position_z);
+                    if (d < best_dist) {
+                        best_dist = d;
+                        best_target[0] = rs.x;
+                        best_target[1] = rs.y;
+                        best_target[2] = rs.z;
+                        found = TRUE;
+                    }
+                }
             }
         }
+
+        if (found) {
+            spawn_orange_at_target(conga_localPtr, congaPtr, best_target, conga_state, cur_map);
+        }
+    } else {
+        /*
+         * TARGET_GROUND: fire at each player in the throw sphere independently.
+         */
+
+        /* Local player */
+        {
+            f32 plyr_pos[3];
+            player_getPosition(plyr_pos);
+            if (is_in_sphere(congaPtr, plyr_pos[0], plyr_pos[2], (f32)CONGA_THROW_SPHERE)) {
+                spawn_orange_at_target(conga_localPtr, congaPtr, plyr_pos, conga_state, cur_map);
+            }
+        }
+
+        /* Remote players */
+        if (recomp_net_is_connected()) {
+            u32 local_id = recomp_net_get_local_player_id();
+            RemoteState rs;
+            for (i = 0; i < 4; i++) {
+                if (i == local_id) continue;
+                if (!recomp_net_get_remote_state(i, &rs)) continue;
+                if (rs.map_id != cur_map) continue;
+                if (!is_in_sphere(congaPtr, rs.x, rs.z, (f32)CONGA_THROW_SPHERE)) continue;
+                {
+                    f32 remote_target[3];
+                    remote_target[0] = rs.x;
+                    remote_target[1] = rs.y;
+                    remote_target[2] = rs.z;
+                    spawn_orange_at_target(conga_localPtr, congaPtr, remote_target, conga_state, cur_map);
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * Receive Conga hit sync from remote player.
+ * Called from bkrecomp_net_process_flag_event in network_flag_sync.c
+ * ============================================================ */
+RECOMP_EXPORT void bkrecomp_net_apply_conga_hit(u32 remote_unk38, u32 remote_unk10) {
+    Actor *conga = find_conga_actor();
+    if (!conga) return;
+
+    /* Only apply if remote hit count is higher (monotonic — prevents revert) */
+    if ((s32)remote_unk38 <= conga->unk38_31) return;
+
+    conga->unk38_31 = (s32)remote_unk38;
+    conga->unk10_12 = (s32)remote_unk10;
+    ((ActorLocal_Conga *)&conga->local)->unkC = 0;
+
+    if (conga->unk38_31 >= 3 && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
+        /* Defeat — update state/animation but skip camera + SFX for remote player */
+        subaddie_set_state_with_direction(conga, CONGA_STATE_ROAR, 0, 1);
+    } else if (conga->state != CONGA_STATE_MOPEY && conga->state != CONGA_STATE_ROAR) {
+        /* Hit reaction — just update state, no SFX on remote side */
+        subaddie_set_state_with_direction(conga, CONGA_STATE_HIT, 0, -1);
     }
 }
 

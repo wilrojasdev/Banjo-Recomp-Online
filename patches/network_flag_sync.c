@@ -3,6 +3,7 @@
 #include "enums.h"
 
 extern Actor *actorArray_findActorFromMarkerId(s32);
+extern void bkrecomp_net_apply_conga_hit(u32 remote_unk38, u32 remote_unk10);
 
 // Network bridge
 void recomp_net_send_flag_change(u32 flag_type, u32 flag_index, u32 value, u32 map_id);
@@ -402,6 +403,8 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
     } else if (ft == NET_FLAG_JUJU_ACTION) {
         bkrecomp_net_juju_remote_hit((u32)idx, evt->flag_map_id);
         recomp_printf("[JUJU-SYNC] remote hit count=%d map=%d\n", idx, evt->flag_map_id);
+    } else if (ft == 10) { /* NET_FLAG_CONGA_HIT */
+        bkrecomp_net_apply_conga_hit((u32)idx, (u32)evt->flag_value);
     } else if (ft == NET_FLAG_MUMBO_ACTION) {
         if (idx == MUMBO_ACTION_LOCK) {
             if (net_mumbo_lock((u8)val)) {

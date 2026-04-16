@@ -48,6 +48,9 @@ extern void anctrl_setAnimTimer(AnimCtrl *this, f32 timer);
 extern ActorMarker *baMarker_get(void);
 extern void player_getPosition(f32 pos[3]);
 
+// Jiggy spawn (for jinjo completion)
+extern void jiggy_spawn(enum jiggy_e jiggy_id, f32 pos[3]);
+
 // Bundle/item drop system (honeycomb on enemy kill)
 extern Actor *__bundle_spawnFromFirstActor(enum bundle_e bundle_id, Actor *actor);
 extern Actor *bundle_spawn_f32(enum bundle_e bundle_id, f32 position[3]);
@@ -65,6 +68,9 @@ static bool is_killable_enemy(Actor *actor) {
     if (df == (MarkerCollisionFunc)net_enemy_die_proxy) return TRUE;
     return TRUE;
 }
+
+// Jiggy actor local ID
+extern enum jiggy_e chjiggy_getJiggyId(Actor *this);
 
 // Score pointers
 extern u8 *jiggyscore_getPtr(void);
@@ -312,6 +318,7 @@ static u8  prev_mumboscore[16] = {0};
 extern void bkrecomp_net_hide_note(u32 note_index);
 extern void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz);
 extern bool is_note_collected(s32 map_id, s32 level_id, u8 note_index);
+extern void set_note_collected(s32 map_id, s32 level_id, u8 note_index);
 static u8  prev_honeycombscore[3] = {0};
 static s32 prev_lives = 0;
 // Debug: track jiggy total changes from ANY source
@@ -364,6 +371,23 @@ static bool despawn_nearest_actor(u32 marker_id, f32 px, f32 py, f32 pz) {
     if (best_actor) {
         marker_despawn(best_actor->marker);
         return TRUE;
+    }
+    return FALSE;
+}
+
+// Despawn the jiggy actor matching a specific jiggy ID (e.g. JIGGY_A_MM_CONGA).
+// Unlike marker-based despawn, this checks each jiggy actor's local ID to find
+// the correct one, avoiding despawning unrelated jiggies.
+static bool despawn_jiggy_by_id(u16 jiggy_id) {
+    if (!suBaddieActorArray) return FALSE;
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker || actor->marker->id != MARKER_52_JIGGY) continue;
+        if ((u16)chjiggy_getJiggyId(actor) == jiggy_id) {
+            marker_despawn(actor->marker);
+            return TRUE;
+        }
     }
     return FALSE;
 }
@@ -721,7 +745,7 @@ static void process_collectible_event(WorldEventData *evt) {
                 recomp_printf("[JIGGY-DEBUG] RESYNC skip jiggy %d (already collected)\n", evt->coll_id);
             }
             if (cur_map == evt->coll_map_id) {
-                despawn_actor_by_marker_id(MARKER_52_JIGGY);
+                despawn_jiggy_by_id(evt->coll_id);
             }
         } else if (ct == COLLECTIBLE_EMPTY_HONEYCOMB) {
             if (!honeycombscore_get(evt->coll_id)) {
@@ -787,15 +811,22 @@ static void process_collectible_event(WorldEventData *evt) {
                 dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
                 { u8 *s = jiggyscore_getPtr(); if (s) { s32 i; for (i=0;i<0xD;i++) prev_jiggyscore[i]=s[i]; } }
                 if (same_map) {
-                    despawn_actor_by_marker_id(MARKER_52_JIGGY);
-                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                    despawn_jiggy_by_id(evt->coll_id);
                 }
             }
         } else if (ct == COLLECTIBLE_NOTE) {
-            // Notes are per-level, only apply if on the same level
-            if (same_level) {
+            // Notes are per-level, only apply if on the same level.
+            // Always mark the bitfield so the note stays collected across map transitions.
+            if (same_level && evt->coll_id != 0xFFFE) {
+                bool already = is_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id);
+                if (!already) {
+                    set_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id);
+                    item_inc(ITEM_C_NOTE);
+                }
+            } else if (same_level && evt->coll_id == 0xFFFE) {
                 item_inc(ITEM_C_NOTE);
             }
+            // Visual despawn only when on the same map
             if (same_map) {
                 if (evt->coll_id == 0xFFFE) {
                     despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
@@ -806,8 +837,18 @@ static void process_collectible_event(WorldEventData *evt) {
         } else if (ct == COLLECTIBLE_JINJO) {
             // Jinjos are per-level — ONLY apply if on the same level.
             if (same_level) {
-                item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
+                s32 result = item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
                 prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+                // All 5 jinjos collected (0x1f) — spawn the jinjo jiggy on this side too.
+                // The collecting player spawns it via the jinjo actor callback,
+                // but remote players need it spawned explicitly here.
+                if (result == 0x1f && same_map) {
+                    f32 jiggy_pos[3];
+                    jiggy_pos[0] = evt->coll_pos_x;
+                    jiggy_pos[1] = evt->coll_pos_y + 50.0f;
+                    jiggy_pos[2] = evt->coll_pos_z;
+                    jiggy_spawn(10 * (s32)level_get() - 9, jiggy_pos);
+                }
             }
             if (same_map) {
                 u32 bit = evt->coll_id;
@@ -829,9 +870,18 @@ static void process_collectible_event(WorldEventData *evt) {
                     item_adjustByDiffWithoutHud(ITEM_1C_MUMBO_TOKEN, 1);
                 }
                 { u8 *s = func_80321538(); if (s) { s32 i; for (i=0;i<16;i++) prev_mumboscore[i]=s[i]; } }
-                if (same_map) {
-                    despawn_actor_by_marker_id(MARKER_39_MUMBO_TOKEN);
-                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                if (same_map && suBaddieActorArray) {
+                    s32 i;
+                    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+                        Actor *actor = &suBaddieActorArray->data[i];
+                        if (!actor->marker) continue;
+                        if (actor->marker->id != MARKER_39_MUMBO_TOKEN) continue;
+                        s32 uid = *(s32*)&actor->local;
+                        if (uid == (s32)evt->coll_id) {
+                            marker_despawn(actor->marker);
+                            break;
+                        }
+                    }
                 }
             }
         } else if (ct == COLLECTIBLE_DESPAWN_ONLY) {
@@ -849,9 +899,18 @@ static void process_collectible_event(WorldEventData *evt) {
                     item_adjustByDiffWithoutHud(ITEM_13_EMPTY_HONEYCOMB, 1);
                 }
                 { u8 *s = honeycombscore_get_ptr(); if (s) { s32 i; for(i=0;i<3;i++) prev_honeycombscore[i]=s[i]; } }
-                if (same_map) {
-                    despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
-                    bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                if (same_map && suBaddieActorArray) {
+                    s32 i;
+                    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+                        Actor *actor = &suBaddieActorArray->data[i];
+                        if (!actor->marker) continue;
+                        if (actor->marker->id != MARKER_53_EMPTY_HONEYCOMB) continue;
+                        s32 uid = *(s32*)&actor->local;
+                        if (uid == (s32)evt->coll_id) {
+                            marker_despawn(actor->marker);
+                            break;
+                        }
+                    }
                 }
             }
         } else if (ct == COLLECTIBLE_EXTRA_LIFE) {

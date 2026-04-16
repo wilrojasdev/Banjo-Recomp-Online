@@ -198,6 +198,7 @@ enum WorldFlagType : uint8_t {
     FLAG_BOTTLES_ACTION = 6,      // Bottles NPC lock/unlock (one player at a time)
     FLAG_HUT_ACTION     = 8,      // MM hut destruction sync (spawn_index in flag_index, smashCount in value)
     FLAG_JUJU_ACTION    = 9,      // MM Juju totem segment hit sync (hit_count in flag_index)
+    FLAG_CONGA_HIT      = 10,     // Conga hit count sync (flag_index=unk38_31, value=unk10_12)
 };
 
 struct WorldFlagPacket {

@@ -82,6 +82,10 @@ extern f32 func_80257A44(f32 a, f32 b);
 extern bool bkrecomp_net_mumbo_is_locked(void);
 extern u8 bkrecomp_net_mumbo_get_lock_owner(void);
 
+// commonParticle.h provides: commonParticle_new, projectile_setPosition, etc.
+// Feather visual actor spawning (from code_51950.c)
+extern void func_8032AA58(Actor *, f32);  // set actor lifetime/fade speed
+
 // Asset cache (assetcache_get already in functions.h)
 extern void assetcache_release(void *bin);
 
@@ -98,6 +102,8 @@ typedef struct {
     u8 prev_bs_state;
     u8 dust_cooldown;
     bool bbuster_dust_done; // Prevent bbuster dust from firing twice (impact + bounce)
+    bool egg_fired;       // Prevent multiple egg spawns per animation
+    u8 feather_cooldown;  // Cooldown ticks between feather particle spawns
     bool initialized;
     // Transformation particle emitters
     ParticleEmitter *xform_emit_blue;
@@ -345,6 +351,61 @@ static void ghost_xform_particles_update(GhostModel *gm, f32 gx, f32 gy, f32 gz)
     particleEmitter_emitN(gm->xform_emit_blue, 1);
 }
 
+// Spawn a visual-only egg particle at the ghost's position.
+// Uses the game's commonParticle system, then relocates to ghost pos/yaw.
+static void ghost_spawn_egg(f32 gx, f32 gy, f32 gz, f32 gyaw, s32 type) {
+    // type: 1 = head egg (forward), 4 = ass egg (backward)
+    s32 idx = commonParticle_new(type, 1);
+    if (idx < 0) return;
+
+    CommonParticle *p = commonParticle_getCurrentParticle();
+    u8 proj_idx = p->projectileIndex;
+    u8 phys_idx = p->unk47;
+
+    f32 rad = gyaw * (3.14159265f / 180.0f);
+    f32 fwd_x = sinf(rad);
+    f32 fwd_z = cosf(rad);
+
+    f32 egg_pos[3];
+    f32 egg_vel[3];
+
+    if (type == 1) {
+        // Head egg: spawn in front of ghost, fly forward
+        egg_pos[0] = gx + fwd_x * 70.0f;
+        egg_pos[1] = gy + 80.0f;
+        egg_pos[2] = gz + fwd_z * 70.0f;
+        egg_vel[0] = fwd_x * 800.0f;
+        egg_vel[1] = 0.0f;
+        egg_vel[2] = fwd_z * 800.0f;
+    } else {
+        // Ass egg: spawn behind ghost, lob backward+up
+        egg_pos[0] = gx - fwd_x * 18.0f;
+        egg_pos[1] = gy + 60.0f;
+        egg_pos[2] = gz - fwd_z * 18.0f;
+        egg_vel[0] = -fwd_x * 200.0f;
+        egg_vel[1] = 710.0f;
+        egg_vel[2] = -fwd_z * 200.0f;
+    }
+
+    projectile_setPosition(proj_idx, egg_pos);
+    func_80344D94(phys_idx, egg_pos);
+    func_80344E3C(phys_idx, egg_vel);
+}
+
+// Spawn a decorative feather actor at ghost position (replicates func_802D8B20)
+static void ghost_spawn_feather(f32 gx, f32 gy, f32 gz, f32 gyaw, bool gold) {
+    f32 pos[3] = {gx, gy, gz};
+    s32 yaw_offset = (randf() > 0.5f) ? 30 : -30;
+    // 0x1FF = red feather visual, 0x200 = gold feather visual
+    Actor *feather = actor_spawnWithYaw_f32(gold ? 0x200 : 0x1FF, pos, (s32)(gyaw + yaw_offset));
+    if (feather) {
+        func_8032AA58(feather, 0.45f);
+        feather->actor_specific_1_f = 22.0f;
+        feather->unk1C[1] = 48.0f;
+        feather->lifetime_value = 1.2f;
+    }
+}
+
 void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     if (!recomp_net_is_connected()) return;
     if (!baModelBin) return;
@@ -528,6 +589,50 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
             if (gm->xform_particles_active) {
                 ghost_xform_particles_update(gm, rs.x, rs.y, rs.z);
+            }
+        }
+
+        // === Egg projectile visual for ghost ===
+        {
+            bool is_egg_head = (rs.bs_state == BS_9_EGG_HEAD);
+            bool is_egg_ass  = (rs.bs_state == BS_A_EGG_ASS);
+            bool was_egg     = (gm->prev_bs_state == BS_9_EGG_HEAD || gm->prev_bs_state == BS_A_EGG_ASS);
+
+            // Reset fire flag when entering egg state
+            if ((is_egg_head || is_egg_ass) && !was_egg) {
+                gm->egg_fired = FALSE;
+            }
+
+            // Spawn egg at the trigger animation frame
+            if (!gm->egg_fired) {
+                if (is_egg_head && rs.anim_timer >= 0.47f) {
+                    ghost_spawn_egg(rs.x, rs.y, rs.z, rs.yaw, 1);
+                    gm->egg_fired = TRUE;
+                } else if (is_egg_ass && rs.anim_timer >= 0.38f) {
+                    ghost_spawn_egg(rs.x, rs.y, rs.z, rs.yaw, 4);
+                    gm->egg_fired = TRUE;
+                }
+            }
+        }
+
+        // === Feather particles for ghost (flying = red, wonderwing = gold) ===
+        {
+            bool is_flying = (rs.bs_state == BS_24_FLY);
+            bool is_wonderwing = (rs.bs_state == BS_1A_WONDERWING_ENTER
+                               || rs.bs_state == BS_1B_WONDERWING_IDLE
+                               || rs.bs_state == BS_1C_WONDERWING_WALK
+                               || rs.bs_state == BS_1D_WONDERWING_JUMP);
+
+            if (gm->feather_cooldown > 0) gm->feather_cooldown--;
+
+            if (gm->feather_cooldown == 0) {
+                if (is_flying) {
+                    ghost_spawn_feather(rs.x, rs.y, rs.z, rs.yaw, FALSE);
+                    gm->feather_cooldown = 15;  // ~every 0.5s at 30fps
+                } else if (is_wonderwing) {
+                    ghost_spawn_feather(rs.x, rs.y, rs.z, rs.yaw, TRUE);
+                    gm->feather_cooldown = 10;  // slightly faster for gold
+                }
             }
         }
 
