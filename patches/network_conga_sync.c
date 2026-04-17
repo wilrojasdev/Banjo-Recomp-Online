@@ -152,6 +152,22 @@ static bool net_anyPlayerInSphere(Actor *actor, f32 radius) {
     return FALSE;
 }
 
+/* Local-only tree check — used for scene-local dialogs that must not
+ * trigger on remote machines when another player climbs the tree. */
+static bool net_isLocalPlayerNearTree(Actor *this) {
+    f32 plyr_pos[3];
+
+    if (map_get() != MAP_2_MM_MUMBOS_MOUNTAIN) return FALSE;
+
+    player_getPosition(plyr_pos);
+    if (plyr_pos[1] >= 300.0f && plyr_pos[1] <= 600.0f) {
+        if (SQ(plyr_pos[0] - CONGA_TREE_X) + SQ(plyr_pos[2] - CONGA_TREE_Z) < CONGA_TREE_RADIUS_SQ) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* Replaces __chConga_isPlayerNearCongaTree — checks ALL players */
 static bool net_isAnyPlayerNearTree(Actor *this) {
     f32 plyr_pos[3];
@@ -494,16 +510,23 @@ RECOMP_PATCH void chConga_update(Actor *this) {
     sp3C = net_anyPlayerInSphere(this, (f32)CONGA_THROW_SPHERE);
 
     /* --- Safe up here dialog --- */
-    /* NOTE: func_8032A9E4 check omitted (calling convention mismatch).
-     * unk138_23 guards this to run at most once anyway. */
+    /* Scene-local: only fire when THIS machine's player is on the tree-top
+     * platform. func_8032A9E4 is replaced with a tree-zone proximity check
+     * (elevation + radius around the tree). The map flag still broadcasts
+     * to activate Conga's ballistic mode on all clients. */
     if (!this->unk138_23
+        && net_isLocalPlayerNearTree(this)
         && gcdialog_showDialog(ASSET_B37_DIALOG_CONGA_SAFE_UP_HERE, 0, 0, 0, 0, 0)) {
         this->unk138_23 = 1;
         mapSpecificFlags_set(MM_SPECIFIC_FLAG_A_UNKNOWN, TRUE);
     }
 
     /* --- First meeting dialog --- */
-    if (sp3C && !this->has_met_before) {
+    /* Scene-local: each player sees their own first-meeting dialog only
+     * when THEY enter Conga's throw sphere. Using sp3C here would leak
+     * the dialog to remote players when only another client is nearby. */
+    if (subaddie_playerIsWithinSphereAndActive(this, CONGA_THROW_SPHERE)
+        && !this->has_met_before) {
         if (gcdialog_showDialog(
                 (player_getTransformation() == TRANSFORM_2_TERMITE)
                     ? ASSET_B3E_DIALOG_CONGA_MEET_AS_TERMITE
@@ -627,7 +650,6 @@ RECOMP_PATCH void chConga_update(Actor *this) {
     /* --- Throw trigger (same as original) --- */
     if ((this->state == CONGA_STATE_TARGET_GROUND && actor_animationIsAt(this, 0.56f))
         || (this->state == CONGA_STATE_TARGET_BANJO && actor_animationIsAt(this, 0.468f))) {
-        recomp_printf("[CONGA-DBG] THROW TRIGGER! state=%d\n", this->state);
         func_8034A1B4(this->marker->unk44, 5, &this->local);
         __spawnQueue_add_1((GenFunction_1)__chConga_sendOrangeProjectile, (s32)this->marker);
     }
