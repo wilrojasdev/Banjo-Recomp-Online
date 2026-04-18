@@ -107,6 +107,15 @@ typedef struct {
 // Used to restrict camera cutscene + dialog to the attacker only.
 static bool local_defeated_conga = FALSE;
 
+// TRUE when the LOCAL player handed the orange to Chimpy. Gates the
+// completion dialog + camera so remote ghosts don't see the cutscene
+// when their MM_SPECIFIC_FLAG_2 receives the sync.
+static bool local_chimpy_delivered = FALSE;
+
+// TRUE when the LOCAL player's orange hit the final pad that triggered
+// the JIGGY_8 spawn cutscene. Gates the camera/dialog/fanfare.
+static bool local_orangepad_triggered = FALSE;
+
 /* ============================================================
  * Helpers
  * ============================================================ */
@@ -275,9 +284,16 @@ static void net_conga_set_state_sfx(Actor *this, s32 anim_id) {
     func_8030E58C(SFX_24_KONGA_NOISE_3, randf2(0.9f, 1.1f));
 }
 
-/* func_80387370 — defeat dialog callback */
+/* func_80387370 — defeat dialog callback.
+ * Scene-local bits (camera 0x11, ending fade) only run on the defeater.
+ * velocity_x is set unconditionally: for the defeater it feeds the local
+ * countdown; for any non-defeater path that somehow reaches this callback,
+ * velocity_x is redundant since apply_conga_hit already primed it. */
 static void net_conga_defeat_dialog_cb(ActorMarker *this_marker, enum asset_e text_id, s32 arg2) {
     marker_getActor(this_marker)->velocity_x = 9.0f;
+    if (recomp_net_is_connected() && !local_defeated_conga) {
+        return;
+    }
     timed_setStaticCameraToNode(0.0f, 0x11);
     timed_exitStaticCamera(3.2f);
     func_80324E38(3.2f, 0);
@@ -296,12 +312,22 @@ static void net_conga_hit_callback(ActorMarker *marker, ActorMarker *other_marke
             actorPtr->unk10_12 = MIN(actorPtr->unk38_31, 0xA);
             if (actorPtr->unk38_31 == 3
                 && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
-                local_defeated_conga = TRUE;
-                subaddie_set_state_with_direction(actorPtr, CONGA_STATE_ROAR, 0, 1);
-                timed_setStaticCameraToNode(0.0f, 0x10);
-                func_80324E38(0.0f, 3);
-                FUNC_8030E624(SFX_84_GOBI_CRYING, 0.8f, 32750);
-                FUNC_8030E624(SFX_84_GOBI_CRYING, 0.8f, 32750);
+                /* Race-condition guard: if we already applied a remote
+                 * defeat (state=ROAR and local_defeated_conga still FALSE),
+                 * do not overwrite with local camera/SFX. */
+                if (recomp_net_is_connected()
+                    && actorPtr->state == CONGA_STATE_ROAR
+                    && !local_defeated_conga) {
+                    /* Remote already applied the defeat; skip local
+                     * camera/SFX to avoid double-firing. */
+                } else {
+                    local_defeated_conga = TRUE;
+                    subaddie_set_state_with_direction(actorPtr, CONGA_STATE_ROAR, 0, 1);
+                    timed_setStaticCameraToNode(0.0f, 0x10);
+                    func_80324E38(0.0f, 3);
+                    FUNC_8030E624(SFX_84_GOBI_CRYING, 0.8f, 32750);
+                    FUNC_8030E624(SFX_84_GOBI_CRYING, 0.8f, 32750);
+                }
             } else if (actorPtr->state != CONGA_STATE_MOPEY
                 && actorPtr->state != CONGA_STATE_ROAR) {
                 net_conga_set_state_sfx(actorPtr, CONGA_STATE_HIT);
@@ -341,6 +367,9 @@ RECOMP_PATCH void func_80387100(ActorMarker *thisMarker) {
     /* Don't spawn if already collected via network sync (timing race guard) */
     if (jiggyscore_isCollected(JIGGY_A_MM_CONGA)) return;
 
+    /* The jiggy spawn itself is shared across all players — everyone sees
+     * the reward appear at Conga. Only the defeat dialog + camera cutscene
+     * are scene-local (guarded in chConga_update / net_conga_defeat_dialog_cb). */
     actorPtr = marker_getActor(m);
     position[0] = actorPtr->position_x;
     position[1] = actorPtr->position_y + 60.0f;
@@ -435,6 +464,7 @@ RECOMP_PATCH void __chlmonkey_updateBringOrange(Actor **this_ptr) {
         && player_throwCarriedObject()) {
         func_8028FA34(0xc6, *this_ptr);
         (*this_ptr)->has_met_before = TRUE;
+        local_chimpy_delivered = TRUE;
         timed_setStaticCameraToNode(1.2f, 0xF);
         func_80324E38(1.2f, 3);
         return;
@@ -449,6 +479,7 @@ RECOMP_PATCH void __chlmonkey_updateBringOrange(Actor **this_ptr) {
         && subaddie_playerIsWithinSphereAndActive(*this_ptr, 345)) {
         func_8028FA34(0xc6, *this_ptr);
         (*this_ptr)->has_met_before = TRUE;
+        local_chimpy_delivered = TRUE;
         timed_setStaticCameraToNode(1.2f, 0xF);
         func_80324E38(1.2f, 3);
         mapSpecificFlags_set(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED, TRUE);
@@ -484,6 +515,10 @@ RECOMP_PATCH void chConga_update(Actor *this) {
     }
 
     /* --- Jiggy countdown after defeat --- */
+    /* velocity_x is set to 9.0 by the defeat dialog callback on the player
+     * who defeated Conga, and by bkrecomp_net_apply_conga_hit on remote
+     * clients, so the jiggy spawn runs on every machine. The dialog and
+     * camera cues themselves stay scene-local. */
     if (0.0f != this->velocity_x) {
         this->velocity_x -= 1.0f;
         if (0.0f == this->velocity_x) {
@@ -836,6 +871,11 @@ RECOMP_EXPORT void bkrecomp_net_apply_conga_hit(u32 remote_unk38, u32 remote_unk
     if (conga->unk38_31 >= 3 && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
         /* Defeat — update state/animation but skip camera + SFX for remote player */
         subaddie_set_state_with_direction(conga, CONGA_STATE_ROAR, 0, 1);
+        /* Shared jiggy spawn: mirror velocity_x=9 here so the countdown runs
+         * on remote clients too and func_80387100 spawns the jiggy for
+         * everyone. The ROAR-state dialog + camera still only fire for the
+         * defeater (gated by local_defeated_conga in chConga_update). */
+        conga->velocity_x = 9.0f;
     } else if (conga->state != CONGA_STATE_MOPEY && conga->state != CONGA_STATE_ROAR) {
         /* Hit reaction — just update state, no SFX on remote side */
         subaddie_set_state_with_direction(conga, CONGA_STATE_HIT, 0, -1);
@@ -867,4 +907,210 @@ RECOMP_EXPORT void bkrecomp_net_process_conga_oranges(void) {
             orangePtr->velocity_z = evt.vel_z;
         }
     }
+}
+
+/* ============================================================
+ * RECOMP_PATCH: chlmonkey_update (Chimpy state machine)
+ * Scene-local: completion dialog + camera only fire on the player who
+ * delivered the orange. Remote clients still see Chimpy walk away and
+ * the jiggy spawn (shared). Meeting dialog already local by radius.
+ * ============================================================ */
+extern void func_8028E668(f32 *pos, f32 a, f32 b, f32 c);
+extern void actor_collisionOff(Actor *);
+extern void func_80343DEC(Actor *);
+extern f32  func_8032970C(Actor *);
+extern f32  ml_map_f(f32, f32, f32, f32, f32);
+extern s32  item_getCount(enum item_e item);
+
+#define LMONKEY_STATE_1_IDLE    1
+#define LMONKEY_STATE_2_JUMPING 2
+#define LMONKEY_STATE_3_WALKING 3
+#define LMONKEY_STATE_4_LEAVING 4
+
+/* Replica of __chlmonkey_playRandomNoise — overlay fn not callable by name. */
+static void net_chlmonkey_noise(Actor *this) {
+    static s32 cooldown = 0;
+    f32 vol = ml_map_f(func_8032970C(this), 1000000.0f, 343000000.0f, 18000.0f, 0.0f);
+    f32 r = randf();
+    cooldown--;
+    if (cooldown < 0 && randf() < 0.2f) {
+        cooldown = 6;
+        gcsfx_playWithPitch((r < 0.5f) ? SFX_58_CHIMPY_NOISE_1 : SFX_59_CHIMPY_NOISE_2,
+                             randf() * 0.25f + 0.85f, vol);
+    }
+}
+
+RECOMP_PATCH void chlmonkey_update(Actor *this) {
+    func_8028E668(this->position, 35.0f, 0.0f, 65.0f);
+    actor_collisionOff(this);
+    this->marker->propPtr->unk8_3 = 1;
+
+    if (map_get() != MAP_2_MM_MUMBOS_MOUNTAIN) {
+        func_80343DEC(this);
+        return;
+    }
+
+    if (subaddie_playerIsWithinSphereAndActive(this, 700) && !gcdialog_hasCurrentTextId()) {
+        net_chlmonkey_noise(this);
+    }
+
+    switch (this->state) {
+        case LMONKEY_STATE_1_IDLE:
+            if (mapSpecificFlags_get(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED)) {
+                subaddie_set_state(this, LMONKEY_STATE_4_LEAVING);
+
+                if (!jiggyscore_isCollected(JIGGY_9_MM_CHIMPY)) {
+                    if (!recomp_net_is_connected() || local_chimpy_delivered) {
+                        /* Local deliverer: show the completion dialog. The
+                         * __chlmonkey_complete callback (already patched)
+                         * gates its own camera by radius 700. */
+                        gcdialog_showDialog(ASSET_B40_DIALOG_CHIMPY_COMPLETE, 0xe,
+                                             this->position, this->marker,
+                                             (void *)__chlmonkey_complete, NULL);
+                    } else {
+                        /* Remote ghost: skip dialog, but still spawn the
+                         * jiggy and transition Chimpy to walking away so
+                         * the world state stays consistent. Duplicate the
+                         * minimal side-effects of __chlmonkey_complete
+                         * without camera or movement lock. */
+                        mapSpecificFlags_set(MM_SPECIFIC_FLAG_4_SHAKE, TRUE);
+                        subaddie_set_state(this, LMONKEY_STATE_3_WALKING);
+                        timedFunc_set_3(2.9f, (void *)__chlmonkey_spawnJiggy,
+                            (s32)this->position_x,
+                            (s32)(this->position_y + 150.0f),
+                            (s32)this->position_z);
+                    }
+                } else {
+                    /* Jiggy already collected (late-join case). Trigger the
+                     * leave sequence directly. __chlmonkey_complete will
+                     * self-gate its camera by radius. */
+                    __chlmonkey_complete(this->marker, ASSET_B40_DIALOG_CHIMPY_COMPLETE, -1);
+                }
+            } else {
+                __chlmonkey_updateBringOrange(&this);
+
+                if (subaddie_playerIsWithinSphereAndActive(this, 345)
+                    && !subaddie_playerIsWithinSphereAndActive(this, 150)
+                    && !item_getCount(ITEM_19_ORANGE)
+                    && !this->has_met_before) {
+                    gcdialog_showDialog(ASSET_B3F_DIALOG_CHIMPY_MEET, 0xe,
+                                         this->position, NULL, NULL, NULL);
+                    this->has_met_before = TRUE;
+                }
+
+                actor_loopAnimation(this);
+                subaddie_maybe_set_state_position_direction(this, LMONKEY_STATE_2_JUMPING, 0.0f, -1, 0.02f);
+            }
+            break;
+
+        case LMONKEY_STATE_2_JUMPING:
+            __chlmonkey_updateBringOrange(&this);
+            actor_playAnimationOnce(this);
+            if (actor_animationIsAt(this, 0.99f)) {
+                subaddie_set_state_with_direction(this, LMONKEY_STATE_1_IDLE, 0.0f, -1);
+            }
+            break;
+
+        case LMONKEY_STATE_4_LEAVING:
+            actor_loopAnimation(this);
+            break;
+
+        case LMONKEY_STATE_3_WALKING:
+            func_80343DEC(this);
+            actor_loopAnimation(this);
+            /* Progress thresholds gate the stump raise, the leave flag and
+             * the despawn. They read this->unk48 (the chlmonkey-specific
+             * progress counter), NOT velocity — those are different fields
+             * in the actor struct. */
+            if (0.19f <= this->unk48) {
+                mapSpecificFlags_set(MM_SPECIFIC_FLAG_0_CHIMPY_STUMP_RAISED, TRUE);
+            }
+            if (0.24f <= this->unk48) {
+                mapSpecificFlags_set(MM_SPECIFIC_FLAG_3_CHIMPY_HAS_LEAVED, TRUE);
+            }
+            if (0.99f <= this->unk48) {
+                marker_despawn(this->marker);
+            }
+            break;
+    }
+}
+
+/* ============================================================
+ * RECOMP_PATCH: handleOrangeCollision (orange vs pad collision)
+ * Scene-local: the jiggy-spawn cutscene camera + dialog + fanfare
+ * fire only when the LOCAL player is inside Conga's arena at the
+ * moment the final pad is hit. Other clients still see the jiggy
+ * appear (shared via func_80387100 equivalent here: spawnJiggy).
+ * ============================================================ */
+extern void gcStaticCamera_activate(s32);
+extern void particleEmitter_setModel(ParticleEmitter *, enum asset_e);
+
+RECOMP_PATCH void handleOrangeCollision(ActorMarker *marker) {
+    f32 distance_to_orange_pad;
+    Actor *closest_orange_pad;
+    f32 position[3];
+    ParticleEmitter *p_ctrl;
+    s32 camera_id;
+
+    position[0] = marker->propPtr->x;
+    position[1] = marker->propPtr->y;
+    position[2] = marker->propPtr->z;
+
+    closest_orange_pad = actorArray_findClosestActorFromActorId(
+        position, ACTOR_57_ORANGE_PAD, 1 /*ORANGE_PAD_STATE_HIT*/, &distance_to_orange_pad);
+    if (!closest_orange_pad || 500.0f < distance_to_orange_pad) {
+        return;
+    }
+
+    closest_orange_pad->state = 1; /* ORANGE_PAD_STATE_HIT */
+
+    if (actorArray_findClosestActorFromActorId(position, ACTOR_57_ORANGE_PAD, 1, &distance_to_orange_pad)) {
+        /* More pads remaining — progress ding (shared audio is fine) */
+        coMusicPlayer_playMusic(COMUSIC_2B_DING_B, 22000);
+    } else {
+        /* Last pad — dispense the jiggy.
+         * Scene-local: the static camera, completion dialog and the
+         * puzzle-solved fanfare run only on the player whose local
+         * orange physics actually triggered this. In our networked
+         * setup, the host (world owner) is the authoritative simulator;
+         * the non-owner only spawns oranges from events (which still
+         * trigger handleOrangeCollision locally when the replicated
+         * orange hits a pad). Gate by proximity to the pad so whoever
+         * is present in Conga's arena sees the cutscene. */
+        bool local_in_arena = subaddie_playerIsWithinSphereAndActive(closest_orange_pad, 2500);
+
+        if (!recomp_net_is_connected() || local_in_arena) {
+            camera_id = (closest_orange_pad->secondaryId == 2 /*ORANGE_PAD_RIGHT*/) ? 0x10 /*JIGGY_SPAWN_RIGHT*/
+                      : (closest_orange_pad->secondaryId == 1 /*ORANGE_PAD_LEFT*/)  ? 0xF  /*JIGGY_SPAWN_LEFT*/
+                                                                                    : 0xE; /*JIGGY_SPAWN_TOP*/
+            gcStaticCamera_activate(camera_id);
+            coMusicPlayer_playMusic(COMUSIC_2D_PUZZLE_SOLVED_FANFARE, 0x7FFF);
+            if (!jiggyscore_isCollected(JIGGY_8_MM_ORANGE_PADS)) {
+                gcdialog_showDialog(ASSET_B3B_DIALOG_CONGA_ORANGE_PAD_JIGGY, 4,
+                                     NULL, NULL, NULL, NULL);
+            }
+            local_orangepad_triggered = TRUE;
+        }
+
+        /* Jiggy spawn is shared: every client sees the reward appear. */
+        position[1] += 50.0f;
+        timedFunc_set_3(0.6f, (GenFunction_3)spawnJiggy,
+                         (s32)position[0], (s32)position[1], (s32)position[2]);
+    }
+
+    /* Orange particles are pure visual — run on every client. */
+    p_ctrl = partEmitMgr_newEmitter(30 /*ORANGE_PARTICLE_COUNT*/);
+    particleEmitter_setPosition(p_ctrl, closest_orange_pad->position);
+    particleEmitter_setModel(p_ctrl, ASSET_89F_MODEL_ORANGE_PARTICLE);
+    particleEmitter_setStartingScaleRange(p_ctrl, 0.09f, 0.19f);
+    particleEmitter_setFinalScaleRange(p_ctrl, 0.0f, 0.0f);
+    particleEmitter_setParticleVelocityRange(p_ctrl, -200.0f, 500.0f, -200.0f, 200.0f, 700.0f, 200.0f);
+    particleEmitter_setAccelerationRange(p_ctrl, 0.0f, -1200.0f, 0.0f, 0.0f, -1200.0f, 0.0f);
+    particleEmitter_setAngularVelocityRange(p_ctrl, -600.0f, -600.0f, -600.0f, 600.0f, 600.0f, 600.0f);
+    particleEmitter_setSpawnIntervalRange(p_ctrl, 0.0f, 0.01f);
+    particleEmitter_setParticleLifeTimeRange(p_ctrl, 4.0f, 4.0f);
+    particleEmitter_func_802EF9F8(p_ctrl, 0.01f);
+    particleEmitter_func_802EFA18(p_ctrl, 3);
+    particleEmitter_func_802EFA20(p_ctrl, 1.0f, 1.3f);
+    particleEmitter_emitN(p_ctrl, 30);
 }

@@ -88,3 +88,6 @@ recomp_net_push_camera_state = 0x8F000128;
 /* Conga orange projectile sync */
 recomp_net_send_conga_orange = 0x8F00012C;
 recomp_net_pop_conga_orange = 0x8F000130;
+
+/* Host-side debug logging (stderr) */
+bknet_debug_log = 0x8F000134;

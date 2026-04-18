@@ -60,6 +60,7 @@ extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_push_camera_state(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_send_conga_orange(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_pop_conga_orange(uint8_t* rdram, recomp_context* ctx);
+extern "C" void bknet_debug_log(uint8_t* rdram, recomp_context* ctx);
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -2003,6 +2004,7 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_push_camera_state);
     REGISTER_FUNC(recomp_net_send_conga_orange);
     REGISTER_FUNC(recomp_net_pop_conga_orange);
+    REGISTER_FUNC(bknet_debug_log);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();
     recomptheme::set_custom_theme();

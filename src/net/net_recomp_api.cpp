@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstring>
 #include "recomp.h"
 #include "librecomp/helpers.hpp"
@@ -111,6 +112,32 @@ extern "C" void recomp_net_push_camera_state(uint8_t* rdram, recomp_context* ctx
     cam.valid = true;
 
     bknet::nametag_set_camera_state(cam);
+}
+
+// Host-side debug log bridge. Writes to /tmp/bk64_debug.log so the user can
+// `tail -f` the file regardless of how the app was launched (Finder or
+// Terminal). recomp_printf in the MIPS runtime is a no-op from the original
+// ROM's osSyncPrintf, so any visible debug has to go through here.
+extern "C" void bknet_debug_log(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t tag = (uint32_t)ctx->r4;
+    int32_t  a   = (int32_t) ctx->r5;
+    int32_t  b   = (int32_t) ctx->r6;
+    int32_t  c   = (int32_t) ctx->r7;
+    static FILE* f = nullptr;
+    if (!f) {
+        f = fopen("/tmp/bk64_debug.log", "a");
+        if (f) {
+            fprintf(f, "=== BK64 log opened ===\n");
+            fflush(f);
+        }
+    }
+    if (f) {
+        fprintf(f, "[BKLOG %u] a=%d b=%d c=%d\n", tag, a, b, c);
+        fflush(f);
+    }
+    // Also go to stderr for Terminal launches.
+    fprintf(stderr, "[BKLOG %u] a=%d b=%d c=%d\n", tag, a, b, c);
+    fflush(stderr);
 }
 
 // Backwards-compat: position-only push (Phase 1)
