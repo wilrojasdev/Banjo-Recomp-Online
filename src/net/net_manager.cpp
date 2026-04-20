@@ -48,6 +48,7 @@ bool NetworkManager::host_game() {
 
     server_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[Network] Player %u joined the game\n", player_id);
+        request_host_eeprom_send(player_id);  // MIPS will read EEPROM and ship via send_host_eeprom
         request_full_sync(player_id);
         // Send host's name directly to the new player
         {
@@ -196,6 +197,7 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
 
     coopnet_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[CoopNet] Player %u joined the game\n", player_id);
+        request_host_eeprom_send(player_id);
         request_full_sync(player_id);
         // Send host's name directly to the new player
         {
@@ -665,6 +667,13 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
             }
             break;
         }
+        case PacketType::HostEeprom: {
+            HostEepromPacket pkt;
+            if (deserialize(data, size, pkt)) {
+                handle_host_eeprom_packet(pkt);
+            }
+            break;
+        }
         case PacketType::EnemyPositionBulk: {
             handle_enemy_position_packet(data, size);
             break;
@@ -1067,6 +1076,53 @@ bool NetworkManager::pop_full_state(WorldStateFullPacket& out) {
     if (full_state_queue_.empty()) return false;
     out = full_state_queue_.front();
     full_state_queue_.pop_front();
+    return true;
+}
+
+// === Host EEPROM snapshot (SM64 Coop DX-style save override) ===
+
+void NetworkManager::request_host_eeprom_send(uint8_t player_id) {
+    host_eeprom_target_player_ = player_id;
+    pending_host_eeprom_.store(true);
+    std::printf("[Network] Host EEPROM send requested for player %u\n", player_id);
+}
+
+bool NetworkManager::should_send_host_eeprom(uint8_t& out_player_id) {
+    if (pending_host_eeprom_.load()) {
+        out_player_id = host_eeprom_target_player_;
+        pending_host_eeprom_.store(false);
+        return true;
+    }
+    return false;
+}
+
+void NetworkManager::send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player) {
+    if (!is_connected() || (!server_ && !coopnet_)) return;
+
+    HostEepromPacket pkt{};
+    pkt.header.type = PacketType::HostEeprom;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = send_sequence_++;
+    size_t copy = (size < HOST_EEPROM_SIZE) ? size : HOST_EEPROM_SIZE;
+    std::memcpy(pkt.eeprom, eeprom_bytes, copy);
+
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    (void)target_player;  // currently broadcast; peers ignore if not them
+    std::printf("[Network] Queued HostEeprom (%zu bytes) for player %u\n", sizeof(pkt), target_player);
+}
+
+void NetworkManager::handle_host_eeprom_packet(const HostEepromPacket& pkt) {
+    if (is_host()) return;  // host never applies its own EEPROM from wire
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    host_eeprom_queue_.push_back(pkt);
+    std::printf("[Network] Received HostEeprom (%zu bytes)\n", sizeof(pkt));
+}
+
+bool NetworkManager::pop_host_eeprom(HostEepromPacket& out) {
+    std::lock_guard<std::mutex> lock(world_mutex_);
+    if (host_eeprom_queue_.empty()) return false;
+    out = host_eeprom_queue_.front();
+    host_eeprom_queue_.pop_front();
     return true;
 }
 

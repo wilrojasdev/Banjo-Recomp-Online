@@ -42,6 +42,7 @@ enum class PacketType : uint8_t {
     WorldKillResync  = 0x37,  // Request owner to re-broadcast killed enemies
     CongaOrangeSpawn = 0x38,  // Conga orange projectile spawn (world owner → others)
     WorldStateFull   = 0x3F,
+    HostEeprom       = 0x40,  // Host ships its full EEPROM (2 KB) to join on connect
 };
 
 #pragma pack(push, 1)
@@ -267,6 +268,29 @@ struct WorldStateFullPacket {
     uint8_t has_flags;               // 1 if flag data is present (backwards compat)
     uint8_t _pad4[3];
     uint8_t abilities[8];            // learnedAbilities (4 bytes) + usedAbilities (4 bytes)
+    // Cross-world note sync (Phase 13):
+    // - note_scores mirrors D_80385FF0 (per-level high scores fed to
+    //   itemscore_noteScores_getTotal; gates note doors).
+    // - level_notes mirrors loaded_file_extension_data.level_notes[9] (BK64's
+    //   custom per-note bitfield; prevents already-collected notes from
+    //   respawning when a player enters a world someone else cleared).
+    uint8_t note_scores[11];
+    uint8_t _pad5;
+    uint8_t level_notes[9][32];      // matches SaveFileExtensionData.level_notes
+};
+
+// --- Host EEPROM snapshot (sent to each joiner on connect) ---
+//
+// Mirrors the SM64 Coop DX pattern: instead of each client running off
+// its own local save file, the host's full 2 KB EEPROM is shipped on
+// join and the client redirects all EEPROM I/O to an in-memory buffer
+// seeded with this data. Saves on the client side stay ephemeral —
+// they never touch disk. See network_save_override.c on the MIPS side.
+constexpr size_t HOST_EEPROM_SIZE = 2048;
+
+struct HostEepromPacket {
+    PacketHeader header;
+    uint8_t eeprom[HOST_EEPROM_SIZE];
 };
 
 // --- Conga orange projectile sync (world owner broadcasts spawn events) ---

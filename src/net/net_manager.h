@@ -114,6 +114,15 @@ public:
     bool pop_world_event(WorldEvent& out);  // Called from game thread
     bool pop_full_state(WorldStateFullPacket& out);  // Called from game thread
 
+    // Host EEPROM snapshot (shipped to each joiner on connect).
+    // Host: MIPS polls should_send_host_eeprom() to read hardware EEPROM and
+    //       call send_host_eeprom().
+    // Join: MIPS polls pop_host_eeprom() to fill the override buffer.
+    void request_host_eeprom_send(uint8_t player_id);
+    bool should_send_host_eeprom(uint8_t& out_player_id);
+    void send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player);
+    bool pop_host_eeprom(HostEepromPacket& out);
+
     // Conga orange projectile sync (world owner spawns, broadcasts to others)
     struct CongaOrangeEvent {
         float spawn_x, spawn_y, spawn_z;
@@ -178,6 +187,7 @@ private:
     void handle_enemy_position_packet(const uint8_t* data, size_t size);
     void handle_flag_packet(const WorldFlagPacket& pkt);
     void handle_world_state_full_packet(const WorldStateFullPacket& pkt);
+    void handle_host_eeprom_packet(const HostEepromPacket& pkt);
     void handle_ownership_packet(const WorldOwnershipPacket& pkt);
     void handle_conga_orange_packet(const CongaOrangeSpawnPacket& pkt);
     void assign_world_owner(uint32_t level_id, uint8_t player_id);
@@ -223,6 +233,11 @@ private:
     std::atomic<bool> pending_full_sync_{false};
     uint8_t sync_target_player_ = 0;
     std::deque<WorldStateFullPacket> full_state_queue_;
+
+    // Host EEPROM snapshot (SM64 Coop DX-style save override)
+    std::atomic<bool> pending_host_eeprom_{false};
+    uint8_t host_eeprom_target_player_ = 0;
+    std::deque<HostEepromPacket> host_eeprom_queue_;
     std::deque<CongaOrangeEvent> conga_orange_queue_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     double get_time() const;

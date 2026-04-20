@@ -60,7 +60,26 @@ extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_push_camera_state(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_send_conga_orange(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_net_pop_conga_orange(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_should_send_host_eeprom(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_send_host_eeprom(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_net_pop_host_eeprom(uint8_t* rdram, recomp_context* ctx);
 extern "C" void bknet_debug_log(uint8_t* rdram, recomp_context* ctx);
+
+// N64 SDK functions that the MAIN recompilation mangles with a `_recomp`
+// suffix (configured per-target), but the PATCH recompilation emits by the
+// raw SDK name. When a RECOMP_PATCH replaces a function that itself calls
+// the SDK (e.g. our replacement of eeprom_readBlocks calling
+// osEepromLongRead), the patch C output references the unsuffixed symbol
+// and the final C++ link fails. Provide trivial forwarders so both symbols
+// resolve to the same implementation.
+extern "C" void osEepromLongRead_recomp(uint8_t* rdram, recomp_context* ctx);
+extern "C" void osEepromLongWrite_recomp(uint8_t* rdram, recomp_context* ctx);
+extern "C" void osEepromLongRead(uint8_t* rdram, recomp_context* ctx) {
+    osEepromLongRead_recomp(rdram, ctx);
+}
+extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
+    osEepromLongWrite_recomp(rdram, ctx);
+}
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -2004,6 +2023,9 @@ int main(int argc, char** argv) {
     REGISTER_FUNC(recomp_net_push_camera_state);
     REGISTER_FUNC(recomp_net_send_conga_orange);
     REGISTER_FUNC(recomp_net_pop_conga_orange);
+    REGISTER_FUNC(recomp_net_should_send_host_eeprom);
+    REGISTER_FUNC(recomp_net_send_host_eeprom);
+    REGISTER_FUNC(recomp_net_pop_host_eeprom);
     REGISTER_FUNC(bknet_debug_log);
     recompui::register_ui_exports();
     recomputil::register_data_api_exports();

@@ -91,3 +91,8 @@ recomp_net_pop_conga_orange = 0x8F000130;
 
 /* Host-side debug logging (stderr) */
 bknet_debug_log = 0x8F000134;
+
+/* Host EEPROM snapshot (save override) */
+recomp_net_should_send_host_eeprom = 0x8F000138;
+recomp_net_send_host_eeprom        = 0x8F00013C;
+recomp_net_pop_host_eeprom         = 0x8F000140;

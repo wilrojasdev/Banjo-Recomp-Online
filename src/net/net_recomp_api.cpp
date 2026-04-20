@@ -385,6 +385,13 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
     pkt.has_flags = MEM_BU(0x78, data_ptr);
     // Abilities at 0x7C (8 bytes)
     for (int i = 0; i < 8; i++) pkt.abilities[i] = MEM_BU(0x7C + i, data_ptr);
+    // Note sync (Phase 13): note_scores at 0x84 (11 bytes), level_notes at 0x90 (9*32 bytes)
+    for (int i = 0; i < 11; i++) pkt.note_scores[i] = MEM_BU(0x84 + i, data_ptr);
+    for (int lvl = 0; lvl < 9; lvl++) {
+        for (int b = 0; b < 32; b++) {
+            pkt.level_notes[lvl][b] = MEM_BU(0x90 + lvl * 32 + b, data_ptr);
+        }
+    }
 
     bknet::NetworkManager::instance().send_world_state_full(
         reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt), static_cast<uint8_t>(target));
@@ -411,6 +418,66 @@ extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
         MEM_BU(0x78, out_ptr) = pkt.has_flags;
         // Abilities at 0x7C (8 bytes)
         for (int i = 0; i < 8; i++) MEM_BU(0x7C + i, out_ptr) = pkt.abilities[i];
+        // Note sync (Phase 13)
+        for (int i = 0; i < 11; i++) MEM_BU(0x84 + i, out_ptr) = pkt.note_scores[i];
+        for (int lvl = 0; lvl < 9; lvl++) {
+            for (int b = 0; b < 32; b++) {
+                MEM_BU(0x90 + lvl * 32 + b, out_ptr) = pkt.level_notes[lvl][b];
+            }
+        }
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}
+
+// === Host EEPROM snapshot (SM64 Coop DX-style save override) ===
+
+// Host polls this; when true, reads real EEPROM and calls send_host_eeprom.
+// r4 = out pointer for target_player_id (u8).
+extern "C" void recomp_net_should_send_host_eeprom(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    uint8_t player_id;
+    if (bknet::NetworkManager::instance().should_send_host_eeprom(player_id)) {
+        MEM_BU(0x00, out_ptr) = player_id;
+        _return(ctx, 1u);
+    } else {
+        _return(ctx, 0u);
+    }
+}
+
+// Host: ship EEPROM snapshot.
+//   r4 = data_ptr (u8[2048])
+//   r5 = size (u32, expected 2048)
+//   r6 = target_player (u8)
+extern "C" void recomp_net_send_host_eeprom(uint8_t* rdram, recomp_context* ctx) {
+    gpr data_ptr = ctx->r4;
+    u32 size = static_cast<u32>(ctx->r5);
+    u32 target = static_cast<u32>(ctx->r6);
+
+    if (size > bknet::HOST_EEPROM_SIZE) size = static_cast<u32>(bknet::HOST_EEPROM_SIZE);
+
+    uint8_t buffer[bknet::HOST_EEPROM_SIZE] = {};
+    for (u32 i = 0; i < size; i++) {
+        buffer[i] = MEM_BU(i, data_ptr);
+    }
+
+    bknet::NetworkManager::instance().send_host_eeprom(buffer, size, static_cast<uint8_t>(target));
+}
+
+// Join: consume a queued HostEeprom into the override buffer.
+//   r4 = out_ptr (u8[2048])
+//   r5 = max_size (u32)
+// Returns 1 if a packet was consumed, 0 if queue empty.
+extern "C" void recomp_net_pop_host_eeprom(uint8_t* rdram, recomp_context* ctx) {
+    gpr out_ptr = ctx->r4;
+    u32 max_size = static_cast<u32>(ctx->r5);
+    bknet::HostEepromPacket pkt;
+    if (bknet::NetworkManager::instance().pop_host_eeprom(pkt)) {
+        u32 copy = (max_size < bknet::HOST_EEPROM_SIZE) ? max_size : static_cast<u32>(bknet::HOST_EEPROM_SIZE);
+        for (u32 i = 0; i < copy; i++) {
+            MEM_BU(i, out_ptr) = pkt.eeprom[i];
+        }
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

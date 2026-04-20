@@ -95,6 +95,9 @@ extern void honeycombscore_set(s32 indx, bool val);
 // Flag sync (from network_flag_sync.c)
 extern void bkrecomp_net_process_flag_event(void *data);
 
+// Save override (from network_save_override.c)
+extern void bkrecomp_net_save_override_tick(void);
+
 // Jigsaw sync (from network_jigsaw_sync.c)
 extern void bkrecomp_net_jigsaw_check_disconnects(void);
 extern void bkrecomp_net_apply_flag_bulk(
@@ -319,6 +322,30 @@ extern void bkrecomp_net_hide_note(u32 note_index);
 extern void bkrecomp_net_hide_nearest_prop(u32 asset_id, f32 px, f32 py, f32 pz);
 extern bool is_note_collected(s32 map_id, s32 level_id, u8 note_index);
 extern void set_note_collected(s32 map_id, s32 level_id, u8 note_index);
+extern s32  get_collected_note_count(enum level_e level);
+extern s32  level_id_to_level_array_index(enum level_e level_id);
+
+// Persistent note state for cross-world sync:
+// - D_80385FF0[level] is the per-level high-score array summed by
+//   itemscore_noteScores_getTotal() (the note-door gate).
+// - loaded_file_extension_data.level_notes[idx] is BK64's custom bitfield of
+//   which note indices have been collected (persists notes across map entries).
+// Both must be merged from remote events so players in different worlds
+// accumulate shared note progress.
+extern u8 D_80385FF0[0xB];
+#include "save_extension.h"
+
+// Recompute D_80385FF0[level] from the level_notes bitfield after a remote
+// note was added, applying MAX-merge so the counter never regresses.
+static void bump_level_notescore(s32 level_id) {
+    if (level_id < 1 || level_id > 0xA) return;
+    s32 arr_idx = level_id_to_level_array_index((enum level_e)level_id);
+    if (arr_idx < 0) return;
+    s32 count = get_collected_note_count((enum level_e)level_id);
+    if (count > (s32)D_80385FF0[level_id]) {
+        D_80385FF0[level_id] = (u8)count;
+    }
+}
 static u8  prev_honeycombscore[3] = {0};
 static s32 prev_lives = 0;
 // Debug: track jiggy total changes from ANY source
@@ -757,19 +784,20 @@ static void process_collectible_event(WorldEventData *evt) {
                 despawn_actor_by_marker_id(MARKER_53_EMPTY_HONEYCOMB);
             }
         } else if (ct == COLLECTIBLE_NOTE) {
-            // Notes are per-level — only apply + hide if on the same map
-            if (cur_map == evt->coll_map_id) {
-                // Only increment counter if note wasn't already collected
-                // (prevents host double-counting its own notes via resync)
-                if (evt->coll_id != 0xFFFE
-                    && !is_note_collected((s32)cur_map, (s32)level_get(), (u8)evt->coll_id)) {
+            // Persistence applies regardless of local map, so cross-world
+            // progress survives resyncs. Visual despawn + HUD stay map-gated.
+            if (evt->coll_id != 0xFFFE
+                && !is_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id)) {
+                set_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id);
+                bump_level_notescore((s32)evt->coll_level_id);
+                if (cur_map == evt->coll_map_id) {
                     item_adjustByDiffWithoutHud(ITEM_C_NOTE, 1);
                 }
+            }
+            if (cur_map == evt->coll_map_id) {
                 if (evt->coll_id == 0xFFFE) {
-                    // Dynamic note — no specific index, just despawn actor
                     despawn_actor_by_marker_id(MARKER_5F_MUSIC_NOTE);
                 } else {
-                    // Static note — hide by index (also marks as collected)
                     bkrecomp_net_hide_note(evt->coll_id);
                 }
             }
@@ -815,16 +843,21 @@ static void process_collectible_event(WorldEventData *evt) {
                 }
             }
         } else if (ct == COLLECTIBLE_NOTE) {
-            // Notes are per-level, only apply if on the same level.
-            // Always mark the bitfield so the note stays collected across map transitions.
-            if (same_level && evt->coll_id != 0xFFFE) {
+            // Persistence (bitfield + D_80385FF0) applies ALWAYS, even when the
+            // local player is in a different world — shared collectibles must
+            // accumulate for note-door checks regardless of location.
+            if (evt->coll_id != 0xFFFE) {
                 bool already = is_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id);
                 if (!already) {
                     set_note_collected((s32)evt->coll_map_id, (s32)evt->coll_level_id, (u8)evt->coll_id);
-                    item_inc(ITEM_C_NOTE);
+                    bump_level_notescore((s32)evt->coll_level_id);
+                    // HUD counter + pickup SFX only when on the same level as the sender.
+                    if (same_level) item_inc(ITEM_C_NOTE);
                 }
-            } else if (same_level && evt->coll_id == 0xFFFE) {
+            } else if (same_level) {
+                // Dynamic note: no stable index to dedupe on, so only apply in-level.
                 item_inc(ITEM_C_NOTE);
+                bump_level_notescore((s32)evt->coll_level_id);
             }
             // Visual despawn only when on the same map
             if (same_map) {
@@ -1179,7 +1212,11 @@ typedef struct {
     u8  has_flags;               // 0x78 (1 if flag data present)
     u8  _pad4[3];                // 0x79
     u8  abilities[8];            // 0x7C (learnedAbilities + usedAbilities)
-} WorldStateFullData;            // 0x84 = 132 bytes
+    // Cross-world note sync (Phase 13)
+    u8  note_scores[11];         // 0x84 (D_80385FF0 mirror: per-level high scores)
+    u8  _pad5;                   // 0x8F
+    u8  level_notes[9][32];      // 0x90 (288 bytes, 0x120) -> ends at 0x1B0
+} WorldStateFullData;            // 0x1B0 = 432 bytes
 
 // Host: snapshot and send current state when a new player joins
 static void check_full_sync_send(void) {
@@ -1231,6 +1268,14 @@ static void check_full_sync_send(void) {
         s32 i;
         for (i = 0; i < 8; i++) data.abilities[i] = ab_ptr[i];
     }
+
+    // Per-level note state (Phase 13): D_80385FF0 drives the door check,
+    // level_notes[] prevents already-collected notes from respawning.
+    // Explicit memcpy routes through memcpy_recomp (syms.ld); a plain byte
+    // loop here gets folded into a compiler-intrinsic memcpy at -O2, which
+    // N64Recomp can't resolve and produces a broken call.
+    memcpy(data.note_scores, D_80385FF0, 11);
+    memcpy(data.level_notes, loaded_file_extension_data.level_notes, 9 * 32);
 
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
     recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d, flags=yes)\n",
@@ -1343,6 +1388,31 @@ static void check_full_sync_receive(void) {
         recomp_printf("[STATE-SYNC] applied flag state + abilities from host\n");
     }
 
+    // Merge per-level note state (Phase 13).
+    // level_notes -> OR into local bitfield (never lose locally-collected notes).
+    // D_80385FF0 -> recompute from merged bitfield, then MAX with host's snapshot
+    // (handles vanilla saves where notes predate note-saving bitfield).
+    {
+        s32 i, b;
+        for (i = 0; i < 9; i++) {
+            for (b = 0; b < 32; b++) {
+                loaded_file_extension_data.level_notes[i].bytes[b] |= data.level_notes[i][b];
+            }
+        }
+        // Apply MAX merge to per-level high-score array.
+        for (i = 1; i <= 0xA; i++) {
+            s32 arr_idx = level_id_to_level_array_index((enum level_e)i);
+            s32 from_bitfield = (arr_idx >= 0) ? get_collected_note_count((enum level_e)i) : 0;
+            s32 from_host = (s32)data.note_scores[i];
+            s32 cur = (s32)D_80385FF0[i];
+            s32 best = cur;
+            if (from_bitfield > best) best = from_bitfield;
+            if (from_host > best) best = from_host;
+            D_80385FF0[i] = (u8)best;
+        }
+        recomp_printf("[STATE-SYNC] merged note state (bitfield OR, D_80385FF0 MAX)\n");
+    }
+
     // Re-snapshot ALL polling state AFTER full sync.
     // The game engine may react to bulk flags by auto-setting score bitfields
     // (e.g., progression flags imply certain jiggies collected). Without this,
@@ -1369,9 +1439,44 @@ static void check_full_sync_receive(void) {
 static u32 prev_global_level = 0xFFFFFFFF;
 static u32 prev_global_map = 0xFFFFFFFF;
 
+// Re-snapshot every polling baseline to the current in-memory score state.
+// Call this AFTER gameFile_load / clearScoreStates in online mode so the
+// first poll doesn't emit every loaded jiggy/mumbo/honeycomb as "just
+// collected" events to peers (which would contaminate the other side's
+// save with items it never picked up).
+RECOMP_EXPORT void bkrecomp_net_reset_poll_baselines(void) {
+    {
+        u8 *score = jiggyscore_getPtr();
+        if (score) { s32 i; for (i = 0; i < 0xD; i++) prev_jiggyscore[i] = score[i]; }
+        else       { s32 i; for (i = 0; i < 0xD; i++) prev_jiggyscore[i] = 0; }
+    }
+    {
+        u8 *score = func_80321538();
+        if (score) { s32 i; for (i = 0; i < 16; i++) prev_mumboscore[i] = score[i]; }
+        else       { s32 i; for (i = 0; i < 16; i++) prev_mumboscore[i] = 0; }
+    }
+    {
+        u8 *score = honeycombscore_get_ptr();
+        if (score) { s32 i; for (i = 0; i < 3; i++) prev_honeycombscore[i] = score[i]; }
+        else       { s32 i; for (i = 0; i < 3; i++) prev_honeycombscore[i] = 0; }
+    }
+    prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+    prev_lives      = item_getCount(ITEM_16_LIFE);
+    prev_eggs          = item_getCount(ITEM_D_EGGS);
+    prev_red_feathers  = item_getCount(ITEM_F_RED_FEATHER);
+    prev_gold_feathers = item_getCount(ITEM_10_GOLD_FEATHER);
+    prev_health        = item_getCount(ITEM_14_HEALTH);
+    dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
+}
+
 // Called every frame
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     if (!recomp_net_is_connected()) return;
+
+    // EEPROM handshake must run every frame regardless of map state —
+    // the join needs this to fire during file-select before any game
+    // logic runs, so put it ahead of the map-change early-return.
+    bkrecomp_net_save_override_tick();
 
     // Detect any JIGGY_TOTAL change (including from game engine itself)
     {

@@ -19,6 +19,12 @@ extern void func_80335110(s32);
 extern void chBottlesBonus_resetCompleted(void);
 extern void ability_setLearned(enum ability_e ability, bool hasLearned);
 extern void fileProgressFlag_set(enum file_progress_e flag, bool value);
+extern void clearScoreStates(void);
+extern void bkrecomp_net_reset_poll_baselines(void);
+
+// Save override (network_save_override.c)
+extern bool bkrecomp_net_save_override_is_ready(void);
+extern void bkrecomp_net_save_override_enable(void);
 
 // @recomp Skip intro cutscenes when online mode is configured — boot directly to file select.
 RECOMP_PATCH enum map_e getDefaultBootMap(void) {
@@ -45,31 +51,71 @@ RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
     }
 
     if (recomp_net_is_online_mode() && !online_autoload_done_for_map) {
+        bool is_join = recomp_net_is_join_mode();
+
+        // Join waits for the host's EEPROM snapshot before continuing.
+        // With the snapshot we can load the exact same save state the host
+        // is running on, via the eeprom_readBlocks override. Without it,
+        // we'd have to guess at the starting state and deal with polling
+        // leaks again.
+        if (is_join && !bkrecomp_net_save_override_is_ready()) {
+            gameSelect_update(this);
+            return;
+        }
+
         online_autoload_done_for_map = TRUE;
 
+        // Fresh RAM state. Vanilla relied on setGameInformationZoombox()
+        // to call clearScoreStates when the player focused a slot; our
+        // autoload bypasses that scene.
+        clearScoreStates();
+
+        if (is_join) {
+            // Flip the EEPROM backing store to the RAM buffer filled by
+            // the HostEeprom packet. Every eeprom_readBlocks/writeBlocks
+            // call from here on will target RAM, so: (1) the game sees
+            // the host's save data when we re-index the file table; and
+            // (2) any save prompt later just writes to RAM and is
+            // discarded at session end — join's on-disk save is never
+            // touched.
+            bkrecomp_net_save_override_enable();
+        }
+
+        // (Re-)index the save data table. For the host this reads the
+        // real EEPROM; for the join it reads from the override buffer
+        // and populates gameFile_saveData[] with the host's slot layout.
         gameFile_8033CE40();
 
-        s32 slot = (s32)recomp_net_get_save_slot();
-        if (recomp_net_is_join_mode()) {
+        s32 slot;
+        if (is_join) {
+            // Pick the first non-empty slot from the host's snapshot.
+            // We don't have the host's exact slot id, but any non-empty
+            // slot maps to the same live state since the host only runs
+            // one save at a time.
             slot = 0;
+            for (s32 i = 0; i < 3; i++) {
+                if (gameFile_isNotEmpty(i)) { slot = i; break; }
+            }
+        } else {
+            slot = (s32)recomp_net_get_save_slot();
         }
 
         gameSelect_setGameNumber(slot);
+        chBottlesBonus_resetCompleted();
 
         if (gameFile_isNotEmpty(slot)) {
             gameFile_load(slot);
-            chBottlesBonus_resetCompleted();
 
             if (chmole_learnedAllSpiralMountainAbilities() && fileProgressFlag_get(FILEPROG_BD_ENTER_LAIR_CUTSCENE)) {
                 timedFunc_set_2(0.0f, (void*)warp_lairEnterLairFromSMLevel, 0, 0);
             } else {
                 timedFunc_set_2(0.0f, (void*)warp_smExitBanjosHouse, 0, 0);
             }
-            timedFunc_set_1(0.0f, (void*)func_80335110, 1);
         } else {
-            // Empty slot — unlock all Spiral Mountain abilities and warp to Lair
-            chBottlesBonus_resetCompleted();
-
+            // Empty slot (host fresh game). Seed SM base abilities so the
+            // player can move, plus the note-door ability gate (see
+            // chnotedoor_update — gated on ABILITY_13_1ST_NOTEDOOR, which
+            // vanilla only grants via Bottles after 50 MM notes).
             ability_setLearned(ABILITY_0_BARGE, TRUE);
             ability_setLearned(ABILITY_4_CLAW_SWIPE, TRUE);
             ability_setLearned(ABILITY_5_CLIMB, TRUE);
@@ -79,11 +125,17 @@ RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
             ability_setLearned(ABILITY_B_RATATAT_RAP, TRUE);
             ability_setLearned(ABILITY_C_ROLL, TRUE);
             ability_setLearned(ABILITY_F_DIVE, TRUE);
+            ability_setLearned(ABILITY_13_1ST_NOTEDOOR, TRUE);
             fileProgressFlag_set(FILEPROG_BD_ENTER_LAIR_CUTSCENE, TRUE);
 
             timedFunc_set_2(0.0f, (void*)warp_lairEnterLairFromSMLevel, 0, 0);
-            timedFunc_set_1(0.0f, (void*)func_80335110, 1);
         }
+        timedFunc_set_1(0.0f, (void*)func_80335110, 1);
+
+        // Prime the collectible poll baselines with the final post-load
+        // score state. Without this, the first poll tick interprets every
+        // loaded-save bit as a fresh collection and broadcasts it.
+        bkrecomp_net_reset_poll_baselines();
         return;
     }
 
