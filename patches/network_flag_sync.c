@@ -324,6 +324,16 @@ RECOMP_PATCH void mapSpecificFlags_set(s32 i, s32 val) {
 
     s32 new_val = val ? 1 : 0;
     if (!net_applying_remote_flag && recomp_net_is_connected() && old != new_val) {
+        /* Flag 0x1F ("player on pad") is a per-frame transient set and
+         * reset inside func_802D4388 each frame of every pad's update.
+         * Broadcasting it thrashes the receiving client's flag between
+         * TRUE/FALSE twice per pad per frame, which can interleave with
+         * the receiver's own pad state machine and prevent the press
+         * animation from triggering (symptom: Mumbo skull pad does not
+         * sink when a join player stands on it). The flag is always
+         * computed locally from the local player's collision, so it
+         * should never be synced. */
+        if (i == 0x1F) return;
         recomp_net_send_flag_change(NET_FLAG_MAP_SPECIFIC, (u32)i,
             (u32)new_val, (u32)map_get());
     }
@@ -364,6 +374,13 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
     } else if (ft == NET_FLAG_VOLATILE) {
         volatileFlag_set((enum volatile_flags_e)idx, val);
     } else if (ft == NET_FLAG_MAP_SPECIFIC) {
+        /* Ignore the per-frame "player on pad" signal — always computed
+         * locally from the local player's collision. See the send-side
+         * filter in mapSpecificFlags_set for details. */
+        if (idx == 0x1F) {
+            net_applying_remote_flag = FALSE;
+            return;
+        }
         mapSpecificFlags_set((s32)idx, val);
         /* MM orange collectible: despawn when remote player picks it up */
         if (idx == MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED && val) {
