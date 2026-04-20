@@ -450,10 +450,12 @@ extern "C" void recomp_net_should_send_host_eeprom(uint8_t* rdram, recomp_contex
 //   r4 = data_ptr (u8[2048])
 //   r5 = size (u32, expected 2048)
 //   r6 = target_player (u8)
+//   r7 = current_slot (s32, host's active save slot 0..2)
 extern "C" void recomp_net_send_host_eeprom(uint8_t* rdram, recomp_context* ctx) {
     gpr data_ptr = ctx->r4;
     u32 size = static_cast<u32>(ctx->r5);
     u32 target = static_cast<u32>(ctx->r6);
+    int16_t slot = static_cast<int16_t>(ctx->r7);
 
     if (size > bknet::HOST_EEPROM_SIZE) size = static_cast<u32>(bknet::HOST_EEPROM_SIZE);
 
@@ -462,21 +464,26 @@ extern "C" void recomp_net_send_host_eeprom(uint8_t* rdram, recomp_context* ctx)
         buffer[i] = MEM_BU(i, data_ptr);
     }
 
-    bknet::NetworkManager::instance().send_host_eeprom(buffer, size, static_cast<uint8_t>(target));
+    bknet::NetworkManager::instance().send_host_eeprom(buffer, size, static_cast<uint8_t>(target), slot);
 }
 
 // Join: consume a queued HostEeprom into the override buffer.
 //   r4 = out_ptr (u8[2048])
 //   r5 = max_size (u32)
+//   r6 = out_slot_ptr (s16*, receives host's active slot)
 // Returns 1 if a packet was consumed, 0 if queue empty.
 extern "C" void recomp_net_pop_host_eeprom(uint8_t* rdram, recomp_context* ctx) {
     gpr out_ptr = ctx->r4;
     u32 max_size = static_cast<u32>(ctx->r5);
+    gpr out_slot_ptr = ctx->r6;
     bknet::HostEepromPacket pkt;
     if (bknet::NetworkManager::instance().pop_host_eeprom(pkt)) {
         u32 copy = (max_size < bknet::HOST_EEPROM_SIZE) ? max_size : static_cast<u32>(bknet::HOST_EEPROM_SIZE);
         for (u32 i = 0; i < copy; i++) {
             MEM_BU(i, out_ptr) = pkt.eeprom[i];
+        }
+        if (out_slot_ptr != 0) {
+            MEM_HU(0x00, out_slot_ptr) = static_cast<u16>(pkt.current_slot);
         }
         _return(ctx, 1u);
     } else {

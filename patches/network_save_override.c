@@ -20,16 +20,20 @@
 static u8   g_override_buffer[EEPROM_OVERRIDE_SIZE];
 static bool g_override_enabled = FALSE;
 static bool g_override_ready   = FALSE;  // populated by host EEPROM packet
+static s16  g_host_slot        = -1;     // active slot the host is playing
+static bool g_prev_connected   = FALSE;  // for edge-detecting disconnects
 
 // Core helpers used by the fall-through path (host / solo)
 extern void func_8024F35C(s32);
 extern OSMesgQueue *pfsManager_getFrameReplyQ(void);
 
 // Packet bridge (C++ side queues a HostEeprom packet; MIPS pops and applies)
-extern u32 recomp_net_pop_host_eeprom(void *out_buffer, s32 size);
+extern u32 recomp_net_pop_host_eeprom(void *out_buffer, s32 size, s16 *out_slot);
 extern u32 recomp_net_should_send_host_eeprom(u8 *out_target_player);
-extern void recomp_net_send_host_eeprom(void *data, s32 size, u32 target_player);
+extern void recomp_net_send_host_eeprom(void *data, s32 size, u32 target_player, s32 current_slot);
 extern u32 recomp_net_is_host(void);
+extern u32 recomp_net_is_connected(void);
+extern s32 gameSelect_getGameNumber(void);
 
 // SaveData is 0x78 (120 bytes) -> 15 blocks per slot in vanilla layout.
 #define EEPROM_OVERRIDE_BLOCKS (EEPROM_OVERRIDE_SIZE / EEPROM_BLOCK_SIZE)
@@ -107,13 +111,14 @@ RECOMP_EXPORT s32 bkrecomp_net_save_read_full_eeprom(u8 *out) {
 
 // Join: fill the override buffer from the host's EEPROM snapshot.
 // Called from the packet receive path.
-RECOMP_EXPORT void bkrecomp_net_save_populate_override(u8 *data, s32 size) {
+RECOMP_EXPORT void bkrecomp_net_save_populate_override(u8 *data, s32 size, s16 host_slot) {
     s32 copy = size;
     if (copy > EEPROM_OVERRIDE_SIZE) copy = EEPROM_OVERRIDE_SIZE;
     if (copy > 0 && data) {
         memcpy(g_override_buffer, data, copy);
     }
     // Any untouched bytes beyond `copy` stay zeroed from BSS init.
+    g_host_slot      = host_slot;
     g_override_ready = TRUE;
 }
 
@@ -121,10 +126,11 @@ RECOMP_EXPORT void bkrecomp_net_save_populate_override(u8 *data, s32 size) {
 // the override buffer. Returns TRUE when a packet was consumed.
 RECOMP_EXPORT bool bkrecomp_net_save_try_pop_host_eeprom(void) {
     static u8 scratch[EEPROM_OVERRIDE_SIZE];
-    if (!recomp_net_pop_host_eeprom(scratch, EEPROM_OVERRIDE_SIZE)) {
+    s16 slot = -1;
+    if (!recomp_net_pop_host_eeprom(scratch, EEPROM_OVERRIDE_SIZE, &slot)) {
         return FALSE;
     }
-    bkrecomp_net_save_populate_override(scratch, EEPROM_OVERRIDE_SIZE);
+    bkrecomp_net_save_populate_override(scratch, EEPROM_OVERRIDE_SIZE, slot);
     return TRUE;
 }
 
@@ -144,25 +150,56 @@ RECOMP_EXPORT bool bkrecomp_net_save_override_is_enabled(void) {
     return g_override_enabled;
 }
 
+// Returns the slot the host is playing (0..2), or -1 if not received yet.
+RECOMP_EXPORT s32 bkrecomp_net_save_get_host_slot(void) {
+    return (s32)g_host_slot;
+}
+
+// Clear the "ready" flag so the next HostEeprom packet that arrives will
+// repopulate the buffer. Intended for reconnect scenarios where a fresh
+// snapshot is expected.
+RECOMP_EXPORT void bkrecomp_net_save_override_reset(void) {
+    g_override_ready = FALSE;
+    g_host_slot      = -1;
+}
+
 // Per-frame hook driven from bkrecomp_net_process_world_events.
 // Host: checks the pending-send flag from C++ and ships its EEPROM when
 //       a new peer has connected.
 // Join: drains any queued HostEeprom packets into the override buffer.
+// Both: on disconnect edge, clear the ready flag so a later reconnect
+//       will pop a fresh snapshot (mitigates the theoretical in-process
+//       reconnect stale-buffer issue).
 RECOMP_EXPORT void bkrecomp_net_save_override_tick(void) {
+    bool connected = recomp_net_is_connected() != 0;
+
+    // Edge: connected -> disconnected. Reset ready so the next session
+    // starts clean. Keep g_override_enabled as-is because the game may
+    // still read/write through the buffer while winding down.
+    if (g_prev_connected && !connected) {
+        g_override_ready = FALSE;
+        g_host_slot      = -1;
+    }
+    g_prev_connected = connected;
+
+    if (!connected) return;
+
     if (recomp_net_is_host()) {
         u8 target = 0;
         if (recomp_net_should_send_host_eeprom(&target)) {
             static u8 snapshot[EEPROM_OVERRIDE_SIZE];
             bkrecomp_net_save_read_full_eeprom(snapshot);
-            recomp_net_send_host_eeprom(snapshot, EEPROM_OVERRIDE_SIZE, (u32)target);
-            recomp_printf("[SAVE-OVERRIDE] host shipped EEPROM to player %d\n", target);
+            s32 cur_slot = gameSelect_getGameNumber();
+            recomp_net_send_host_eeprom(snapshot, EEPROM_OVERRIDE_SIZE, (u32)target, cur_slot);
+            recomp_printf("[SAVE-OVERRIDE] host shipped EEPROM to player %d (slot=%d)\n", target, cur_slot);
         }
     } else {
         // Pop any queued snapshot. Once the buffer is ready, the title
         // screen patch flips g_override_enabled and runs gameFile_load.
         if (!g_override_ready) {
             if (bkrecomp_net_save_try_pop_host_eeprom()) {
-                recomp_printf("[SAVE-OVERRIDE] join buffer populated from host\n");
+                recomp_printf("[SAVE-OVERRIDE] join buffer populated from host (slot=%d)\n",
+                              (s32)g_host_slot);
             }
         }
     }

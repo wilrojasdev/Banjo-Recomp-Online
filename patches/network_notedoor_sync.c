@@ -35,20 +35,40 @@ static const s16 NOTEDOOR_PRE_OPEN_FLAGS[6] = {
     0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B
 };
 
+// Per-door flag: did WE call func_8028F918(2) to lock the local player while
+// this door fades? If yes, we must call func_8028F918(0) at despawn to unlock.
+// Indexed by actorTypeSpecificField (1..12); slot 0 unused.
+// Without this flag we would always unlock at despawn regardless of whether
+// we locked — which fights with whatever other system currently holds control.
+static bool s_notedoor_locked_local[13] = { FALSE };
+
 // RECOMP_PATCH of chnotedoor_update.
 //
-// Adds a "remote opening" path: when the FILEPROG_3A+door flag transitions
-// from FALSE to TRUE through the network flag sync (i.e. another player in
-// the session just opened it), the receiving client still sees the door as
-// visible. Vanilla only despawns on the init branch or after finishing the
-// local fade animation, so without this patch the door stays forever on
-// every other client — and nearby players never get the opening sparkle /
-// sound either.
+// Purpose: keep the door opening animation + despawn in sync across peers,
+// without softlocking the join.
 //
-// The remote_forced branch bypasses the proximity + notes + ability gate so
-// the fade plays out, particles spawn, and the marker despawns naturally.
-// `fileProgressFlag_set` is skipped in that branch so we don't echo the flag
-// back through the network.
+// The bug this file fixes:
+//   Vanilla only despawns on init OR at the end of the local fade. Once
+//   another peer opens the door (flag gets set via flag-sync), the join
+//   still sees the door as fully opaque and the fade never plays.
+//
+// Bugs the PREVIOUS version of this patch introduced:
+//   1) Used `remote_forced = flag_set && alpha==0xFF`, which was only
+//      true for a single frame. The next frame (alpha=248) the outer
+//      condition evaluated to false and the whole fade block was
+//      skipped — alpha froze at 248, marker_despawn never ran, and
+//      func_8028F918(0) was never called → local player stuck.
+//   2) Called func_8028F918(2) for the remote-triggered path too, which
+//      locked the control of any peer who happened to be near the door
+//      when another player opened it.
+//
+// Fix:
+//   - `flag_set` alone drives "remote triggered" (no alpha gate).
+//   - `is_fading` = alpha != 0xFF keeps the outer condition true for
+//     every frame until despawn, regardless of flag_set flips.
+//   - Control lock is now conditional on (local player approached AND
+//     flag wasn't already set by network) and remembered in the
+//     s_notedoor_locked_local[] table so we only unlock if we locked.
 RECOMP_PATCH void func_80387730(Actor *this) {
     f32 spAC[3];
     ParticleEmitter *temp_s5;
@@ -63,13 +83,17 @@ RECOMP_PATCH void func_80387730(Actor *this) {
 
     s32 door_idx = (s32)this->actorTypeSpecificField;
     enum file_progress_e door_flag = (enum file_progress_e)(door_idx + FILEPROG_39_CCW_OPEN);
-    s32 flag_set = fileProgressFlag_get(door_flag);
+    bool flag_set = fileProgressFlag_get(door_flag) != 0;
 
     if (!this->volatile_initialized) {
         this->volatile_initialized = TRUE;
         this->alpha_124_19 = 0xFF;
         this->unk1C[1] = 0.0f;
         this->unk1C[2] = 3.5f;
+        // Reset any stale lock bookkeeping from a previous session.
+        if (door_idx >= 1 && door_idx < 13) {
+            s_notedoor_locked_local[door_idx] = FALSE;
+        }
         if (flag_set) {
             marker_despawn(this->marker);
             return;
@@ -82,6 +106,7 @@ RECOMP_PATCH void func_80387730(Actor *this) {
         }
     }
 
+    // Pulsing number opacity — runs every frame.
     this->unk1C[1] += this->unk1C[2];
     if (this->unk1C[1] >= 255.0f) {
         this->unk1C[1] = 255.0f;
@@ -92,14 +117,17 @@ RECOMP_PATCH void func_80387730(Actor *this) {
         this->unk1C[2] = 3.5f;
     }
 
-    // Remote-triggered open: flag is set but this instance hasn't started
-    // fading yet (alpha still at initial 0xFF). Force the fade path.
-    bool remote_forced = (flag_set != 0) && (this->alpha_124_19 == 0xFF);
+    bool is_fading = (this->alpha_124_19 != 0xFF);
+    bool can_start_local = !flag_set && ability_isUnlocked(ABILITY_13_1ST_NOTEDOOR);
 
-    if ((!flag_set && ability_isUnlocked(ABILITY_13_1ST_NOTEDOOR)) || remote_forced) {
+    // Outer gate. `is_fading` keeps us processing the fade every frame until
+    // despawn, so the flag_set transition mid-fade doesn't skip the block.
+    if (can_start_local || flag_set || is_fading) {
         player_getPosition(spAC);
 
-        if (!flag_set
+        // Hint dialog + "not enough notes" only when the local player could
+        // actually start the open (flag not yet set, has the ability).
+        if (can_start_local
             && (ml_vec3f_distance(spAC, this->position) < 500.0f)
             && (gcdialog_getCurrentTextId() != 0xF64)) {
             func_802FACA4(0xC);
@@ -108,7 +136,7 @@ RECOMP_PATCH void func_80387730(Actor *this) {
         s32 required = NOTEDOOR_REQUIREMENTS[door_idx - 1];
         bool has_notes = itemscore_noteScores_getTotal() >= required;
 
-        if (has_notes || remote_forced) {
+        if (has_notes || flag_set || is_fading) {
             if (this->marker->unk14_21) {
                 func_8032BC60(this, 5, sp90);
                 func_8032BC60(this, 6, sp84);
@@ -121,14 +149,24 @@ RECOMP_PATCH void func_80387730(Actor *this) {
                 phi_f20 = 290.0f;
             }
             sp9C[1] = this->position[1];
+            bool local_near = (ml_vec3f_distance(spAC, sp9C) < phi_f20);
 
-            if (remote_forced
-                || (ml_vec3f_distance(spAC, sp9C) < phi_f20)
-                || (this->alpha_124_19 != 0xFF)) {
+            // Start/continue the fade if local is the trigger, the flag
+            // arrived from the network, or we're already in progress.
+            if (local_near || flag_set || is_fading) {
                 if (this->alpha_124_19 == 0xFF) {
                     func_80324CFC(0.0f, COMUSIC_43_ENTER_LEVEL_GLITTER, 32700);
                     func_80324D2C(2.4f, COMUSIC_43_ENTER_LEVEL_GLITTER);
-                    func_8028F918(2);
+                    // Only lock the local player's control when THIS client
+                    // is the one opening the door. Spectating a remote open
+                    // (flag arrived via network) leaves control alone so the
+                    // peer can keep moving while the animation plays.
+                    if (local_near && !flag_set) {
+                        func_8028F918(2);
+                        if (door_idx >= 1 && door_idx < 13) {
+                            s_notedoor_locked_local[door_idx] = TRUE;
+                        }
+                    }
                 }
                 if (this->alpha_124_19 < 7U) {
                     this->alpha_124_19 = 0;
@@ -136,14 +174,20 @@ RECOMP_PATCH void func_80387730(Actor *this) {
                     this->alpha_124_19 -= 7;
                 }
                 if (this->alpha_124_19 == 0) {
-                    // Local open: set flag (flag_sync broadcasts to peers).
-                    // Remote open: flag is already set — skip to avoid echo.
-                    if (!remote_forced) {
+                    // Local trigger: set the flag so peers despawn their copy.
+                    // Remote trigger: flag is already TRUE — skip to avoid echo.
+                    if (!flag_set) {
                         fileProgressFlag_set(door_flag, TRUE);
                     }
                     marker_despawn(this->marker);
-                    func_8028F918(0);
-                    func_8028F66C(BS_INTR_35);
+                    // Unlock only if we actually locked. Prevents unlocking
+                    // control we never took when we were the spectator.
+                    if (door_idx >= 1 && door_idx < 13
+                        && s_notedoor_locked_local[door_idx]) {
+                        func_8028F918(0);
+                        func_8028F66C(BS_INTR_35);
+                        s_notedoor_locked_local[door_idx] = FALSE;
+                    }
                     return;
                 }
                 if (this->marker->unk14_21) {
@@ -169,7 +213,7 @@ RECOMP_PATCH void func_80387730(Actor *this) {
                     }
                 }
             }
-        } else if (!remote_forced && (door_idx >= 2)
+        } else if (can_start_local && (door_idx >= 2)
                    && (ml_vec3f_distance(spAC, this->position) < 290.0f)) {
             progressDialog_setAndTriggerDialog_0(VOLATILE_FLAG_B0_NOT_ENOUGH_NOTES);
         }

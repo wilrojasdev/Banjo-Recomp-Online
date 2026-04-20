@@ -510,7 +510,11 @@ void NetworkManager::update() {
         // Flush regular queued packets
         while (!packet_send_queue_.empty()) {
             auto& qp = packet_send_queue_.front();
-            net_broadcast(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
+            if (qp.target_player == BROADCAST_TARGET) {
+                net_broadcast(qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
+            } else {
+                net_send_to(qp.target_player, qp.data.data(), qp.data.size(), qp.channel, qp.reliable);
+            }
             packet_send_queue_.pop_front();
         }
     }
@@ -1096,19 +1100,26 @@ bool NetworkManager::should_send_host_eeprom(uint8_t& out_player_id) {
     return false;
 }
 
-void NetworkManager::send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player) {
+void NetworkManager::send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player, int16_t current_slot) {
     if (!is_connected() || (!server_ && !coopnet_)) return;
 
     HostEepromPacket pkt{};
     pkt.header.type = PacketType::HostEeprom;
     pkt.header.player_id = local_player_id_;
     pkt.header.sequence = send_sequence_++;
+    pkt.current_slot = current_slot;
     size_t copy = (size < HOST_EEPROM_SIZE) ? size : HOST_EEPROM_SIZE;
     std::memcpy(pkt.eeprom, eeprom_bytes, copy);
 
-    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-    (void)target_player;  // currently broadcast; peers ignore if not them
-    std::printf("[Network] Queued HostEeprom (%zu bytes) for player %u\n", sizeof(pkt), target_player);
+    // Targeted send: HostEeprom is meaningful only to the newly-joined peer.
+    // Broadcasting would spam already-connected clients with ~2 KB of data
+    // they'd enqueue and never consume (their override buffer is already
+    // populated from their own join handshake).
+    // Route through the send queue — the bridge runs on the game thread and
+    // ENet is not thread-safe, so the actual send happens on the SDL thread.
+    enqueue_packet_to(target_player, &pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    std::printf("[Network] Queued HostEeprom (%zu bytes, slot=%d) for player %u\n",
+                sizeof(pkt), (int)current_slot, target_player);
 }
 
 void NetworkManager::handle_host_eeprom_packet(const HostEepromPacket& pkt) {
@@ -1129,11 +1140,16 @@ bool NetworkManager::pop_host_eeprom(HostEepromPacket& out) {
 // === Thread-safe packet sending ===
 
 void NetworkManager::enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable) {
+    enqueue_packet_to(BROADCAST_TARGET, data, size, channel, reliable);
+}
+
+void NetworkManager::enqueue_packet_to(uint8_t target_player, const void* data, size_t size, uint8_t channel, bool reliable) {
     std::lock_guard<std::mutex> lock(send_queue_mutex_);
     QueuedPacket qp;
     qp.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
     qp.channel = channel;
     qp.reliable = reliable;
+    qp.target_player = target_player;
     packet_send_queue_.push_back(std::move(qp));
 }
 

@@ -25,6 +25,7 @@ extern void bkrecomp_net_reset_poll_baselines(void);
 // Save override (network_save_override.c)
 extern bool bkrecomp_net_save_override_is_ready(void);
 extern void bkrecomp_net_save_override_enable(void);
+extern s32  bkrecomp_net_save_get_host_slot(void);
 
 // @recomp Skip intro cutscenes when online mode is configured — boot directly to file select.
 RECOMP_PATCH enum map_e getDefaultBootMap(void) {
@@ -88,13 +89,22 @@ RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
 
         s32 slot;
         if (is_join) {
-            // Pick the first non-empty slot from the host's snapshot.
-            // We don't have the host's exact slot id, but any non-empty
-            // slot maps to the same live state since the host only runs
-            // one save at a time.
-            slot = 0;
-            for (s32 i = 0; i < 3; i++) {
-                if (gameFile_isNotEmpty(i)) { slot = i; break; }
+            // Use the exact slot the host is playing (shipped in the
+            // HostEeprom packet). Scanning for "first non-empty" is wrong
+            // when the host's EEPROM has leftover data in another slot —
+            // we'd load that unrelated save and diverge from the host's
+            // live state.
+            s32 host_slot = bkrecomp_net_save_get_host_slot();
+            if (host_slot < 0 || host_slot > 2) {
+                // Fallback: if for some reason we never got a slot in
+                // the packet, still pick the first non-empty slot rather
+                // than crashing on an out-of-range index.
+                slot = 0;
+                for (s32 i = 0; i < 3; i++) {
+                    if (gameFile_isNotEmpty(i)) { slot = i; break; }
+                }
+            } else {
+                slot = host_slot;
             }
         } else {
             slot = (s32)recomp_net_get_save_slot();

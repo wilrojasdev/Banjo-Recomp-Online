@@ -120,7 +120,7 @@ public:
     // Join: MIPS polls pop_host_eeprom() to fill the override buffer.
     void request_host_eeprom_send(uint8_t player_id);
     bool should_send_host_eeprom(uint8_t& out_player_id);
-    void send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player);
+    void send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, uint8_t target_player, int16_t current_slot);
     bool pop_host_eeprom(HostEepromPacket& out);
 
     // Conga orange projectile sync (world owner spawns, broadcasts to others)
@@ -264,12 +264,16 @@ private:
         std::vector<uint8_t> data;
         uint8_t channel;
         bool reliable;
+        // 0xFF = broadcast to all peers; 0..MAX_PLAYERS-1 = send only to that peer
+        uint8_t target_player;
     };
+    static constexpr uint8_t BROADCAST_TARGET = 0xFF;
     mutable std::mutex send_queue_mutex_;
     std::deque<QueuedPacket> packet_send_queue_;
 
     // Thread-safe enqueue (called from game thread)
     void enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable);
+    void enqueue_packet_to(uint8_t target_player, const void* data, size_t size, uint8_t channel, bool reliable);
 };
 
 } // namespace bknet

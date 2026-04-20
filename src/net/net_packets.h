@@ -290,6 +290,11 @@ constexpr size_t HOST_EEPROM_SIZE = 2048;
 
 struct HostEepromPacket {
     PacketHeader header;
+    // Current save slot the host is playing (0..2). Joiners load this exact
+    // slot instead of guessing the first non-empty one — critical when the
+    // host's EEPROM has multiple non-empty slots and the active one isn't 0.
+    int16_t current_slot;
+    uint8_t _pad[2];
     uint8_t eeprom[HOST_EEPROM_SIZE];
 };
 
