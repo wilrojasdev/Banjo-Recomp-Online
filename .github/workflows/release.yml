@@ -22,6 +22,12 @@ jobs:
 
   release:
     needs: build
+    # Run even if some build platforms failed — we ship whatever
+    # artifacts were produced. As of v0.14.0 the Linux arm64 and
+    # Flatpak builds fail because the prebuilt libjuice.a in
+    # lib/coopnet/lib/linux is x86_64-only; macOS, Windows and
+    # Linux x64 binaries still get published.
+    if: always() && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
       contents: write
