@@ -10,9 +10,17 @@
 #include <thread>
 #include <chrono>
 #ifdef _WIN32
-#include <windows.h>
+// winsock2.h MUST be included before windows.h — otherwise windows.h
+// drags in the legacy <winsock.h>, and every subsequent use of
+// winsock2.h hits redefinition errors (sockaddr, fd_set, timeval,
+// hostent, WSAData, IPPROTO_*). WIN32_LEAN_AND_MEAN also tells
+// windows.h NOT to include the legacy winsock headers.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #include <spawn.h>
