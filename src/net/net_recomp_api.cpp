@@ -375,8 +375,10 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
     // honeycomb_score at 0x25 (3 bytes)
     for (int i = 0; i < 3; i++) pkt.honeycomb_score[i] = MEM_BU(0x25 + i, data_ptr);
     pkt.jinjo_bits = MEM_BU(0x28, data_ptr);
+    pkt.picked_bullion_mask = MEM_BU(0x29, data_ptr);
     pkt.note_count = static_cast<uint16_t>(MEM_HU(0x2A, data_ptr));
     pkt.lives = MEM_BU(0x2C, data_ptr);
+    pkt.bullions = MEM_BU(0x2D, data_ptr);
     // Flag arrays at 0x2E
     for (int i = 0; i < 37; i++) pkt.file_progress_flags[i] = MEM_BU(0x2E + i, data_ptr);
     for (int i = 0; i < 8; i++) pkt.level_specific_flags[i] = MEM_BU(0x53 + i, data_ptr);
@@ -408,8 +410,10 @@ extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
         for (int i = 0; i < 16; i++) MEM_BU(0x15 + i, out_ptr) = pkt.mumbo_score[i];
         for (int i = 0; i < 3; i++) MEM_BU(0x25 + i, out_ptr) = pkt.honeycomb_score[i];
         MEM_BU(0x28, out_ptr) = pkt.jinjo_bits;
+        MEM_BU(0x29, out_ptr) = pkt.picked_bullion_mask;
         MEM_HU(0x2A, out_ptr) = pkt.note_count;
         MEM_BU(0x2C, out_ptr) = pkt.lives;
+        MEM_BU(0x2D, out_ptr) = pkt.bullions;
         // Flag arrays
         for (int i = 0; i < 37; i++) MEM_BU(0x2E + i, out_ptr) = pkt.file_progress_flags[i];
         for (int i = 0; i < 8; i++) MEM_BU(0x53 + i, out_ptr) = pkt.level_specific_flags[i];

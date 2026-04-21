@@ -59,12 +59,25 @@ extern s32 D_8036E564; // bundle count global, read by bundle system
 
 static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_marker);
 
+// Some enemies run their own custom sync module instead of the generic
+// enemy sync below. The generic die-proxy treats every dieFunc call as a
+// one-shot kill AND spawns a honeycomb bundle on remote, neither of which
+// is correct for:
+//   - Nipper (multi-hit boss, 120->80->40->dead lifetime progression)
+//   - Buried Treasure (treasure-hunt chest — jiggy already has its own
+//     spawn path in __chTreasure_die, and honeycomb-on-remote is wrong)
+extern bool bkrecomp_net_is_nipper_marker(u32 marker_id);
+
 // Killable enemies have dieFunc set (death handler from marker_setCollisionScripts).
 // NPCs like Bottles, platforms, pads do NOT have dieFunc.
 static bool is_killable_enemy(Actor *actor) {
     if (!actor || !actor->marker) return FALSE;
     MarkerCollisionFunc df = actor->marker->dieFunc;
     if (!df) return FALSE;
+    // Exclude enemies that run their own custom sync module.
+    u32 mid = (u32)actor->marker->id;
+    if (bkrecomp_net_is_nipper_marker(mid)) return FALSE;
+    if (mid == MARKER_DB_BURIED_TREASURE) return FALSE;
     if (df == (MarkerCollisionFunc)net_enemy_die_proxy) return TRUE;
     return TRUE;
 }
@@ -87,6 +100,7 @@ extern void honeycombscore_set(s32 indx, bool val);
 #define COLLECTIBLE_DESPAWN_ONLY     4  // Non-shared: eggs, feathers, honeycomb
 #define COLLECTIBLE_EMPTY_HONEYCOMB  5  // Shared: panel pieces (2 per world)
 #define COLLECTIBLE_EXTRA_LIFE       6  // Shared: Banjo trophy
+#define COLLECTIBLE_GOLD_BULLION     7  // Shared: TTC gold bullions for Blubber quest
 
 #define EVENT_COLLECTIBLE 0
 #define EVENT_ENEMY       1
@@ -355,6 +369,24 @@ static s32 prev_eggs = 0;
 static s32 prev_red_feathers = 0;
 static s32 prev_gold_feathers = 0;
 static s32 prev_health = 0;
+// Shared (TTC Blubber quest)
+static s32 prev_bullions = 0;
+// Previous-frame snapshot of MARKER_37_GOLD_BULLION actor spawn_indexes,
+// used to identify which specific bullion disappeared (= was picked up
+// locally) in the current frame so we can tag the broadcast with the
+// correct spawn_index. Up to 4 slots — there are only 2 bullions in
+// TTC, but leave headroom.
+#define MAX_BULLION_SNAPSHOT 4
+static u16 prev_bullion_snapshot[MAX_BULLION_SNAPSHOT];
+static s32 prev_bullion_snapshot_count = 0;
+
+// Blubber sync module owns the persistent picked_bullion_mask across
+// sub-map transitions. network_world_sync.c updates it on pickup, and
+// ships the full mask inside WorldStateFullData on late-join so a
+// fresh peer does not see already-collected bullions respawn.
+extern void bkrecomp_net_blubber_mark_bullion_picked(u32 spawn_index);
+extern u32  bkrecomp_net_blubber_get_picked_bullion_mask(void);
+extern void bkrecomp_net_blubber_apply_picked_bullion_mask(u32 mask);
 
 // === Actor search ===
 
@@ -368,6 +400,23 @@ static bool despawn_actor_by_marker_id(u32 marker_id) {
             marker_despawn(actor->marker);
             return TRUE;
         }
+    }
+    return FALSE;
+}
+
+// Despawn the actor matching marker_id AND spawn_index. Used when we
+// need to target a specific instance (two gold bullions in TTC share
+// the same marker id, differ only by spawn order).
+static bool despawn_actor_by_marker_and_spawn(u32 marker_id, u32 spawn_index) {
+    if (!suBaddieActorArray) return FALSE;
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker) continue;
+        if (actor->marker->id != marker_id) continue;
+        if (bkrecomp_get_marker_spawn_index(actor->marker) != spawn_index) continue;
+        marker_despawn(actor->marker);
+        return TRUE;
     }
     return FALSE;
 }
@@ -504,6 +553,79 @@ static void poll_shared_collectibles(void) {
             }
         }
         prev_lives = cur;
+    }
+
+    // --- Gold bullions (TTC Blubber quest) ---
+    // Shared: any player picking one up spawns the bullion in every
+    // inventory, and the actor/prop despawns for everyone. To support
+    // cross-sub-map despawn (if P2 is inside MAP_5 when P1 picks up,
+    // the bullion must still be gone when P2 steps back onto MAP_7),
+    // we identify the picked bullion by its spawn_index and carry it
+    // in the packet's coll_id. The spawn_index is recovered by
+    // diffing a per-frame snapshot of MARKER_37 actors against the
+    // previous frame's snapshot.
+    {
+        // Build current-frame snapshot of *still-live* gold-bullion
+        // actors. marker_despawn is deferred when D_8036E574 is set:
+        // it marks despawn_flag=1 but leaves the actor in the array
+        // until the next cleanup pass. We MUST treat flagged actors
+        // as already gone, otherwise the same-frame pickup diff fails
+        // to identify which spawn_index disappeared (the bullion is
+        // still in the array, so the pickup is broadcast with the
+        // 0xFFFF sentinel and remote peers cannot update their mask).
+        u16 cur_snapshot[MAX_BULLION_SNAPSHOT];
+        s32 cur_snapshot_count = 0;
+        if (suBaddieActorArray) {
+            s32 j;
+            for (j = 0; j < suBaddieActorArray->cnt && cur_snapshot_count < MAX_BULLION_SNAPSHOT; j++) {
+                Actor *actor = &suBaddieActorArray->data[j];
+                if (!actor->marker) continue;
+                if (actor->marker->id != MARKER_37_GOLD_BULLION) continue;
+                if (actor->despawn_flag) continue;
+                cur_snapshot[cur_snapshot_count++] =
+                    (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            }
+        }
+
+        s32 cur = item_getCount(ITEM_18_GOLD_BULLIONS);
+        if (cur == prev_bullions + 1) {
+            // Find which spawn_index was in the previous snapshot but
+            // missing from the current one — that is the bullion the
+            // local player just picked up.
+            u16 picked_si = 0xFFFF;
+            s32 pi;
+            for (pi = 0; pi < prev_bullion_snapshot_count; pi++) {
+                bool still_present = FALSE;
+                s32 ci;
+                for (ci = 0; ci < cur_snapshot_count; ci++) {
+                    if (prev_bullion_snapshot[pi] == cur_snapshot[ci]) {
+                        still_present = TRUE;
+                        break;
+                    }
+                }
+                if (!still_present) {
+                    picked_si = prev_bullion_snapshot[pi];
+                    break;
+                }
+            }
+
+            if (picked_si != 0xFFFF) {
+                bkrecomp_net_blubber_mark_bullion_picked((u32)picked_si);
+            }
+            recomp_net_send_collectible(COLLECTIBLE_GOLD_BULLION,
+                (u32)picked_si, 1, cur_map, cur_level);
+        }
+        prev_bullions = cur;
+
+        // Save current snapshot for next frame's diff. Unroll the
+        // copy to a fixed 4-slot assignment so clang -O2 does NOT
+        // fold it into a memcpy intrinsic (N64Recomp can't resolve
+        // that call at link time).
+        prev_bullion_snapshot[0] = (cur_snapshot_count > 0) ? cur_snapshot[0] : 0;
+        prev_bullion_snapshot[1] = (cur_snapshot_count > 1) ? cur_snapshot[1] : 0;
+        prev_bullion_snapshot[2] = (cur_snapshot_count > 2) ? cur_snapshot[2] : 0;
+        prev_bullion_snapshot[3] = (cur_snapshot_count > 3) ? cur_snapshot[3] : 0;
+        prev_bullion_snapshot_count = cur_snapshot_count;
     }
 }
 
@@ -806,6 +928,26 @@ static void process_collectible_event(WorldEventData *evt) {
             if (cur_map == evt->coll_map_id) {
                 despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
             }
+        } else if (ct == COLLECTIBLE_GOLD_BULLION) {
+            // Resync (sender_id == 0xFE): don't adjust inventory, just
+            // mark the persistent picked mask (so sub-map peers still
+            // know this bullion is gone when they later step into
+            // MAP_7) and despawn by spawn_index on the same map. The
+            // spawn_index is carried in coll_id; 0xFFFF means the
+            // sender couldn't identify a specific bullion (legacy
+            // fallback to position-based despawn).
+            if (evt->coll_id != 0xFFFF) {
+                bkrecomp_net_blubber_mark_bullion_picked((u32)evt->coll_id);
+            }
+            if (cur_map == evt->coll_map_id) {
+                if (evt->coll_id != 0xFFFF) {
+                    despawn_actor_by_marker_and_spawn(MARKER_37_GOLD_BULLION,
+                        (u32)evt->coll_id);
+                } else {
+                    despawn_nearest_actor(MARKER_37_GOLD_BULLION,
+                        evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                }
+            }
         }
 
         processing_remote = FALSE;
@@ -952,6 +1094,37 @@ static void process_collectible_event(WorldEventData *evt) {
             if (same_map) {
                 despawn_actor_by_marker_id(MARKER_61_EXTRA_LIFE);
                 bkrecomp_net_hide_nearest_prop(0, evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+            }
+        } else if (ct == COLLECTIBLE_GOLD_BULLION) {
+            // Shared bullion. Three responsibilities:
+            //   1. Update the persistent picked-bullion mask owned by
+            //      the Blubber sync module. This must run regardless
+            //      of the receiver's current map so that a player
+            //      inside MAP_5 / MAP_6 / MAP_A learns the bullion is
+            //      gone and can despawn it on returning to MAP_7.
+            //   2. Give the receiver +1 in inventory (clamped to the
+            //      natural 2-bullion cap) so either player can deliver
+            //      it to Blubber later.
+            //   3. Despawn the specific actor in the current map by
+            //      spawn_index (carried in coll_id). The legacy
+            //      position-based despawn is kept as a fallback when
+            //      a sender from an older build transmits 0xFFFF.
+            if (evt->coll_id != 0xFFFF) {
+                bkrecomp_net_blubber_mark_bullion_picked((u32)evt->coll_id);
+            }
+            s32 cur_count = item_getCount(ITEM_18_GOLD_BULLIONS);
+            if (cur_count < 2) {
+                item_inc(ITEM_18_GOLD_BULLIONS);
+            }
+            prev_bullions = item_getCount(ITEM_18_GOLD_BULLIONS);
+            if (same_map) {
+                if (evt->coll_id != 0xFFFF) {
+                    despawn_actor_by_marker_and_spawn(MARKER_37_GOLD_BULLION,
+                        (u32)evt->coll_id);
+                } else {
+                    despawn_nearest_actor(MARKER_37_GOLD_BULLION,
+                        evt->coll_pos_x, evt->coll_pos_y, evt->coll_pos_z);
+                }
             }
         }
     }
@@ -1200,10 +1373,10 @@ typedef struct {
     u8  mumbo_score[16];     // 0x15
     u8  honeycomb_score[3];  // 0x25
     u8  jinjo_bits;          // 0x28
-    u8  _pad2;               // 0x29
+    u8  picked_bullion_mask; // 0x29 — TTC bullion spawn_index bitmask (was _pad2)
     u16 note_count;          // 0x2A
     u8  lives;               // 0x2C
-    u8  _pad3;               // 0x2D
+    u8  bullions;            // 0x2D — ITEM_18_GOLD_BULLIONS (Blubber quest)
     // Flag sync data (Phase 8)
     u8  file_progress_flags[37]; // 0x2E (0x25 bytes) -> ends at 0x53
     u8  level_specific_flags[8]; // 0x53 -> ends at 0x5B
@@ -1249,6 +1422,12 @@ static void check_full_sync_send(void) {
     data.jinjo_bits = 0;  // per-level, handled by collectible resync
     data.note_count = 0;  // per-level, handled by collectible resync
     data.lives = (u8)item_getCount(ITEM_16_LIFE);
+    data.bullions = (u8)item_getCount(ITEM_18_GOLD_BULLIONS);
+    // TTC bullion spawn_index mask — tells the joiner which specific
+    // bullions have already been picked up so their local copies can
+    // be despawned before the player walks over a ghost-actor.
+    data.picked_bullion_mask =
+        (u8)bkrecomp_net_blubber_get_picked_bullion_mask();
 
     // Flag state
     {
@@ -1377,6 +1556,24 @@ static void check_full_sync_receive(void) {
         prev_lives = item_getCount(ITEM_16_LIFE);
     }
 
+    // Apply gold bullions (TTC Blubber quest) — late-join recovery.
+    // Clamped to the natural 2-bullion cap.
+    {
+        s32 cur = item_getCount(ITEM_18_GOLD_BULLIONS);
+        s32 target = (s32)data.bullions;
+        if (target > 2) target = 2;
+        if (target > cur) {
+            item_adjustByDiffWithoutHud(ITEM_18_GOLD_BULLIONS, target - cur);
+        }
+        prev_bullions = item_getCount(ITEM_18_GOLD_BULLIONS);
+    }
+
+    // Merge the TTC picked-bullion spawn_index mask. Ensures a late
+    // joiner knows which specific bullion actors have already been
+    // collected in-session, so despawn_picked_bullions (blubber_tick)
+    // can clean them up the next time the joiner sets foot on MAP_7.
+    bkrecomp_net_blubber_apply_picked_bullion_mask((u32)data.picked_bullion_mask);
+
     // Apply flag state + abilities from host
     if (data.has_flags) {
         bkrecomp_net_apply_flag_bulk(
@@ -1427,6 +1624,7 @@ static void check_full_sync_receive(void) {
         if (hs) { s32 i; for (i = 0; i < 3; i++) prev_honeycombscore[i] = hs[i]; }
         prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
         prev_lives = item_getCount(ITEM_16_LIFE);
+        prev_bullions = item_getCount(ITEM_18_GOLD_BULLIONS);
         dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
     }
 
@@ -1466,6 +1664,7 @@ RECOMP_EXPORT void bkrecomp_net_reset_poll_baselines(void) {
     prev_red_feathers  = item_getCount(ITEM_F_RED_FEATHER);
     prev_gold_feathers = item_getCount(ITEM_10_GOLD_FEATHER);
     prev_health        = item_getCount(ITEM_14_HEALTH);
+    prev_bullions      = item_getCount(ITEM_18_GOLD_BULLIONS);
     dbg_prev_jiggy_total = item_getCount(ITEM_26_JIGGY_TOTAL);
 }
 
@@ -1562,6 +1761,36 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     poll_nonshared_collectibles();
     poll_enemy_deaths();
     sync_enemy_positions();
+
+    // TTC Leaky bucket egg-counter sync
+    {
+        extern void bkrecomp_net_leaky_tick(void);
+        bkrecomp_net_leaky_tick();
+    }
+
+    // TTC Sandcastle cheat-code progress sync
+    {
+        extern void bkrecomp_net_sandcastle_tick(void);
+        bkrecomp_net_sandcastle_tick();
+    }
+
+    // TTC Nipper (hermit crab) state + lifetime sync
+    {
+        extern void bkrecomp_net_nipper_tick(void);
+        bkrecomp_net_nipper_tick();
+    }
+
+    // TTC Blubber (pirate) delivery decrement + quest-complete despawn sync
+    {
+        extern void bkrecomp_net_blubber_tick(void);
+        bkrecomp_net_blubber_tick();
+    }
+
+    // TTC Treasure Hunt (red arrow/question/X chain + buried treasure) sync
+    {
+        extern void bkrecomp_net_treasurehunt_tick(void);
+        bkrecomp_net_treasurehunt_tick();
+    }
 
     WorldEventData evt;
     while (recomp_net_pop_world_event(&evt)) {

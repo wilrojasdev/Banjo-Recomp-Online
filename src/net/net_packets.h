@@ -200,6 +200,11 @@ enum WorldFlagType : uint8_t {
     FLAG_HUT_ACTION     = 8,      // MM hut destruction sync (spawn_index in flag_index, smashCount in value)
     FLAG_JUJU_ACTION    = 9,      // MM Juju totem segment hit sync (hit_count in flag_index)
     FLAG_CONGA_HIT      = 10,     // Conga hit count sync (flag_index=unk38_31, value=unk10_12)
+    FLAG_LEAKY_ACTION   = 11,     // TTC Leaky bucket egg-counter sync (value=egg count 0-2)
+    FLAG_SANDCASTLE_ACTION = 12,  // TTC Sandcastle cheat-code progress (flag_index=code idx or 0xFE for BK state, value=new codeCharacterIdx)
+    FLAG_NIPPER_ACTION     = 13,  // TTC Nipper state + lifetime sync (flag_index=sub-action, value=new state / lifetime/40 / has_met_before)
+    FLAG_BLUBBER_ACTION    = 14,  // TTC Blubber delivery decrement + quest-complete despawn (flag_index=sub-action 0/1)
+    FLAG_TREASUREHUNT_ACTION = 15, // TTC Treasure Hunt step counter sync (value=new chtreasureHunt_puzzleCurrentStep 0-6)
 };
 
 struct WorldFlagPacket {
@@ -256,10 +261,10 @@ struct WorldStateFullPacket {
     uint8_t mumbo_score[16];
     uint8_t honeycomb_score[3];
     uint8_t jinjo_bits;         // ITEM_12_JINJOS bitmask
-    uint8_t _pad2;
+    uint8_t picked_bullion_mask; // TTC gold-bullion spawn_index bitmask (was _pad2)
     uint16_t note_count;
     uint8_t lives;
-    uint8_t _pad3;
+    uint8_t bullions;               // ITEM_18_GOLD_BULLIONS — Blubber quest
     // Flag sync (Phase 8)
     uint8_t file_progress_flags[37]; // fileProgressFlags bitfield (0x25 bytes)
     uint8_t level_specific_flags[8]; // levelSpecificFlags bitfield

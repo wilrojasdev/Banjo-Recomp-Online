@@ -74,6 +74,22 @@ extern void bkrecomp_net_hut_remote_destroy(u32 spawn_index, u32 smash_count, u3
 // Juju totem sync (from network_juju_sync.c)
 extern void bkrecomp_net_juju_remote_hit(u32 hit_count, u32 map_id);
 
+// Leaky bucket sync (from network_leaky_sync.c)
+extern void bkrecomp_net_leaky_remote_apply(u32 count, u32 map_id);
+
+// Sandcastle cheat-code sync (from network_sandcastle_sync.c)
+extern void bkrecomp_net_sandcastle_remote_apply(u32 code_index, u32 value);
+
+// Nipper state/lifetime sync (from network_nipper_sync.c)
+extern void bkrecomp_net_nipper_remote_apply(u32 action, u32 value);
+
+// Blubber delivery + quest-complete sync (from network_blubber_sync.c)
+extern void bkrecomp_net_blubber_remote_apply(u32 action, u32 value);
+extern void bkrecomp_net_blubber_on_local_flag1_set(void);
+
+// Treasure hunt (red X chain + buried treasure) sync
+extern void bkrecomp_net_treasurehunt_remote_apply(u32 action, u32 value);
+
 // Ability system
 extern s32 ability_hasLearned(s32 ability);
 extern void ability_getSizeAndPtr(s32 *size, u8 **addr);
@@ -336,6 +352,19 @@ RECOMP_PATCH void mapSpecificFlags_set(s32 i, s32 val) {
         if (i == 0x1F) return;
         recomp_net_send_flag_change(NET_FLAG_MAP_SPECIFIC, (u32)i,
             (u32)new_val, (u32)map_get());
+
+        // Blubber quest: flag 1 (second bullion delivered) is the
+        // single authoritative "quest complete" latch. Only the local
+        // thrower reaches this branch (remote sets are wrapped in
+        // net_applying_remote_flag = TRUE), so broadcasting the
+        // BLUBBER_QUEST_COMPLETE action here guarantees exactly one
+        // emission, no echo from peers. Must fire after the map/level
+        // check above — we key by map_get() for the TTC-specific flag.
+        if (i == (s32)TTC_SPECIFIC_FLAG_1_UNKNOWN
+            && new_val
+            && map_get() == MAP_7_TTC_TREASURE_TROVE_COVE) {
+            bkrecomp_net_blubber_on_local_flag1_set();
+        }
     }
 }
 
@@ -422,6 +451,16 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
         recomp_printf("[JUJU-SYNC] remote hit count=%d map=%d\n", idx, evt->flag_map_id);
     } else if (ft == 10) { /* NET_FLAG_CONGA_HIT */
         bkrecomp_net_apply_conga_hit((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 11) { /* NET_FLAG_LEAKY_ACTION */
+        bkrecomp_net_leaky_remote_apply((u32)evt->flag_value, evt->flag_map_id);
+    } else if (ft == 12) { /* NET_FLAG_SANDCASTLE_ACTION */
+        bkrecomp_net_sandcastle_remote_apply((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 13) { /* NET_FLAG_NIPPER_ACTION */
+        bkrecomp_net_nipper_remote_apply((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 14) { /* NET_FLAG_BLUBBER_ACTION */
+        bkrecomp_net_blubber_remote_apply((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 15) { /* NET_FLAG_TREASUREHUNT_ACTION */
+        bkrecomp_net_treasurehunt_remote_apply((u32)idx, (u32)evt->flag_value);
     } else if (ft == NET_FLAG_MUMBO_ACTION) {
         if (idx == MUMBO_ACTION_LOCK) {
             if (net_mumbo_lock((u8)val)) {
