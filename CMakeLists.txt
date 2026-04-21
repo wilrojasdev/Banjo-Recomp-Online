@@ -72,27 +72,35 @@ add_library(coopnet STATIC ${COOPNET_SOURCES})
 target_include_directories(coopnet PUBLIC ${COOPNET_DIR}/common ${COOPNET_DIR}/lib/include)
 target_compile_definitions(coopnet PRIVATE JUICE_STATIC $<$<PLATFORM_ID:Darwin>:OSX_BUILD=1>)
 target_compile_features(coopnet PRIVATE cxx_std_11)
+
 if (APPLE)
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
         set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_arm)
     else()
         set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_intel)
     endif()
-elseif (WIN32)
-    if (CMAKE_SIZEOF_VOID_P EQUAL 8)
-        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/win64)
-    else()
-        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/win32)
-    endif()
-else()
-    set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/linux)
-endif()
-target_link_directories(coopnet PUBLIC ${COOPNET_LIB_DIR})
-if (APPLE)
+    target_link_directories(coopnet PUBLIC ${COOPNET_LIB_DIR})
     target_link_libraries(coopnet PUBLIC "${COOPNET_LIB_DIR}/libjuice.1.6.2.dylib")
 elseif (WIN32)
-    target_link_libraries(coopnet PUBLIC juice ws2_32 iphlpapi bcrypt)
+    # The prebuilt lib/coopnet/lib/win64/libjuice.a that ships in the
+    # coopnet repository was compiled with MinGW-GCC and cannot be
+    # linked by lld-link / MSVC (undefined __chkstk_ms, __mingw_v*,
+    # etc.). Build libjuice from source here instead so the resulting
+    # juice-static target uses the same MSVC CRT as the rest of the
+    # app.
+    FetchContent_Declare(libjuice
+        GIT_REPOSITORY https://github.com/paullouisageneau/libjuice.git
+        GIT_TAG v1.6.2
+    )
+    set(NO_TESTS ON CACHE BOOL "" FORCE)
+    set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+    set(NO_SERVER ON CACHE BOOL "" FORCE)
+    set(USE_NETTLE OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(libjuice)
+    target_link_libraries(coopnet PUBLIC LibJuice::LibJuiceStatic ws2_32 iphlpapi bcrypt)
 else()
+    set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/linux)
+    target_link_directories(coopnet PUBLIC ${COOPNET_LIB_DIR})
     target_link_libraries(coopnet PUBLIC juice pthread)
 endif()
 
