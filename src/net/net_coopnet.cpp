@@ -143,7 +143,25 @@ void CoopNetTransport::request_lobby_list(const std::string& password) {
 
 void CoopNetTransport::broadcast(const void* data, size_t size) {
     if (current_lobby_id_ == 0) return;
-    coopnet_send(static_cast<const uint8_t*>(data), static_cast<uint64_t>(size));
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    const uint64_t len = static_cast<uint64_t>(size);
+    if (is_host_) {
+        // Host already has every peer_id (assigned in on_peer_connected),
+        // so we can explicitly unicast to each. This is more reliable than
+        // the library broadcast in flaky-NAT scenarios — PlayerAssignment
+        // (also unicast) arrives even when state broadcasts don't.
+        for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
+            uint64_t peer = player_peers_[i];
+            if (peer != INVALID_PEER && peer != local_user_id_) {
+                coopnet_send_to(peer, bytes, len);
+            }
+        }
+    } else {
+        // Non-host joiners may not yet know other joiners' peer_ids — the
+        // mapping is learned lazily on first inbound packet (see on_receive).
+        // Use library broadcast so first-contact still happens.
+        coopnet_send(bytes, len);
+    }
 }
 
 void CoopNetTransport::send_to(uint8_t player_id, const void* data, size_t size) {
@@ -163,7 +181,12 @@ uint8_t CoopNetTransport::peer_count() const {
 // === Peer ID mapping ===
 
 uint8_t CoopNetTransport::assign_player_id(uint64_t peer_id) {
-    // Find first free slot (1-3, since 0 is host)
+    // Idempotent: libcoopnet can fire on_peer_connected multiple times per
+    // peer (once per ICE candidate / connectivity check). Return the existing
+    // slot if the peer is already assigned, otherwise take the first free one.
+    for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
+        if (player_peers_[i] == peer_id) return i;
+    }
     for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
         if (player_peers_[i] == INVALID_PEER) {
             player_peers_[i] = peer_id;
@@ -342,10 +365,24 @@ void CoopNetTransport::on_receive(uint64_t from_user_id, const uint8_t* data, ui
     }
 
     if (player_id == 0xFF) {
-        // Unknown peer — might be a new peer whose PlayerJoin we haven't processed yet
-        std::fprintf(stderr, "[CoopNet] Received data from unknown peer %llu\n",
-                     (unsigned long long)from_user_id);
-        return;
+        // P2P mesh: non-host peers connect directly but only the host assigns
+        // player_ids. Learn the mapping from the packet's own header — every
+        // packet (PlayerPosition, PlayerState, PlayerJoin, ...) carries the
+        // sender's player_id. Without this, data from non-host peers is
+        // silently dropped and only host+self render.
+        if (size < sizeof(PacketHeader)) return;
+        PacketHeader hdr;
+        std::memcpy(&hdr, data, sizeof(hdr));
+        if (hdr.player_id == 0 || hdr.player_id >= MAX_PLAYERS ||
+            s_instance_->player_peers_[hdr.player_id] != INVALID_PEER) {
+            std::fprintf(stderr, "[CoopNet] Received data from unknown peer %llu\n",
+                         (unsigned long long)from_user_id);
+            return;
+        }
+        s_instance_->player_peers_[hdr.player_id] = from_user_id;
+        player_id = hdr.player_id;
+        std::printf("[CoopNet] Learned peer mapping: %llu -> player %u\n",
+                    (unsigned long long)from_user_id, hdr.player_id);
     }
 
     if (s_instance_->packet_callback_) {
@@ -379,6 +416,12 @@ void CoopNetTransport::on_peer_connected(uint64_t peer_id) {
     std::printf("[CoopNet] P2P peer connected: %llu\n", (unsigned long long)peer_id);
 
     if (s_instance_->is_host_) {
+        // Skip if this peer is already assigned — libcoopnet fires this event
+        // multiple times per peer and we don't want to resend assignment/join
+        // packets or trigger connect_callback more than once.
+        if (s_instance_->peer_to_player_id(peer_id) != 0xFF) {
+            return;
+        }
         // Host assigns a player_id to this peer
         uint8_t assigned_id = s_instance_->assign_player_id(peer_id);
         if (assigned_id == 0xFF) {
@@ -419,8 +462,16 @@ void CoopNetTransport::on_peer_connected(uint64_t peer_id) {
             }
         }
     } else {
-        // Client: the peer is the host. We'll get PlayerAssignment via on_receive.
-        std::printf("[CoopNet] P2P connection to host established\n");
+        // Non-host client. The peer could be host, or another joiner in a
+        // 3+ player lobby — libcoopnet establishes a full P2P mesh.
+        // We learn the peer_id->player_id mapping via PlayerAssignment (host)
+        // or from the first data packet's header (other joiners, see on_receive).
+        if (peer_id == s_instance_->lobby_owner_id_) {
+            std::printf("[CoopNet] P2P connection to host established\n");
+        } else {
+            std::printf("[CoopNet] P2P connection to peer %llu established\n",
+                        (unsigned long long)peer_id);
+        }
     }
 }
 

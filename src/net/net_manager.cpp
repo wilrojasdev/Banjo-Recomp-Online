@@ -558,7 +558,14 @@ InterpolatedState NetworkManager::get_remote_player(uint8_t player_id) const {
 uint8_t NetworkManager::player_count() const {
     if (coopnet_) return coopnet_->peer_count();
     if (server_) return server_->client_count() + 1;
-    if (client_ && client_->is_connected()) return 2;
+    if (client_ && client_->is_connected()) {
+        std::lock_guard<std::mutex> lock(roster_mutex_);
+        uint8_t count = 0;
+        for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
+            if (player_roster_[i].connected) count++;
+        }
+        return count > 0 ? count : 1;
+    }
     return 1;
 }
 
