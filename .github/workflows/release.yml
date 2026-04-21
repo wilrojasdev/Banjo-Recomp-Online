@@ -5,9 +5,12 @@ on:
       - 'v*'
   workflow_dispatch:  # Manual trigger from the Actions tab
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+# NOTE: no top-level concurrency group here. validate.yml already
+# declares its own (`${{ github.workflow }}-${{ github.ref }}`), and
+# because `github.workflow` inside a reusable workflow resolves to the
+# CALLER's name, both would hash to `release-v0.14.0` and GitHub would
+# detect a reusable-workflow deadlock (top level vs callee waiting on
+# the same group). Letting validate own the group is enough.
 
 jobs:
   # Reuse the validate pipeline to build all platforms. It produces
