@@ -85,16 +85,16 @@ jobs:
           prerelease: false
           generate_release_notes: true
           body: |
-            ## 🎮 BK64-Online — cooperativo online para Banjo-Kazooie
+            ## 🎮 BK64-Online — online co-op for Banjo-Kazooie
 
-            Descargar el binario para tu sistema operativo abajo.
+            Download the binary for your OS below.
 
-            ### Requisitos
-            - ROM de Banjo-Kazooie **NTSC-U 1.0** (no incluido)
-            - Un amigo 🎉
+            ### Requirements
+            - Banjo-Kazooie **NTSC-U 1.0** ROM (not included)
+            - A friend 🎉
 
-            ### Cómo jugar
-            Uno hace **Host** (CoopNet recomendado) y el otro hace **Join** con la contraseña del lobby. Detalles completos en el [README](../blob/main/README.md).
+            ### How to play
+            One player hosts (**CoopNet** recommended) and the other joins with the lobby password. Full instructions in the [README](../blob/main/README.md).
 
-            ### Qué incluye esta versión
-            Ver las notas auto-generadas abajo — contienen el resumen de commits desde la versión anterior.
+            ### What's in this release
+            See the auto-generated notes below — they contain the commit summary since the previous tag.

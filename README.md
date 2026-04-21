@@ -1,60 +1,60 @@
 # BK64-Online
 
-**Juega Banjo-Kazooie en cooperativo online con un amigo.**
-Basado en [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — no es un emulador, es el juego recompilado nativamente para PC.
+**Play Banjo-Kazooie in online co-op with a friend.**
+Built on top of [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — this is not an emulator, it's the game recompiled natively for PC.
 
-> ⚠️ **Necesitas un ROM de Banjo-Kazooie (versión NTSC-U 1.0).** Este proyecto no incluye archivos del juego.
+> ⚠️ **You need a Banjo-Kazooie ROM (NTSC-U 1.0).** This project does not bundle any game assets.
 
 ---
 
-## 📥 Descargar
+## 📥 Download
 
-Descarga la versión más reciente desde **[Releases](../../releases)**:
+Grab the latest build from **[Releases](../../releases)**:
 
-| Plataforma | Archivo | Instrucciones |
+| Platform | File | Instructions |
 |---|---|---|
-| 🪟 **Windows** | `BK64-Online-Windows.zip` | Extrae el zip y ejecuta `BanjoRecompiled.exe` |
-| 🍎 **macOS** (Intel + Apple Silicon) | `BK64-Online-macOS.zip` | Extrae el zip y abre `BanjoRecompiled.app` |
-| 🐧 **Linux** | `BK64-Online-Linux-X64.tar.gz` | `tar -xzf` y ejecuta `./BanjoRecompiled` |
+| 🪟 **Windows** | `BK64-Online-Windows.zip` | Extract the zip and run `BanjoRecompiled.exe` |
+| 🍎 **macOS** (Intel + Apple Silicon) | `BK64-Online-macOS.zip` | Extract the zip and open `BanjoRecompiled.app` |
+| 🐧 **Linux** | `BK64-Online-Linux-X64.tar.gz` | `tar -xzf` and run `./BanjoRecompiled` |
 
-En el primer arranque el juego te pedirá el ROM. Coloca tu ROM NTSC-U 1.0 donde te indique y listo.
-
----
-
-## 🎮 Cómo jugar
-
-### Anfitrión (uno de los dos crea la partida)
-
-1. Abre el juego → menú **Host**
-2. Elige modo de conexión:
-   - **CoopNet** (recomendado) — conecta por internet sin abrir puertos. Comparte la contraseña del lobby con tu amigo.
-   - **Direct (LAN/VPN)** — usa tu IP directamente. Útil si están en la misma red o con VPN como Hamachi/ZeroTier.
-3. Selecciona tu partida guardada. Listo, estás esperando al otro jugador.
-
-### Invitado (el que se une)
-
-1. Abre el juego → menú **Join**
-2. **Private Lobbies** → introduce la contraseña del anfitrión, o **Direct Connection** → introduce la IP.
-3. Tu partida guardada se reemplaza **solo durante la sesión** por la del anfitrión. Tu save local queda intacto.
+On first launch the game will ask for your ROM. Drop your NTSC-U 1.0 ROM where it tells you and you're done.
 
 ---
 
-## ✨ Qué hace el modo cooperativo
+## 🎮 How to play
 
-- **Fantasma del otro jugador en tiempo real** — ves su animación, saltos, ataques, transformaciones (termita, calabaza, morsa, cocodrilo, abeja, wishy-washy).
-- **Coleccionables compartidos** — jiggies, notas, jinjos, panales vacíos, tokens de Mumbo y vidas cuentan para los dos.
-- **Enemigos sincronizados** — el que mate uno cuenta para ambos; los enemigos se mueven igual en la pantalla de ambos.
-- **Jefes y NPCs** — Bottles, Mumbo, Nipper, Blubber, Conga, Juju, cabañas MM, Clanker y más respetan el estado compartido.
-- **Puzles de mundo** — piezas de rompecabezas (Lair), códigos del castillo de arena (TTC), baldes de leche (Leaky), caza del tesoro (X + cofre), switches y puertas.
-- **Nombres flotantes** sobre cada jugador + **lista de jugadores** (mantén `CTRL`).
-- **Chat** — presiona `Tab` para escribir.
-- **Bloqueo de NPC** — cuando alguien habla con Bottles o se transforma con Mumbo, el otro espera su turno.
+### Hosting (one of you starts the game)
 
-Progreso detallado por mundo: [PROGRESS.md](../../blob/main/PROGRESS.md)
+1. Open the game → **Host** menu
+2. Pick a connection mode:
+   - **CoopNet** (recommended) — connects over the internet without port forwarding. Share the lobby password with your friend.
+   - **Direct (LAN/VPN)** — uses your IP directly. Useful when you're on the same network or using a VPN like Hamachi / ZeroTier.
+3. Pick the save slot you want to play. That's it — you're now waiting for the other player.
 
-### Mundos cubiertos
+### Joining
 
-| Mundo | Estado |
+1. Open the game → **Join** menu
+2. **Private Lobbies** → enter the host's password, or **Direct Connection** → enter the host's IP.
+3. Your save is replaced **only for the session** by the host's save. Your local save on disk is left untouched.
+
+---
+
+## ✨ What the co-op mode does
+
+- **Live ghost of the other player** — you see their animations, jumps, attacks, and transformations (termite, pumpkin, walrus, crocodile, bee, wishy-washy).
+- **Shared collectibles** — jiggies, musical notes, jinjos, empty honeycombs, Mumbo tokens and extra lives count for both players.
+- **Synced enemies** — if one of you kills something, it counts for both; enemies move identically on everyone's screen.
+- **Bosses and NPCs** — Bottles, Mumbo, Nipper, Blubber, Conga, Juju, MM huts, Clanker and more respect the shared state.
+- **World puzzles** — jigsaw pedestals (Lair), sandcastle letter codes (TTC), Leaky the bucket, Treasure Hunt (X + chest), switches and doors.
+- **Floating nametags** above each player + **player list overlay** (hold `CTRL`).
+- **Chat** — press `Tab` to type.
+- **NPC locking** — when someone is talking to Bottles or transforming with Mumbo, the other player has to wait their turn.
+
+Detailed per-world progress: [PROGRESS.md](../../blob/main/PROGRESS.md)
+
+### World coverage
+
+| World | Status |
 |---|---|
 | 🏠 Spiral Mountain | ✅ 90% |
 | 🏰 Gruntilda's Lair (hub) | ✅ 85% |
@@ -71,50 +71,50 @@ Progreso detallado por mundo: [PROGRESS.md](../../blob/main/PROGRESS.md)
 
 ---
 
-## ❓ Preguntas frecuentes
+## ❓ FAQ
 
-**¿Necesita el ROM?**
-Sí, obligatorio. El juego no incluye assets — por copyright. Usa tu copia legal del cartucho NTSC-U 1.0.
+**Do I need the ROM?**
+Yes, required. The game does not bundle assets — copyright reasons. Use your own legal copy of the NTSC-U 1.0 cartridge.
 
-**¿Funciona con emuladores o roms de otras regiones?**
-No, solo con el ROM NTSC-U 1.0 decompilado. No es un emulador.
+**Does it work with emulators or ROMs from other regions?**
+No, only with the decompressed NTSC-U 1.0 ROM. This is a native recompilation, not an emulator.
 
-**¿Mi partida guardada se ve afectada al unirme a una sesión?**
-No. Al unirte, el juego usa una copia en memoria del save del anfitrión. Tu save local en disco queda igual y solo se escribe cuando juegas en solitario.
+**Is my save file affected when I join a session?**
+No. When you join, the game uses an in-memory copy of the host's save. Your local save on disk stays untouched and only gets written when you play solo.
 
-**¿Se puede jugar con más de 2 jugadores?**
-El sync está probado con 2 jugadores. Técnicamente soporta hasta 4, pero no está garantizado.
+**Can I play with more than 2 players?**
+The sync is tested with 2 players. Technically up to 4 is supported, but not guaranteed to be stable.
 
-**¿Necesito abrir puertos?**
-No si usas **CoopNet** (recomendado). El modo Direct sí requiere abrir puerto 7777 o estar en la misma LAN/VPN.
+**Do I need to open ports?**
+Not if you use **CoopNet** (recommended). The Direct mode does require opening port 7777 or being on the same LAN / VPN.
 
-**La conexión falla o es lenta**
-Si CoopNet no conecta, intenta el modo **Direct** con Hamachi/ZeroTier (redes virtuales gratuitas). También revisa que ambos estén en la misma versión del juego.
-
----
-
-## 🛠️ Para desarrolladores
-
-- Cómo compilar desde el código fuente: [BUILDING.md](BUILDING.md)
-- Seguimiento de progreso por mundo: [PROGRESS.md](../../blob/main/PROGRESS.md)
-- Arquitectura: los patches MIPS en `patches/` interceptan el código del juego y el lado C++ en `src/net/` maneja la red (CoopNet/ENet).
-
-El script `build.sh` en la raíz del proyecto automatiza todo el pipeline de compilación (cross-compile MIPS → N64Recomp → PatchesLib → BanjoRecompiled).
+**The connection fails or is slow**
+If CoopNet won't connect, try **Direct** mode with Hamachi / ZeroTier (free virtual LAN services). Also make sure both players are on the same game version.
 
 ---
 
-## 🙏 Créditos
+## 🛠️ For developers
 
-- [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — proyecto base
-- [N64Recomp](https://github.com/N64Recomp/N64Recomp) — framework de recompilación estática
-- [RT64](https://github.com/rt64/rt64) — motor de renderizado
-- [CoopNet](https://github.com/djoslin0/coopnet) — red P2P con NAT traversal (portada de SM64 Coop DX)
-- [Banjo-Kazooie Decompilation](https://gitlab.com/banjo.decomp/banjo-kazooie) — headers y símbolos del juego original
+- How to build from source: [BUILDING.md](BUILDING.md)
+- Per-world sync progress tracker: [PROGRESS.md](../../blob/main/PROGRESS.md)
+- Architecture: MIPS patches in `patches/` intercept game functions, and the C++ side in `src/net/` handles networking (CoopNet / ENet).
+
+The `build.sh` script in the project root automates the full build pipeline (MIPS cross-compile → N64Recomp → PatchesLib → BanjoRecompiled).
 
 ---
 
-## ⚖️ Licencia
+## 🙏 Credits
 
-Este proyecto es una modificación de Banjo: Recompiled. Consulta el proyecto base para los términos de licencia. Este repositorio **no contiene ningún asset ni código propietario del juego original** — debes proporcionar tu propio ROM.
+- [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — base project
+- [N64Recomp](https://github.com/N64Recomp/N64Recomp) — static recompilation framework
+- [RT64](https://github.com/rt64/rt64) — rendering engine
+- [CoopNet](https://github.com/djoslin0/coopnet) — P2P networking with NAT traversal (ported from SM64 Coop DX)
+- [Banjo-Kazooie Decompilation](https://gitlab.com/banjo.decomp/banjo-kazooie) — headers and symbols for the original game
 
-Banjo-Kazooie™ es marca registrada de Nintendo / Rare. Este proyecto no está afiliado ni respaldado por ninguna de esas compañías.
+---
+
+## ⚖️ License
+
+This project is a modification of Banjo: Recompiled. See the base project for license terms. This repository **does not contain any assets or proprietary code from the original game** — you need to provide your own ROM.
+
+Banjo-Kazooie™ is a trademark of Nintendo / Rare. This project is not affiliated with or endorsed by either company.
