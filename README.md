@@ -1,129 +1,120 @@
 # BK64-Online
 
-**Online cooperative multiplayer for Banjo-Kazooie**, built on top of [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp).
+**Juega Banjo-Kazooie en cooperativo online con un amigo.**
+Basado en [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — no es un emulador, es el juego recompilado nativamente para PC.
 
-Play through the entire game with a friend over the internet. Explore worlds together, collect items collaboratively, and watch each other's progress in real time.
-
-> **This project does not contain game assets.** A US 1.0 Banjo-Kazooie ROM is required.
-
----
-
-## Features
-
-### Multiplayer
-- **Online Co-op** via [CoopNet](https://github.com/coopnet) (NAT traversal, no port forwarding needed) or Direct IP
-- **Ghost System** -- see your partner moving through the world in real time
-- **Shared Progress** -- jiggies, notes, jinjos, mumbo tokens, empty honeycombs, and abilities sync between players
-- **Collectible Deduplication** -- no double-counting when both players grab the same item
-- **Enemy & NPC Sync** -- enemy kills, Bottles conversations, and Mumbo transformations are coordinated
-- **World Object Sync** -- destructible huts, Juju totem, Conga encounters, Chimpy delivery
-- **Jigsaw Puzzle Sync** -- cooperative pedestal solving with player locking
-- **Flag & Switch Sync** -- doors, platforms, and world events stay consistent
-- **Floating Nametags** -- see your partner's name above their ghost
-- **Player List Overlay** -- press CTRL to see connected players
-
-### Inherited from Banjo: Recompiled
-- Native PC port via static recompilation (not emulation)
-- High framerate, widescreen/ultrawide, dual analog camera
-- Note saving, instant load times, mod support
-- Windows, Linux, and macOS
+> ⚠️ **Necesitas un ROM de Banjo-Kazooie (versión NTSC-U 1.0).** Este proyecto no incluye archivos del juego.
 
 ---
 
-## Getting Started
+## 📥 Descargar
 
-### Host a Game
-1. Launch the game and select **Host**
-2. Choose **CoopNet** (internet) or **Direct** (LAN/VPN)
-3. Share the lobby code or your IP with your partner
+Descarga la versión más reciente desde **[Releases](../../releases)**:
 
-### Join a Game
-1. Launch the game and select **Join**
-2. Enter the lobby code (CoopNet) or host IP (Direct)
+| Plataforma | Archivo | Instrucciones |
+|---|---|---|
+| 🪟 **Windows** | `BK64-Online-Windows.zip` | Extrae el zip y ejecuta `BanjoRecompiled.exe` |
+| 🍎 **macOS** (Intel + Apple Silicon) | `BK64-Online-macOS.zip` | Extrae el zip y abre `BanjoRecompiled.app` |
+| 🐧 **Linux** | `BK64-Online-Linux-X64.tar.gz` | `tar -xzf` y ejecuta `./BanjoRecompiled` |
 
----
-
-## Building
-
-### Requirements
-- CMake 3.20+
-- A C/C++ compiler (Clang recommended)
-- MIPS cross-compiler for patches (Clang with MIPS target)
-- US 1.0 Banjo-Kazooie ROM
-
-### Build Steps
-
-```bash
-# Configure (first time only)
-cd BanjoRecomp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-# Build (after any code change)
-cd ..
-./build.sh
-```
-
-The `build.sh` script handles the full pipeline:
-1. Cross-compiles patches to MIPS (`patches.elf`)
-2. Runs N64Recomp to generate recompiled C code
-3. Builds PatchesLib and links the final executable
-
-> **Important:** Always use `./build.sh` instead of building individual targets. The N64Recomp step is required to convert patch changes into host code.
+En el primer arranque el juego te pedirá el ROM. Coloca tu ROM NTSC-U 1.0 donde te indique y listo.
 
 ---
 
-## Architecture
+## 🎮 Cómo jugar
 
-```
-Patches (MIPS C)          Host (C++)
-+-----------------------+ +---------------------------+
-| network_world_sync.c  | | net_manager.cpp           |
-| network_conga_sync.c  | | net_recomp_api.cpp        |
-| network_flag_sync.c   | | net_packets.h             |
-| network_bottles_sync.c| | NetworkManager            |
-| network_mumbo_sync.c  | | CoopNetTransport / ENet   |
-| network_remote_player | +---------------------------+
-| network_jigsaw_sync.c |
-| network_hut_sync.c    |
-| network_juju_sync.c   |
-| note_saving.c         |
-+-----------------------+
-```
+### Anfitrión (uno de los dos crea la partida)
 
-**Patches** run inside the recompiled N64 game engine (MIPS → host via N64Recomp). They intercept game functions to detect state changes and broadcast them.
+1. Abre el juego → menú **Host**
+2. Elige modo de conexión:
+   - **CoopNet** (recomendado) — conecta por internet sin abrir puertos. Comparte la contraseña del lobby con tu amigo.
+   - **Direct (LAN/VPN)** — usa tu IP directamente. Útil si están en la misma red o con VPN como Hamachi/ZeroTier.
+3. Selecciona tu partida guardada. Listo, estás esperando al otro jugador.
 
-**Host code** manages networking (CoopNet/ENet), packet serialization, and bridges events between the network layer and the patch callbacks.
+### Invitado (el que se une)
+
+1. Abre el juego → menú **Join**
+2. **Private Lobbies** → introduce la contraseña del anfitrión, o **Direct Connection** → introduce la IP.
+3. Tu partida guardada se reemplaza **solo durante la sesión** por la del anfitrión. Tu save local queda intacto.
 
 ---
 
-## Synchronized Systems
+## ✨ Qué hace el modo cooperativo
 
-| System | Method | Scope |
-|--------|--------|-------|
-| Jiggies | Bitfield polling + `despawn_jiggy_by_id` | Global |
-| Notes | Collision callback + `is_note_collected` dedup | Per-level |
-| Jinjos | Bit-mask + remote jiggy spawn on completion | Per-level |
-| Mumbo Tokens | Bitfield polling + UID-based actor despawn | Global |
-| Empty Honeycombs | Bitfield polling + UID-based actor despawn | Global |
-| Enemies | Death callback + spawn index tracking | Per-map |
-| Flags | RECOMP_PATCH on all 4 flag systems | Per-type |
-| Bottles | NPC lock + ability broadcast | Per-actor |
-| Mumbo | Transformation sync + token deduction | Per-level |
-| Jigsaw Puzzles | Lock/place/complete protocol | Per-pedestal |
-| MM Objects | Hut smash, Juju hits, Conga oranges | Per-actor |
+- **Fantasma del otro jugador en tiempo real** — ves su animación, saltos, ataques, transformaciones (termita, calabaza, morsa, cocodrilo, abeja, wishy-washy).
+- **Coleccionables compartidos** — jiggies, notas, jinjos, panales vacíos, tokens de Mumbo y vidas cuentan para los dos.
+- **Enemigos sincronizados** — el que mate uno cuenta para ambos; los enemigos se mueven igual en la pantalla de ambos.
+- **Jefes y NPCs** — Bottles, Mumbo, Nipper, Blubber, Conga, Juju, cabañas MM, Clanker y más respetan el estado compartido.
+- **Puzles de mundo** — piezas de rompecabezas (Lair), códigos del castillo de arena (TTC), baldes de leche (Leaky), caza del tesoro (X + cofre), switches y puertas.
+- **Nombres flotantes** sobre cada jugador + **lista de jugadores** (mantén `CTRL`).
+- **Chat** — presiona `Tab` para escribir.
+- **Bloqueo de NPC** — cuando alguien habla con Bottles o se transforma con Mumbo, el otro espera su turno.
+
+Progreso detallado por mundo: [PROGRESS.md](../../blob/main/PROGRESS.md)
+
+### Mundos cubiertos
+
+| Mundo | Estado |
+|---|---|
+| 🏠 Spiral Mountain | ✅ 90% |
+| 🏰 Gruntilda's Lair (hub) | ✅ 85% |
+| ⛰️ Mumbo's Mountain | ✅ 70% |
+| 🏖️ Treasure Trove Cove | ✅ 95% |
+| 🐙 Clanker's Cavern | 🔧 60% |
+| 🐸 Bubblegloop Swamp | 🔧 50% |
+| ❄️ Freezeezy Peak | 🔧 40% |
+| 🏜️ Gobi's Valley | 🔧 50% |
+| 👻 Mad Monster Mansion | 🔧 45% |
+| 🚢 Rusty Bucket Bay | 🔧 45% |
+| 🌳 Click Clock Wood | 🔧 35% |
+| 🧙 Final Boss | 🔧 30% |
 
 ---
 
-## Credits
+## ❓ Preguntas frecuentes
 
-- [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) -- the base project
-- [N64Recomp](https://github.com/N64Recomp/N64Recomp) -- static recompilation framework
-- [RT64](https://github.com/rt64/rt64) -- rendering engine
-- [CoopNet](https://github.com/coopnet) -- P2P networking with NAT traversal
-- [BK Decompilation](https://github.com/bombsquad-community/banern) -- reverse engineering headers and functions
+**¿Necesita el ROM?**
+Sí, obligatorio. El juego no incluye assets — por copyright. Usa tu copia legal del cartucho NTSC-U 1.0.
+
+**¿Funciona con emuladores o roms de otras regiones?**
+No, solo con el ROM NTSC-U 1.0 decompilado. No es un emulador.
+
+**¿Mi partida guardada se ve afectada al unirme a una sesión?**
+No. Al unirte, el juego usa una copia en memoria del save del anfitrión. Tu save local en disco queda igual y solo se escribe cuando juegas en solitario.
+
+**¿Se puede jugar con más de 2 jugadores?**
+El sync está probado con 2 jugadores. Técnicamente soporta hasta 4, pero no está garantizado.
+
+**¿Necesito abrir puertos?**
+No si usas **CoopNet** (recomendado). El modo Direct sí requiere abrir puerto 7777 o estar en la misma LAN/VPN.
+
+**La conexión falla o es lenta**
+Si CoopNet no conecta, intenta el modo **Direct** con Hamachi/ZeroTier (redes virtuales gratuitas). También revisa que ambos estén en la misma versión del juego.
 
 ---
 
-## License
+## 🛠️ Para desarrolladores
 
-This project is a modification of Banjo: Recompiled. See the original project for license terms. This repository does not contain any game assets or proprietary code from the original game.
+- Cómo compilar desde el código fuente: [BUILDING.md](BUILDING.md)
+- Seguimiento de progreso por mundo: [PROGRESS.md](../../blob/main/PROGRESS.md)
+- Arquitectura: los patches MIPS en `patches/` interceptan el código del juego y el lado C++ en `src/net/` maneja la red (CoopNet/ENet).
+
+El script `build.sh` en la raíz del proyecto automatiza todo el pipeline de compilación (cross-compile MIPS → N64Recomp → PatchesLib → BanjoRecompiled).
+
+---
+
+## 🙏 Créditos
+
+- [Banjo: Recompiled](https://github.com/BanjoRecomp/BanjoRecomp) — proyecto base
+- [N64Recomp](https://github.com/N64Recomp/N64Recomp) — framework de recompilación estática
+- [RT64](https://github.com/rt64/rt64) — motor de renderizado
+- [CoopNet](https://github.com/djoslin0/coopnet) — red P2P con NAT traversal (portada de SM64 Coop DX)
+- [Banjo-Kazooie Decompilation](https://gitlab.com/banjo.decomp/banjo-kazooie) — headers y símbolos del juego original
+
+---
+
+## ⚖️ Licencia
+
+Este proyecto es una modificación de Banjo: Recompiled. Consulta el proyecto base para los términos de licencia. Este repositorio **no contiene ningún asset ni código propietario del juego original** — debes proporcionar tu propio ROM.
+
+Banjo-Kazooie™ es marca registrada de Nintendo / Rare. Este proyecto no está afiliado ni respaldado por ninguna de esas compañías.

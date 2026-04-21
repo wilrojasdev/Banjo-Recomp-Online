@@ -1,0 +1,100 @@
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:  # Manual trigger from the Actions tab
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Reuse the validate pipeline to build all platforms. It produces
+  # upload-artifact entries for Linux (x64, arm64), Windows, macOS —
+  # in both Debug and Release types. We only ship Release binaries.
+  build:
+    uses: ./.github/workflows/validate.yml
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so generate_release_notes can diff
+
+      - name: Download Release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: BanjoRecompiled-*-Release
+          path: artifacts/
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== artifact tree ==="
+          find artifacts -maxdepth 3 -print
+          echo "=== done ==="
+
+      - name: Repackage per-platform release archives
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p ../release
+          for dir in */; do
+            name="${dir%/}"
+            cd "$dir"
+
+            # Figure out the friendly name we want in the release.
+            # The artifact names look like:
+            #   BanjoRecompiled-Linux-X64-Release
+            #   BanjoRecompiled-Linux-ARM64-Release
+            #   BanjoRecompiled-Windows-Release
+            #   BanjoRecompiled-macOS-Release
+            friendly="$(echo "$name" | sed 's/^BanjoRecompiled-/BK64-Online-/; s/-Release$//')"
+
+            # macOS and Linux artifacts each contain a single archive
+            # already (BanjoRecompiled.zip / BanjoRecompiled.tar.gz);
+            # just rename it. Windows artifact is a loose directory
+            # tree (exe + DLLs + assets) — zip it up.
+            if [ -f BanjoRecompiled.zip ]; then
+              cp BanjoRecompiled.zip "../../release/${friendly}.zip"
+            elif [ -f BanjoRecompiled.tar.gz ]; then
+              cp BanjoRecompiled.tar.gz "../../release/${friendly}.tar.gz"
+            else
+              (zip -r "../../release/${friendly}.zip" .)
+            fi
+
+            cd ..
+          done
+
+          echo "=== release tree ==="
+          ls -la ../release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 🎮 BK64-Online — cooperativo online para Banjo-Kazooie
+
+            Descargar el binario para tu sistema operativo abajo.
+
+            ### Requisitos
+            - ROM de Banjo-Kazooie **NTSC-U 1.0** (no incluido)
+            - Un amigo 🎉
+
+            ### Cómo jugar
+            Uno hace **Host** (CoopNet recomendado) y el otro hace **Join** con la contraseña del lobby. Detalles completos en el [README](../blob/main/README.md).
+
+            ### Qué incluye esta versión
+            Ver las notas auto-generadas abajo — contienen el resumen de commits desde la versión anterior.
