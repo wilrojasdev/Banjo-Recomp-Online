@@ -74,11 +74,11 @@ target_compile_definitions(coopnet PRIVATE JUICE_STATIC $<$<PLATFORM_ID:Darwin>:
 target_compile_features(coopnet PRIVATE cxx_std_11)
 
 if (APPLE)
-    if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
-        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_arm)
-    else()
-        set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_intel)
-    endif()
+    # Always use the fat (universal) dylib. Per-arch dylibs break
+    # CMAKE_OSX_ARCHITECTURES="x86_64;arm64" universal builds — CMake
+    # picks a single linker input per target, so the "other" arch hits
+    # "ignoring file ... required architecture" + undefined symbols.
+    set(COOPNET_LIB_DIR ${COOPNET_DIR}/lib/mac_universal)
     target_link_directories(coopnet PUBLIC ${COOPNET_LIB_DIR})
     target_link_libraries(coopnet PUBLIC "${COOPNET_LIB_DIR}/libjuice.1.6.2.dylib")
 elseif (WIN32)
