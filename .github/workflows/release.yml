@@ -37,10 +37,22 @@ jobs:
         with:
           fetch-depth: 0  # full history so generate_release_notes can diff
 
-      - name: Download Release artifacts
+      # Validate.yml uses different "release-like" names per platform:
+      #   Linux / macOS / Flatpak : ...-Release
+      #   Windows                 : ...-RelWithDebInfo  (+ a separate
+      #                             ...-PDB-* artifact for symbols)
+      # Download both and filter out the Debug + PDB noise in the repack
+      # step below.
+      - name: Download release-type artifacts (-Release)
         uses: actions/download-artifact@v4
         with:
           pattern: BanjoRecompiled-*-Release
+          path: artifacts/
+
+      - name: Download release-type artifacts (-RelWithDebInfo)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: BanjoRecompiled-*-RelWithDebInfo
           path: artifacts/
 
       - name: List downloaded artifacts
@@ -58,15 +70,23 @@ jobs:
           mkdir -p ../release
           for dir in */; do
             name="${dir%/}"
+
+            # Skip the Debug builds and the Windows PDB side-artifact
+            # — they are uploaded only for post-mortem debugging and
+            # should not clutter the public release.
+            case "$name" in
+              *-Debug|BanjoRecompiled-PDB-*) continue ;;
+            esac
+
             cd "$dir"
 
             # Figure out the friendly name we want in the release.
             # The artifact names look like:
             #   BanjoRecompiled-Linux-X64-Release
-            #   BanjoRecompiled-Linux-ARM64-Release
-            #   BanjoRecompiled-Windows-Release
+            #   BanjoRecompiled-Flatpak-X64-Release
+            #   BanjoRecompiled-Windows-RelWithDebInfo
             #   BanjoRecompiled-macOS-Release
-            friendly="$(echo "$name" | sed 's/^BanjoRecompiled-/BK64-Online-/; s/-Release$//')"
+            friendly="$(echo "$name" | sed 's/^BanjoRecompiled-/BK64-Online-/; s/-Release$//; s/-RelWithDebInfo$//')"
 
             # macOS and Linux artifacts each contain a single archive
             # already (BanjoRecompiled.zip / BanjoRecompiled.tar.gz);
