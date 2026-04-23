@@ -408,6 +408,94 @@ static void bump_level_notescore(s32 level_id) {
         D_80385FF0[level_id] = (u8)count;
     }
 }
+
+// Forward decl: poll_collected_jinjos() below calls despawn_actor_by_marker_id()
+// which is defined further down in the file.
+static bool despawn_actor_by_marker_id(u32 marker_id);
+
+// === Persistent per-level jinjo bitfield ===
+// Stored in loaded_file_extension_data.jinjos_collected[level_idx] so the
+// state survives death, world re-entry, and save/load. Shared across all
+// players in a session — once anyone collects a jinjo, it stays collected
+// for everyone. Bits 0..4 = Blue/Green/Orange/Pink/Yellow.
+static u8 get_jinjo_flags_for_level(s32 level_id) {
+    s32 arr_idx = level_id_to_level_array_index((enum level_e)level_id);
+    if (arr_idx < 0 || arr_idx >= 9) return 0;
+    return loaded_file_extension_data.jinjos_collected[arr_idx];
+}
+
+static void mark_jinjo_collected(s32 level_id, u8 bit_mask) {
+    s32 arr_idx = level_id_to_level_array_index((enum level_e)level_id);
+    if (arr_idx < 0 || arr_idx >= 9) return;
+    loaded_file_extension_data.jinjos_collected[arr_idx] |= bit_mask;
+}
+
+static u32 jinjo_bit_to_marker_id(u8 bit) {
+    if (bit & 0x01) return MARKER_5A_JINJO_BLUE;
+    if (bit & 0x02) return MARKER_5B_JINJO_GREEN;
+    if (bit & 0x04) return MARKER_5C_JINJO_ORANGE;
+    if (bit & 0x08) return MARKER_5D_JINJO_PINK;
+    if (bit & 0x10) return MARKER_5E_JINJO_YELLOW;
+    return 0;
+}
+
+// Per-frame reconciliation between the persistent jinjo bitfield (source
+// of truth) and the vanilla ITEM_12_JINJOS counter + live actors. Three
+// jobs:
+//   1) If the vanilla counter is out of sync with the bitfield (typical
+//      after death, which resets the counter but NOT the bitfield), top
+//      it up silently so the HUD matches shared progress.
+//   2) Despawn any jinjo actor whose bit is already set in the bitfield
+//      — catches the vanilla death-respawn that would otherwise let the
+//      dead player "collect" an already-shared jinjo.
+//   3) Migrate legacy saves: if the per-world jinjo jiggy (id =
+//      10*level-9) is already in jiggyscore and the bitfield is empty,
+//      pre-mark all 5 bits so the engine doesn't respawn them for a
+//      first-time online session on a save that pre-dates this feature.
+static s32 jinjo_despawn_last_level = -1;
+static void poll_collected_jinjos(void) {
+    if (!recomp_net_is_connected() || processing_remote) return;
+
+    s32 cur_level = (s32)level_get();
+    if (cur_level < 1 || cur_level > 0xA) return;
+
+    // Migration (once per level entry): if the jinjo-completion jiggy is
+    // already collected but the bitfield is empty, seed it to 0x1F.
+    if (cur_level != jinjo_despawn_last_level) {
+        jinjo_despawn_last_level = cur_level;
+        u8 flags = get_jinjo_flags_for_level(cur_level);
+        if (flags == 0) {
+            s32 jinjo_jiggy_id = 10 * cur_level - 9;
+            if (jinjo_jiggy_id > 0 && jinjo_jiggy_id < 0x65 &&
+                jiggyscore_isCollected(jinjo_jiggy_id)) {
+                mark_jinjo_collected(cur_level, 0x1F);
+            }
+        }
+    }
+
+    u8 collected = get_jinjo_flags_for_level(cur_level);
+    if (collected == 0) return;
+
+    // Top up the vanilla counter to match the bitfield (no HUD).
+    s32 cur = item_getCount(ITEM_12_JINJOS);
+    s32 diff = (s32)collected & ~cur;
+    if (diff > 0) {
+        processing_remote = TRUE;  // suppress the poll from re-broadcasting
+        item_adjustByDiffWithoutHud(ITEM_12_JINJOS, diff);
+        prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+        processing_remote = FALSE;
+    }
+
+    // Despawn any already-collected jinjo actor still alive on this map.
+    s32 b;
+    for (b = 0; b < 5; b++) {
+        u8 bit = (u8)(1 << b);
+        if (collected & bit) {
+            u32 marker_id = jinjo_bit_to_marker_id(bit);
+            if (marker_id) despawn_actor_by_marker_id(marker_id);
+        }
+    }
+}
 static u8  prev_honeycombscore[3] = {0};
 static s32 prev_lives = 0;
 // Debug: track jiggy total changes from ANY source
@@ -530,6 +618,11 @@ static void poll_shared_collectibles(void) {
         if (cur != prev_jinjo_bits) {
             s32 new_bits = cur & ~prev_jinjo_bits;
             if (new_bits > 0) {
+                // Persist to bitfield BEFORE broadcasting so death/exit
+                // can't lose the state. The persistent flags are the
+                // source of truth; ITEM_12_JINJOS is just the vanilla
+                // per-run counter that resets on respawn.
+                mark_jinjo_collected((s32)cur_level, (u8)new_bits);
                 recomp_net_send_collectible(COLLECTIBLE_JINJO, (u32)new_bits, 1, cur_map, cur_level);
             }
             prev_jinjo_bits = cur;
@@ -894,22 +987,20 @@ static void process_collectible_event(WorldEventData *evt) {
         u32 cur_map = (u32)map_get();
 
         if (ct == COLLECTIBLE_JINJO) {
-            // Apply jinjo bits silently
+            u8 target_bits = (u8)evt->coll_id;
+            // Always persist to bitfield — this is the source of truth.
+            mark_jinjo_collected((s32)evt->coll_level_id, target_bits);
+
+            // Apply jinjo bits to the ITEM counter silently if not already set.
             s32 cur = item_getCount(ITEM_12_JINJOS);
-            s32 new_bits = (s32)evt->coll_id & ~cur;
+            s32 new_bits = (s32)target_bits & ~cur;
             if (new_bits > 0) {
                 item_adjustByDiffWithoutHud(ITEM_12_JINJOS, new_bits);
             }
             prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
-            // Despawn jinjo actor
+            // Despawn jinjo actor on the same map
             if (cur_map == evt->coll_map_id) {
-                u32 bit = evt->coll_id;
-                u32 marker_id = 0;
-                if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
-                else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
-                else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
-                else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
-                else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
+                u32 marker_id = jinjo_bit_to_marker_id(target_bits);
                 if (marker_id) despawn_actor_by_marker_id(marker_id);
             }
         } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
@@ -1061,14 +1152,28 @@ static void process_collectible_event(WorldEventData *evt) {
                 }
             }
         } else if (ct == COLLECTIBLE_JINJO) {
-            // Jinjos are per-level — ONLY apply if on the same level.
+            u8 target_bits = (u8)evt->coll_id;
+            // Persist to the shared bitfield regardless of level so a
+            // player in a different world still records the collection
+            // and can't re-collect on entry.
+            bool was_complete = (get_jinjo_flags_for_level((s32)evt->coll_level_id) == 0x1F);
+            mark_jinjo_collected((s32)evt->coll_level_id, target_bits);
+            bool now_complete = (get_jinjo_flags_for_level((s32)evt->coll_level_id) == 0x1F);
+
+            // Apply to the vanilla ITEM_12_JINJOS counter only on the
+            // same level AND only for bits not already set — without the
+            // filter, a re-collected jinjo after another player's death
+            // double-counts for everyone who already had that bit.
             if (same_level) {
-                s32 result = item_adjustByDiffWithHud(ITEM_12_JINJOS, (s32)evt->coll_id);
-                prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
-                // All 5 jinjos collected (0x1f) — spawn the jinjo jiggy on this side too.
-                // The collecting player spawns it via the jinjo actor callback,
-                // but remote players need it spawned explicitly here.
-                if (result == 0x1f && same_map) {
+                s32 cur = item_getCount(ITEM_12_JINJOS);
+                s32 actual_new = (s32)target_bits & ~cur;
+                if (actual_new > 0) {
+                    item_adjustByDiffWithHud(ITEM_12_JINJOS, actual_new);
+                    prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+                }
+                // Fire the jinjo-completion jiggy only on the transition
+                // <5 -> 5. Guards against a re-broadcast spawning a dup.
+                if (!was_complete && now_complete && same_map) {
                     f32 jiggy_pos[3];
                     jiggy_pos[0] = evt->coll_pos_x;
                     jiggy_pos[1] = evt->coll_pos_y + 50.0f;
@@ -1077,13 +1182,7 @@ static void process_collectible_event(WorldEventData *evt) {
                 }
             }
             if (same_map) {
-                u32 bit = evt->coll_id;
-                u32 marker_id = 0;
-                if (bit & 0x01) marker_id = MARKER_5A_JINJO_BLUE;
-                else if (bit & 0x02) marker_id = MARKER_5B_JINJO_GREEN;
-                else if (bit & 0x04) marker_id = MARKER_5C_JINJO_ORANGE;
-                else if (bit & 0x08) marker_id = MARKER_5D_JINJO_PINK;
-                else if (bit & 0x10) marker_id = MARKER_5E_JINJO_YELLOW;
+                u32 marker_id = jinjo_bit_to_marker_id(target_bits);
                 if (marker_id) despawn_actor_by_marker_id(marker_id);
             }
         } else if (ct == COLLECTIBLE_MUMBO_TOKEN) {
@@ -1465,7 +1564,10 @@ typedef struct {
     u8  note_scores[11];         // 0x84 (D_80385FF0 mirror: per-level high scores)
     u8  _pad5;                   // 0x8F
     u8  level_notes[9][32];      // 0x90 (288 bytes, 0x120) -> ends at 0x1B0
-} WorldStateFullData;            // 0x1B0 = 432 bytes
+    // Persistent per-level jinjo bitfield
+    u8  jinjos_collected[9];     // 0x1B0
+    u8  _pad6[3];                // 0x1B9 (pad to 4-byte boundary)
+} WorldStateFullData;            // 0x1BC = 444 bytes
 
 // Host: snapshot and send current state when a new player joins
 static void check_full_sync_send(void) {
@@ -1531,6 +1633,8 @@ static void check_full_sync_send(void) {
     // N64Recomp can't resolve and produces a broken call.
     memcpy(data.note_scores, D_80385FF0, 11);
     memcpy(data.level_notes, loaded_file_extension_data.level_notes, 9 * 32);
+    // Per-level persistent jinjo bitfield — shared across all players.
+    memcpy(data.jinjos_collected, loaded_file_extension_data.jinjos_collected, 9);
 
     recomp_net_send_world_state_full(&data, sizeof(data), (u32)target_player);
     recomp_printf("[STATE-SYNC] sent full state to player %d (map=%d, flags=yes)\n",
@@ -1686,6 +1790,28 @@ static void check_full_sync_receive(void) {
         recomp_printf("[STATE-SYNC] merged note state (bitfield OR, D_80385FF0 MAX)\n");
     }
 
+    // Merge per-level persistent jinjo bitfield — OR into local.
+    // After the merge, top up ITEM_12_JINJOS if the receiver is currently
+    // in a level whose flags changed. poll_collected_jinjos() will also
+    // reconcile and despawn stale actors on subsequent frames.
+    {
+        s32 i;
+        for (i = 0; i < 9; i++) {
+            loaded_file_extension_data.jinjos_collected[i] |= data.jinjos_collected[i];
+        }
+        s32 cur_level = (s32)level_get();
+        u8 flags_here = get_jinjo_flags_for_level(cur_level);
+        if (flags_here != 0) {
+            s32 cur = item_getCount(ITEM_12_JINJOS);
+            s32 diff = (s32)flags_here & ~cur;
+            if (diff > 0) {
+                item_adjustByDiffWithoutHud(ITEM_12_JINJOS, diff);
+                prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
+            }
+        }
+        recomp_printf("[STATE-SYNC] merged jinjo bitfield\n");
+    }
+
     // Re-snapshot ALL polling state AFTER full sync.
     // The game engine may react to bulk flags by auto-setting score bitfields
     // (e.g., progression flags imply certain jiggies collected). Without this,
@@ -1835,6 +1961,7 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
 
     poll_shared_collectibles();
     poll_nonshared_collectibles();
+    poll_collected_jinjos();
     poll_enemy_deaths();
     sync_enemy_positions();
 

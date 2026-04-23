@@ -401,6 +401,8 @@ extern "C" void recomp_net_send_world_state_full(uint8_t* rdram, recomp_context*
             pkt.level_notes[lvl][b] = MEM_BU(0x90 + lvl * 32 + b, data_ptr);
         }
     }
+    // Persistent per-level jinjo bitfield at 0x1B0 (9 bytes).
+    for (int i = 0; i < 9; i++) pkt.jinjos_collected[i] = MEM_BU(0x1B0 + i, data_ptr);
 
     bknet::NetworkManager::instance().send_world_state_full(
         reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt), static_cast<uint8_t>(target));
@@ -436,6 +438,8 @@ extern "C" void recomp_net_pop_full_state(uint8_t* rdram, recomp_context* ctx) {
                 MEM_BU(0x90 + lvl * 32 + b, out_ptr) = pkt.level_notes[lvl][b];
             }
         }
+        // Persistent per-level jinjo bitfield at 0x1B0 (9 bytes).
+        for (int i = 0; i < 9; i++) MEM_BU(0x1B0 + i, out_ptr) = pkt.jinjos_collected[i];
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

@@ -282,6 +282,12 @@ struct WorldStateFullPacket {
     uint8_t note_scores[11];
     uint8_t _pad5;
     uint8_t level_notes[9][32];      // matches SaveFileExtensionData.level_notes
+    // Per-level collected-jinjo bitfield (bits 0..4 = B/G/O/P/Y). Shared
+    // across all players, persisted in the save extension so death/exit
+    // never respawn already-collected jinjos. Matches
+    // SaveFileExtensionData.jinjos_collected.
+    uint8_t jinjos_collected[9];
+    uint8_t _pad6[3];                // align to 4-byte boundary
 };
 
 // --- Host EEPROM snapshot (sent to each joiner on connect) ---

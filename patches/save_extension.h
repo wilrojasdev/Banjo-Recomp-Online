@@ -8,10 +8,17 @@ typedef struct {
 // This struct must be 256 bytes to add up to 1536 bytes, which adds to the original 512 bytes of save data to equal exactly 2048 bytes.
 typedef struct {
     LevelNotes level_notes[9];
-    u8 padding[32]; // Reserved for future use.
+    // Per-level collected-jinjo bitfield. 1 byte per level, bits 0..4 =
+    // Blue/Green/Orange/Pink/Yellow. Promoted to persistent state so
+    // jinjos don't respawn on death or world re-entry, matching the
+    // sharing semantics already used for jiggies/mumbos/notes. Old
+    // saves have zero here (from the former padding), which is also
+    // the "none collected" initial state — no migration needed.
+    u8 jinjos_collected[9];
+    u8 padding[23]; // Reserved for future use (was 32 before jinjos).
 } SaveFileExtensionData;
 
-_Static_assert(sizeof(SaveFileExtensionData) == 320, "SaveExtensionData must be 256 bytes");
+_Static_assert(sizeof(SaveFileExtensionData) == 320, "SaveExtensionData must be 320 bytes");
 
 typedef struct {
     u8 padding[256];
