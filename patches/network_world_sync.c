@@ -814,6 +814,132 @@ static void poll_nonshared_collectibles(void) {
 
 // === POLLING: Detect local enemy deaths each frame ===
 
+extern s32 bs_getState(void);
+
+// Death-suppression window: when the owner dies, BK unloads
+// suBaddieActorArray as part of the death / respawn transition. Without
+// suppression, poll_enemy_deaths misinterprets every vanished enemy as a
+// real kill and broadcasts it, causing remote players to see enemies
+// mass-despawn with honeycomb drops.
+//
+// We detect the owner's death via bs_state — the Banjo state machine
+// enters a DIE state the moment the death animation starts, well before
+// the vanilla life counter decrements (which was our previous, too-late
+// signal). While any DIE state is active we hold the suppression counter
+// at its max; once it clears we keep suppressing for ~2s more so the
+// respawn warp/cutscene finishes before polling resumes.
+static s32 death_suppress_frames = 0;
+#define DEATH_SUPPRESS_FRAMES 180
+
+static bool owner_is_dying(void) {
+    s32 bs = bs_getState();
+    switch (bs) {
+        case BS_41_DIE:
+        case BS_43_ANT_DIE:
+        case BS_4E_PUMPKIN_DIE:
+        case BS_54_SWIM_DIE:
+        case BS_CROC_DIE:
+        case BS_WALRUS_DIE:
+        case BS_BEE_DIE:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+// Snapshot of alive-enemy positions taken the frame the owner enters a
+// DIE state. While the suppression window is active we keep restoring
+// actor->position from this snapshot so sync_enemy_positions broadcasts
+// the pre-death coordinates — otherwise the engine's respawn routine
+// resets every enemy to its initial spawn location, and those initial
+// coordinates get sent to remote players on the very next broadcast,
+// causing a visual snap on the join side.
+static TrackedEnemy pre_death_snapshot[MAX_TRACKED_ENEMIES];
+static s32 pre_death_count = 0;
+static bool pre_death_captured = FALSE;
+
+static void capture_pre_death_snapshot(void) {
+    if (pre_death_captured) return;
+    if (!suBaddieActorArray) return;
+    s32 count = 0;
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt && count < MAX_TRACKED_ENEMIES; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker) continue;
+        if (!is_killable_enemy(actor)) continue;
+        pre_death_snapshot[count].marker_id   = (u16)actor->marker->id;
+        pre_death_snapshot[count].spawn_index = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+        pre_death_snapshot[count].pos_x = actor->position[0];
+        pre_death_snapshot[count].pos_y = actor->position[1];
+        pre_death_snapshot[count].pos_z = actor->position[2];
+        count++;
+    }
+    pre_death_count = count;
+    pre_death_captured = TRUE;
+    recomp_printf("[DEATH-SUPPRESS] captured %d live enemy positions pre-death\n", count);
+}
+
+static void restore_live_enemy_positions(void) {
+    if (!suBaddieActorArray || pre_death_count == 0) return;
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker) continue;
+        u16 mid = (u16)actor->marker->id;
+        u16 si  = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+
+        s32 k;
+        for (k = 0; k < pre_death_count; k++) {
+            if (pre_death_snapshot[k].marker_id   == mid &&
+                pre_death_snapshot[k].spawn_index == si) {
+                // Pin the enemy to where it was before the owner died.
+                // sync_enemy_positions reads actor->position each frame,
+                // so overriding here keeps remote players' view stable.
+                actor->position[0] = pre_death_snapshot[k].pos_x;
+                actor->position[1] = pre_death_snapshot[k].pos_y;
+                actor->position[2] = pre_death_snapshot[k].pos_z;
+                break;
+            }
+        }
+    }
+}
+
+// After the owner's respawn, BK's engine re-spawns every enemy that had
+// been killed before the death. That leaves the owner's local state out
+// of sync with the shared world view — and because the owner is the one
+// broadcasting positions, those respawned-but-actually-dead enemies also
+// appear back on every remote player's screen.
+//
+// This helper iterates killed_on_map[] (which tracks both local kills and
+// remote kills received while the owner was alive) and silently despawns
+// any actor matching a dead entry on the current map. It's called each
+// frame during the death-suppression window so gradual respawns are
+// caught as they happen.
+static void resync_killed_on_respawn(void) {
+    if (!suBaddieActorArray) return;
+    if (killed_on_map_count == 0) return;
+    u32 cur_map = (u32)map_get();
+
+    s32 k;
+    for (k = 0; k < killed_on_map_count; k++) {
+        if (killed_on_map[k].map_id != cur_map) continue;
+        u16 want_marker = killed_on_map[k].marker_type;
+        u16 want_spawn  = killed_on_map[k].spawn_index;
+
+        s32 i;
+        for (i = 0; i < suBaddieActorArray->cnt; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            if (actor->marker->id != want_marker) continue;
+            u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            if (si != want_spawn) continue;
+            // Found a respawned enemy that should be dead — despawn silently
+            marker_despawn(actor->marker);
+            break;
+        }
+    }
+}
+
 static void poll_enemy_deaths(void) {
     if (!recomp_net_is_connected() || processing_remote) return;
     if (!suBaddieActorArray) return;
@@ -823,6 +949,46 @@ static void poll_enemy_deaths(void) {
 
     // Only world owner polls — others receive via sync_enemy_positions
     if (!recomp_net_am_i_world_owner(cur_level)) return;
+
+    // --- Owner-death suppression ---
+    if (owner_is_dying()) {
+        if (death_suppress_frames == 0) {
+            recomp_printf("[DEATH-SUPPRESS] owner entered DIE state (bs=0x%X), freezing kill detection\n",
+                bs_getState());
+            // Capture enemy positions ONCE on the first DIE frame. The
+            // engine may reposition them during the respawn transition,
+            // but we'll keep overwriting with these saved values.
+            capture_pre_death_snapshot();
+        }
+        death_suppress_frames = DEATH_SUPPRESS_FRAMES;  // hold at max while dying
+        prev_enemy_count = 0;
+        // Pin live enemies to their pre-death positions (stops the visual
+        // snap on joins when the engine resets enemies to spawn points).
+        restore_live_enemy_positions();
+        // Clear respawned-dead enemies as they re-appear during the
+        // respawn sequence. Runs every frame because BK re-spawns
+        // gradually.
+        resync_killed_on_respawn();
+        return;
+    }
+    if (death_suppress_frames > 0) {
+        death_suppress_frames--;
+        // Force the next live frame to rebuild the snapshot from scratch
+        // instead of comparing against a stale pre-death roster.
+        prev_enemy_count = 0;
+        restore_live_enemy_positions();
+        resync_killed_on_respawn();
+        return;
+    }
+    // Suppression has ended — release the pre-death snapshot so the next
+    // death cycle can re-capture fresh positions. The engine will now own
+    // enemy movement again from wherever restore_live_enemy_positions
+    // last pinned them, so there's no snap.
+    if (pre_death_captured) {
+        pre_death_captured = FALSE;
+        pre_death_count = 0;
+        recomp_printf("[DEATH-SUPPRESS] suppression window ended, resuming normal polling\n");
+    }
 
     // Reset tracking only on LEVEL change (not sub-area map transitions).
     // level_get() stays constant when entering interiors/sub-areas within the same world.
@@ -894,6 +1060,29 @@ static void poll_enemy_deaths(void) {
         cur_enemies[cur_count].pos_y = actor->position[1];
         cur_enemies[cur_count].pos_z = actor->position[2];
         cur_count++;
+    }
+
+    // Mass-unload fallback: if a large chunk of the roster vanished in a
+    // single frame, treat it as a scene transition (death cutscene,
+    // cutscene reload, etc.) rather than a barrage of kills. Real combat
+    // rarely drops more than a handful of enemies simultaneously — bombs
+    // and splash damage tend to cap at 2-3. 5+ vanishing at once is
+    // almost always an engine unload.
+    if (prev_enemy_count > 0 && (prev_enemy_count - cur_count) >= 5) {
+        recomp_printf("[DEATH-SUPPRESS] mass unload detected (%d->%d), skipping frame\n",
+            prev_enemy_count, cur_count);
+        // Rebuild snapshot from current roster so the next frame compares
+        // against the post-unload state instead of the pre-unload one.
+        s32 j;
+        for (j = 0; j < cur_count; j++) {
+            prev_enemies[j].marker_id = cur_enemies[j].marker_id;
+            prev_enemies[j].spawn_index = cur_enemies[j].spawn_index;
+            prev_enemies[j].pos_x = cur_enemies[j].pos_x;
+            prev_enemies[j].pos_y = cur_enemies[j].pos_y;
+            prev_enemies[j].pos_z = cur_enemies[j].pos_z;
+        }
+        prev_enemy_count = cur_count;
+        return;
     }
 
     // Detect deaths: entries in prev but not in current
@@ -1386,7 +1575,9 @@ static void process_enemy_event(EnemyEventData *evt) {
             break;
         }
     }
-    // If world owner: remove from prev_enemies so poll doesn't re-detect
+    // If world owner: remove from prev_enemies so poll doesn't re-detect,
+    // and track the kill in killed_on_map so a future death/respawn of this
+    // owner can despawn the respawned-but-actually-dead enemy.
     if (recomp_net_am_i_world_owner((u32)level_get())) {
         s32 p;
         for (p = 0; p < prev_enemy_count; p++) {
@@ -1399,6 +1590,32 @@ static void process_enemy_event(EnemyEventData *evt) {
                 prev_enemies[p].pos_z = prev_enemies[prev_enemy_count - 1].pos_z;
                 prev_enemy_count--;
                 break;
+            }
+        }
+
+        // Track remote kills in killed_on_map[] so respawn cleanup catches
+        // enemies killed by other players too (not just the owner's local
+        // kills). Dedup by (marker, spawn, map).
+        if (cur_map == evt->enemy_map_id && killed_on_map_count < MAX_KILLED_ON_MAP) {
+            bool already_tracked = FALSE;
+            s32 k;
+            for (k = 0; k < killed_on_map_count; k++) {
+                if (killed_on_map[k].marker_type == target_marker &&
+                    killed_on_map[k].spawn_index == target_spawn &&
+                    killed_on_map[k].map_id == cur_map) {
+                    already_tracked = TRUE;
+                    break;
+                }
+            }
+            if (!already_tracked) {
+                s32 ki = killed_on_map_count;
+                killed_on_map[ki].marker_type = target_marker;
+                killed_on_map[ki].spawn_index = target_spawn;
+                killed_on_map[ki].pos_x = evt->enemy_pos_x;
+                killed_on_map[ki].pos_y = evt->enemy_pos_y;
+                killed_on_map[ki].pos_z = evt->enemy_pos_z;
+                killed_on_map[ki].map_id = cur_map;
+                killed_on_map_count = ki + 1;
             }
         }
     }
