@@ -23,6 +23,20 @@ struct LobbyInfo {
     uint16_t max_players;
 };
 
+// Translated error kinds. Keep in sync with translate_error() in the .cpp
+// so UI code can show actionable messages instead of raw numbers.
+enum class CoopNetError : int {
+    Unknown = 0,
+    LobbyNotFound,
+    LobbyFull,
+    LobbyJoinFailed,
+    PasswordIncorrect,
+    VersionMismatch,
+    PeerFailed,
+    IdleTimeout,      // local: peer stopped sending keepalive
+    ProtocolMismatch, // local: PROTOCOL_VERSION handshake failed
+};
+
 class CoopNetTransport {
 public:
     using PacketCallback = std::function<void(uint8_t player_id, const uint8_t* data, size_t size)>;
@@ -31,6 +45,7 @@ public:
     using LobbyListCallback = std::function<void(const std::vector<LobbyInfo>& lobbies)>;
     using LobbyCreatedCallback = std::function<void(uint64_t lobby_id)>;
     using ErrorCallback = std::function<void(int error_code)>;
+    using TypedErrorCallback = std::function<void(CoopNetError kind, const std::string& message)>;
 
     CoopNetTransport();
     ~CoopNetTransport();
@@ -65,6 +80,29 @@ public:
     void set_lobby_list_callback(LobbyListCallback cb) { lobby_list_callback_ = cb; }
     void set_lobby_created_callback(LobbyCreatedCallback cb) { lobby_created_callback_ = cb; }
     void set_error_callback(ErrorCallback cb) { error_callback_ = cb; }
+    void set_typed_error_callback(TypedErrorCallback cb) { typed_error_callback_ = cb; }
+
+    // RTT accessor for UI (milliseconds; 0 = unknown). Thread-safe.
+    uint32_t get_peer_rtt_ms(uint8_t player_id) const;
+
+    // Lookup peer_id for a given player_id — used by NetworkManager to send
+    // per-peer (Ping, VersionCheck) from the SDL thread.
+    uint64_t peer_id_for_player(uint8_t player_id) const;
+
+    // Drop a peer due to application-level reason (idle, version mismatch).
+    // Fires disconnect_callback like a normal disconnect.
+    void drop_peer(uint8_t player_id, CoopNetError reason);
+
+    // Marks that we successfully received *any* inbound packet from this peer —
+    // resets the idle timer. Called by NetworkManager after handle_packet.
+    void mark_peer_alive(uint8_t player_id);
+
+    // Check how many seconds since last inbound packet from peer. Returns
+    // negative if peer unknown.
+    double seconds_since_last_packet(uint8_t player_id) const;
+
+    // Called by NetworkManager::update() on SDL thread to store latest RTT.
+    void set_peer_rtt_ms(uint8_t player_id, uint32_t rtt_ms);
 
 private:
     // CoopNet C callback trampolines
@@ -110,6 +148,15 @@ private:
     LobbyListCallback lobby_list_callback_;
     LobbyCreatedCallback lobby_created_callback_;
     ErrorCallback error_callback_;
+    TypedErrorCallback typed_error_callback_;
+
+    // Per-peer liveness & latency (indexed by player_id). All access from SDL
+    // thread so no additional mutex required beyond the single-threaded
+    // invariant already documented. rtt_ms_ is atomic because get_stats() may
+    // be read from UI threads other than SDL.
+    std::array<double, MAX_PLAYERS> last_packet_time_{}; // seconds since start
+    std::array<std::atomic<uint32_t>, MAX_PLAYERS> rtt_ms_{};
+    std::array<bool, MAX_PLAYERS> cleanup_done_{}; // guards double-cleanup between on_lobby_left / on_peer_disconnected
 
     static CoopNetTransport* s_instance_;
 };

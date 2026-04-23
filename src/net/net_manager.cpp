@@ -1,5 +1,6 @@
 #include "net_manager.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <thread>
@@ -7,9 +8,41 @@
 
 namespace bknet {
 
+// Global log level storage (declared extern in net_log.h). Default = Warn.
+// Override at startup via env: `BKNET_LOG_LEVEL=3 <binary>` for Debug.
+std::atomic<int> g_log_level{static_cast<int>(LogLevel::Warn)};
+
+namespace {
+    struct LogLevelInit {
+        LogLevelInit() {
+            if (const char* e = std::getenv("BKNET_LOG_LEVEL")) {
+                int v = std::atoi(e);
+                if (v >= 0 && v <= 3) g_log_level.store(v);
+            }
+        }
+    };
+    static LogLevelInit s_log_init;
+}
+
 NetworkManager& NetworkManager::instance() {
     static NetworkManager s_instance;
     return s_instance;
+}
+
+NetworkStats NetworkManager::get_stats() const {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    NetworkStats out = stats_;
+    if (coopnet_) {
+        for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
+            out.rtt_ms_by_player[i] = coopnet_->get_peer_rtt_ms(i);
+        }
+    }
+    return out;
+}
+
+uint32_t NetworkManager::get_peer_features(uint8_t player_id) const {
+    if (player_id >= MAX_PLAYERS) return 0;
+    return peer_features_[player_id];
 }
 
 bool NetworkManager::initialize() {
@@ -167,6 +200,14 @@ bool NetworkManager::coopnet_begin(const std::string& server, uint16_t port) {
 
     disconnect();
 
+    // Remember target so tick_network_health() can retry the signaling
+    // connection with exponential backoff if we drop unexpectedly.
+    reconnect_server_ = server;
+    reconnect_port_ = port;
+    reconnect_pending_ = false;
+    reconnect_attempts_ = 0;
+    next_reconnect_at_ = 0.0;
+
     const auto& config = get_config();
     coopnet_ = std::make_unique<CoopNetTransport>();
 
@@ -180,6 +221,7 @@ bool NetworkManager::coopnet_begin(const std::string& server, uint16_t port) {
     if (lobby_list_callback_) coopnet_->set_lobby_list_callback(lobby_list_callback_);
     if (lobby_created_callback_) coopnet_->set_lobby_created_callback(lobby_created_callback_);
     if (coopnet_error_callback_) coopnet_->set_error_callback(coopnet_error_callback_);
+    if (typed_error_callback_) coopnet_->set_typed_error_callback(typed_error_callback_);
 
     if (!coopnet_->begin(server, port, config.player_name)) {
         coopnet_.reset();
@@ -197,6 +239,9 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
 
     coopnet_->set_connect_callback([this](uint8_t player_id) {
         std::printf("[CoopNet] Player %u joined the game\n", player_id);
+        // Version handshake first — if the joiner is on an incompatible build,
+        // the handler will drop them before any other state is shipped.
+        send_version_check(player_id);
         request_host_eeprom_send(player_id);
         request_full_sync(player_id);
         // Send host's name directly to the new player
@@ -226,7 +271,7 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
     });
 
     coopnet_->set_disconnect_callback([this](uint8_t player_id) {
-        std::printf("[CoopNet] Player %u left the game\n", player_id);
+        BKNET_LOG(Info, "Player %u left the game", player_id);
         std::string leave_name;
         {
             std::lock_guard<std::mutex> lock(roster_mutex_);
@@ -238,6 +283,7 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
         if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
         add_system_message(leave_name + " left the game");
         interpolation_.remove_player(player_id);
+        reset_peer_state(player_id);
         uint32_t level;
         {
             std::lock_guard<std::mutex> lock(ownership_mutex_);
@@ -253,6 +299,11 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
         state_ = ConnectionState::Disconnected;
         interpolation_.reset();
         unexpected_disconnect_.store(true);
+        // Schedule a reconnect (tick_network_health drives the backoff).
+        if (!reconnect_server_.empty()) {
+            reconnect_pending_ = true;
+            next_reconnect_at_ = get_time() + 1.0;
+        }
         std::printf("[CoopNet] Lost connection\n");
     });
 
@@ -291,7 +342,8 @@ bool NetworkManager::coopnet_join_lobby(uint64_t lobby_id, const std::string& pa
             if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
             add_system_message(leave_name + " left the game");
             interpolation_.remove_player(player_id);
-            std::printf("[CoopNet] Player %u (%s) left\n", player_id, leave_name.c_str());
+            reset_peer_state(player_id);
+            BKNET_LOG(Info, "Player %u (%s) left", player_id, leave_name.c_str());
         }
     });
 
@@ -299,6 +351,10 @@ bool NetworkManager::coopnet_join_lobby(uint64_t lobby_id, const std::string& pa
         state_ = ConnectionState::Disconnected;
         interpolation_.reset();
         unexpected_disconnect_.store(true);
+        if (!reconnect_server_.empty()) {
+            reconnect_pending_ = true;
+            next_reconnect_at_ = get_time() + 1.0;
+        }
         std::printf("[CoopNet] Lost connection\n");
     });
 
@@ -338,6 +394,17 @@ void NetworkManager::set_coopnet_error_callback(CoopNetTransport::ErrorCallback 
     if (coopnet_) coopnet_->set_error_callback(cb);
 }
 
+void NetworkManager::set_typed_error_callback(CoopNetTransport::TypedErrorCallback cb) {
+    typed_error_callback_ = cb;
+    if (coopnet_) coopnet_->set_typed_error_callback(cb);
+}
+
+uint32_t NetworkManager::get_player_rtt_ms(uint8_t player_id) const {
+    if (player_id >= MAX_PLAYERS || player_id == local_player_id_) return 0;
+    if (coopnet_) return coopnet_->get_peer_rtt_ms(player_id);
+    return 0;
+}
+
 // === Unified send helpers ===
 
 void NetworkManager::net_broadcast(const void* data, size_t size, uint8_t channel, bool reliable) {
@@ -348,6 +415,9 @@ void NetworkManager::net_broadcast(const void* data, size_t size, uint8_t channe
     } else if (client_) {
         client_->send(data, size, channel, reliable);
     }
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    stats_.packets_sent++;
+    stats_.bytes_sent += size;
 }
 
 void NetworkManager::net_send_to(uint8_t player_id, const void* data, size_t size, uint8_t channel, bool reliable) {
@@ -356,6 +426,9 @@ void NetworkManager::net_send_to(uint8_t player_id, const void* data, size_t siz
     } else if (server_) {
         server_->send_to(player_id, data, size, channel, reliable);
     }
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    stats_.packets_sent++;
+    stats_.bytes_sent += size;
 }
 
 void NetworkManager::disconnect() {
@@ -371,6 +444,26 @@ void NetworkManager::disconnect() {
         client_->disconnect();
         client_.reset();
     }
+
+    // Intentional disconnect — cancel any pending reconnection attempts.
+    reconnect_pending_ = false;
+    reconnect_attempts_ = 0;
+    reconnect_server_.clear();
+
+    // Reset rolling network state so a fresh session starts clean.
+    last_seen_seq_.clear();
+    fragment_assembly_.clear();
+    sent_fragments_.clear();
+    last_chat_time_.fill(0.0);
+    bytes_recv_window_.fill(0);
+    last_bw_window_reset_ = 0.0;
+    peer_features_.fill(0);
+    last_recv_state_valid_.fill(false);
+    for (auto& s : last_recv_state_) s = {};
+    last_keepalive_send_ = 0.0;
+    last_ping_send_ = 0.0;
+    last_idle_check_ = 0.0;
+    { std::lock_guard<std::mutex> lock(stats_mutex_); stats_ = {}; }
 
     state_ = ConnectionState::Disconnected;
     local_player_id_ = 0;
@@ -408,8 +501,14 @@ void NetworkManager::update() {
             interpolation_.reset();
             set_player_name(local_player_id_, get_config().player_name);
             broadcast_local_name();
+            // As a fresh joiner, immediately send a version handshake to the host.
+            // Host will respond if its version matches; if ours is wrong, host
+            // drops us. This closes the "silent desync on update" footgun.
+            send_version_check(0);
             std::printf("[CoopNet] Joined game as player %u\n", local_player_id_);
         }
+        // Reconnection attempt timer (runs even when not connected).
+        tick_network_health();
     }
 
     if (!is_connected() && !coopnet_) return;
@@ -579,12 +678,100 @@ void NetworkManager::send_local_state() {
     net_broadcast(&pkt, sizeof(pkt), CHANNEL_UNRELIABLE, false);
 }
 
-void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size) {
+void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size,
+                                    bool skip_accounting) {
     if (size < sizeof(PacketHeader)) return;
+    // Reject any packet whose sender identity we can't trust. Malformed or
+    // spoofed player_ids could OOB-index arrays downstream.
+    if (from_player_id >= MAX_PLAYERS) return;
 
     PacketType type = peek_type(data, size);
 
+    if (!skip_accounting) {
+        // Stats: one inbound packet accounted for (bandwidth cap applies below).
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.packets_received++;
+            stats_.bytes_received += size;
+        }
+
+        // Per-peer inbound bandwidth cap (1s sliding window). A peer that floods
+        // past MAX_INBOUND_BPS gets dropped — protects host from a buggy/hostile
+        // client saturating the link.
+        double now_secs = get_time();
+        if (now_secs - last_bw_window_reset_ >= 1.0) {
+            bytes_recv_window_.fill(0);
+            last_bw_window_reset_ = now_secs;
+        }
+        if (from_player_id != local_player_id_) {
+            bytes_recv_window_[from_player_id] += static_cast<uint32_t>(size);
+            if (bytes_recv_window_[from_player_id] > MAX_INBOUND_BPS) {
+                BKNET_LOG(Warn, "Player %u exceeded BW cap (%u B/s) — dropping",
+                          from_player_id, bytes_recv_window_[from_player_id]);
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.peers_dropped_bw++;
+                    stats_.packets_dropped_rate_limit++;
+                }
+                if (coopnet_) coopnet_->drop_peer(from_player_id, CoopNetError::PeerFailed);
+                return;
+            }
+        }
+
+        // Liveness: any valid-sender inbound packet (including keepalive) resets
+        // the idle timer for that peer. CoopNet side already stamps on receive,
+        // but doing it here too means direct-ENet paths also get the benefit if
+        // we later add idle detection there.
+        if (coopnet_ && from_player_id != local_player_id_) {
+            coopnet_->mark_peer_alive(from_player_id);
+        }
+
+        // Drop out-of-order high-frequency packets so a late UDP datagram can't
+        // overwrite a newer position/state already applied.
+        PacketHeader hdr_peek;
+        std::memcpy(&hdr_peek, data, sizeof(hdr_peek));
+        if (!sequence_is_fresh(from_player_id, type, hdr_peek.sequence)) {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.packets_dropped_stale_seq++;
+            return;
+        }
+    }
+
     switch (type) {
+        case PacketType::KeepAlive:
+            // Presence is the payload. mark_peer_alive already ran above.
+            return;
+        case PacketType::Ping: {
+            PingPacket pkt;
+            if (deserialize(data, size, pkt)) handle_ping_packet(from_player_id, pkt);
+            return;
+        }
+        case PacketType::Pong: {
+            PongPacket pkt;
+            if (deserialize(data, size, pkt)) handle_pong_packet(from_player_id, pkt);
+            return;
+        }
+        case PacketType::VersionCheck: {
+            VersionCheckPacket pkt;
+            if (deserialize(data, size, pkt)) handle_version_check(from_player_id, pkt);
+            return;
+        }
+        case PacketType::FragmentChunk: {
+            FragmentChunkPacket pkt;
+            // Fragment packets are variable-size on the wire (trailing chunks
+            // can be short), so accept anything with a full fixed header.
+            size_t header_size = offsetof(FragmentChunkPacket, data);
+            if (size >= header_size) {
+                std::memcpy(&pkt, data, std::min(size, sizeof(pkt)));
+                handle_fragment_chunk(from_player_id, pkt);
+            }
+            return;
+        }
+        case PacketType::FragmentNack: {
+            FragmentNackPacket pkt;
+            if (deserialize(data, size, pkt)) handle_fragment_nack(from_player_id, pkt);
+            return;
+        }
         case PacketType::PlayerPosition: {
             PlayerPositionPacket pkt;
             if (deserialize(data, size, pkt)) {
@@ -705,8 +892,15 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
         }
         // WorldOwnerTransfer and WorldKillResync — no longer used
         // (centralized kill tracking in C++ replaces these)
-        default:
+        default: {
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                stats_.packets_dropped_unknown++;
+            }
+            BKNET_LOG(Warn, "Unknown PacketType 0x%02X from player %u (protocol mismatch?)",
+                      static_cast<unsigned>(type), from_player_id);
             break;
+        }
     }
 }
 
@@ -723,27 +917,52 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
 
     update_player_level(pid, pkt.level_id);
 
-    PositionSnapshot snap;
-    snap.x = pkt.x;
-    snap.y = pkt.y;
-    snap.z = pkt.z;
-    snap.yaw = pkt.yaw;
-    snap.pitch = pkt.pitch;
-    snap.scale = 1.0f;
-    snap.map_id = pkt.map_id;
-    snap.level_id = pkt.level_id;
-    snap.animation_id = pkt.animation_id;
-    snap.anim_timer = pkt.anim_progress;
-    snap.anim_duration = pkt.anim_duration;
-    snap.anim_subrange_start = pkt.anim_subrange_start;
-    snap.anim_subrange_end = pkt.anim_subrange_end;
-    snap.anim_playback_type = pkt.anim_playback_type;
-    snap.kazooie_flags = pkt.kazooie_flags;
-    snap.health = pkt.health;
-    snap.health_total = pkt.health_total;
-    snap.transformation = pkt.transformation;
-    snap.bs_state = static_cast<uint8_t>(pkt.bs_state);
-    snap.horizontal_velocity = pkt.horizontal_velocity;
+    // Merge-apply: start from the last fully-known snapshot for this player,
+    // then overwrite fields whose dirty bits are set in this packet. If we
+    // don't have a baseline yet, or the sender sent everything (full-apply
+    // shortcut 0xFFFFFFFF), apply the whole packet.
+    PositionSnapshot snap{};
+    const bool full_apply =
+        !last_recv_state_valid_[pid] || pkt.dirty_flags == 0xFFFFFFFFu;
+    if (!full_apply) {
+        snap = last_recv_state_[pid];
+    }
+
+    if (full_apply || (pkt.dirty_flags & DIRTY_POSITION)) {
+        snap.x = pkt.x; snap.y = pkt.y; snap.z = pkt.z;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_ROTATION)) {
+        snap.yaw = pkt.yaw; snap.pitch = pkt.pitch;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_MAP)) {
+        snap.map_id = pkt.map_id;
+        snap.level_id = pkt.level_id;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_ANIMATION)) {
+        snap.animation_id = pkt.animation_id;
+        snap.anim_timer = pkt.anim_progress;
+        snap.anim_duration = pkt.anim_duration;
+        snap.anim_subrange_start = pkt.anim_subrange_start;
+        snap.anim_subrange_end = pkt.anim_subrange_end;
+        snap.anim_playback_type = pkt.anim_playback_type;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_HEALTH)) {
+        snap.health = pkt.health;
+        snap.health_total = pkt.health_total;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_TRANSFORMATION)) {
+        snap.transformation = pkt.transformation;
+    }
+    if (full_apply || (pkt.dirty_flags & DIRTY_ITEMS)) {
+        snap.kazooie_flags = pkt.kazooie_flags;
+        snap.bs_state = static_cast<uint8_t>(pkt.bs_state);
+        snap.horizontal_velocity = pkt.horizontal_velocity;
+    }
+    // scale isn't in any flag group — always take it (sender hardcodes 1.0f)
+    if (full_apply) snap.scale = 1.0f;
+
+    last_recv_state_[pid] = snap;
+    last_recv_state_valid_[pid] = true;
 
     interpolation_.push_full_state(pid, snap);
 }
@@ -782,11 +1001,24 @@ void NetworkManager::send_chat(const std::string& message) {
 
 void NetworkManager::handle_chat_packet(const ChatMessagePacket& pkt) {
     uint8_t pid = pkt.header.player_id;
+    if (pid >= MAX_PLAYERS) return; // malformed / spoof
+    if (pkt.msg_length >= CHAT_MAX_LENGTH) return; // oversized
+
+    // Per-player rate limit: 2 msg/sec. A buggy/malicious client can't spam
+    // the chat history and blow the 20-entry ring.
+    double now = get_time();
+    if (now - last_chat_time_[pid] < 0.5) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.packets_dropped_rate_limit++;
+        return;
+    }
+    last_chat_time_[pid] = now;
+
     std::string msg(pkt.message, pkt.msg_length);
 
     {
         std::lock_guard<std::mutex> lock(chat_mutex_);
-        chat_history_.push_back({pid, msg, get_time()});
+        chat_history_.push_back({pid, msg, now});
         if (chat_history_.size() > MAX_CHAT_HISTORY) chat_history_.pop_front();
         new_messages_ = true;
     }
@@ -931,6 +1163,7 @@ void NetworkManager::send_conga_orange(float sx, float sy, float sz, float vx, f
 }
 
 void NetworkManager::handle_conga_orange_packet(const CongaOrangeSpawnPacket& pkt) {
+    if (pkt.header.player_id >= MAX_PLAYERS) return;
     if (pkt.header.player_id == local_player_id_) return;
     std::lock_guard<std::mutex> lock(world_mutex_);
     CongaOrangeEvent evt{};
@@ -1070,8 +1303,14 @@ bool NetworkManager::should_send_full_sync(uint8_t& out_player_id) {
 void NetworkManager::send_world_state_full(const uint8_t* data, size_t size, uint8_t target_player) {
     if (!is_connected() || (!server_ && !coopnet_)) return;
 
-    // Enqueue for SDL thread (game thread cannot call ENet directly)
-    enqueue_packet(data, size, CHANNEL_RELIABLE, true);
+    // Fragment large payloads: a single dropped packet would otherwise trigger
+    // full-packet retransmit and risk join timeout on lossy WAN. Chunks are
+    // reliable individually, so ENet/CoopNet retries only the missing piece.
+    if (size > FRAGMENT_CHUNK_PAYLOAD) {
+        send_chunked(BROADCAST_TARGET, PacketType::WorldStateFull, data, size);
+    } else {
+        enqueue_packet(data, size, CHANNEL_RELIABLE, true);
+    }
     std::printf("[Network] Queued WorldStateFull (%zu bytes) for player %u\n", size, target_player);
 }
 
@@ -1119,12 +1358,10 @@ void NetworkManager::send_host_eeprom(const uint8_t* eeprom_bytes, size_t size, 
     std::memcpy(pkt.eeprom, eeprom_bytes, copy);
 
     // Targeted send: HostEeprom is meaningful only to the newly-joined peer.
-    // Broadcasting would spam already-connected clients with ~2 KB of data
-    // they'd enqueue and never consume (their override buffer is already
-    // populated from their own join handshake).
-    // Route through the send queue — the bridge runs on the game thread and
-    // ENet is not thread-safe, so the actual send happens on the SDL thread.
-    enqueue_packet_to(target_player, &pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+    // The payload is ~2 KB — always fragment so a single lost packet triggers
+    // only a small chunk retransmit instead of redelivering the whole blob
+    // and risking a join timeout.
+    send_chunked(target_player, PacketType::HostEeprom, &pkt, sizeof(pkt));
     std::printf("[Network] Queued HostEeprom (%zu bytes, slot=%d) for player %u\n",
                 sizeof(pkt), (int)current_slot, target_player);
 }
@@ -1146,18 +1383,465 @@ bool NetworkManager::pop_host_eeprom(HostEepromPacket& out) {
 
 // === Thread-safe packet sending ===
 
+void NetworkManager::reset_peer_state(uint8_t player_id) {
+    if (player_id >= MAX_PLAYERS) return;
+    // Clear anything keyed by player_id that could leak to a new occupant of
+    // the slot: seq tracking, rate limits, inbound BW window, reassembly and
+    // negotiated features, cached "last state" used by dirty-delta apply.
+    last_chat_time_[player_id] = 0.0;
+    bytes_recv_window_[player_id] = 0;
+    peer_features_[player_id] = 0;
+    last_recv_state_valid_[player_id] = false;
+    last_recv_state_[player_id] = {};
+
+    // Wipe per-player sequence entries.
+    for (auto it = last_seen_seq_.begin(); it != last_seen_seq_.end(); ) {
+        uint8_t pid = static_cast<uint8_t>(it->first >> 8);
+        if (pid == player_id) it = last_seen_seq_.erase(it);
+        else ++it;
+    }
+
+    // Drop any in-flight fragment reassembly from this sender.
+    for (auto it = fragment_assembly_.begin(); it != fragment_assembly_.end(); ) {
+        uint8_t pid = static_cast<uint8_t>(it->first >> 16);
+        if (pid == player_id) it = fragment_assembly_.erase(it);
+        else ++it;
+    }
+
+    BKNET_LOG(Info, "Reset per-peer state for player %u", player_id);
+}
+
 void NetworkManager::enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable) {
     enqueue_packet_to(BROADCAST_TARGET, data, size, channel, reliable);
 }
 
 void NetworkManager::enqueue_packet_to(uint8_t target_player, const void* data, size_t size, uint8_t channel, bool reliable) {
     std::lock_guard<std::mutex> lock(send_queue_mutex_);
+
+    // Backpressure: if the queue is huge (CoopNet stalled or game thread
+    // spamming), drop the oldest unreliable packet first, then oldest reliable.
+    // This bounds memory and keeps the queue responsive when the link recovers.
+    // Only bump the drop counter if we ACTUALLY dropped something — otherwise
+    // the stat becomes noise (triggered just by hitting the cap).
+    if (packet_send_queue_.size() >= MAX_SEND_QUEUE) {
+        bool dropped = false;
+        for (auto it = packet_send_queue_.begin(); it != packet_send_queue_.end(); ++it) {
+            if (!it->reliable) {
+                packet_send_queue_.erase(it);
+                dropped = true;
+                break;
+            }
+        }
+        if (!dropped && packet_send_queue_.size() >= MAX_SEND_QUEUE * 2) {
+            BKNET_LOG(Warn, "Send queue overflow (%zu) — dropping oldest reliable packet",
+                      packet_send_queue_.size());
+            packet_send_queue_.pop_front();
+            dropped = true;
+        }
+        if (dropped) {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.packets_dropped_queue++;
+        }
+    }
+
     QueuedPacket qp;
     qp.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
     qp.channel = channel;
     qp.reliable = reliable;
     qp.target_player = target_player;
     packet_send_queue_.push_back(std::move(qp));
+}
+
+// === Network health: keepalive, ping/pong, idle timeout, reconnection ===
+
+void NetworkManager::tick_network_health() {
+    if (!coopnet_) return;
+
+    double now = get_time();
+
+    // Send keepalives every 10s per peer.
+    if (now - last_keepalive_send_ >= 10.0) {
+        last_keepalive_send_ = now;
+        if (is_connected()) {
+            send_keepalive_to_all();
+        }
+    }
+
+    // Ping every 5s for RTT sampling.
+    if (now - last_ping_send_ >= 5.0) {
+        last_ping_send_ = now;
+        if (is_connected()) {
+            send_ping_to_all();
+        }
+    }
+
+    // Idle timeout check once per second. 30s without any inbound data =
+    // consider the peer dead and drop it explicitly (otherwise libcoopnet
+    // can hold a stale slot for several minutes).
+    if (now - last_idle_check_ >= 1.0) {
+        last_idle_check_ = now;
+        if (is_connected()) {
+            for (uint8_t pid = 1; pid < MAX_PLAYERS; pid++) {
+                if (pid == local_player_id_) continue;
+                double idle = coopnet_->seconds_since_last_packet(pid);
+                if (idle > 30.0) {
+                    BKNET_LOG(Warn, "Player %u idle for %.1fs — dropping", pid, idle);
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.peers_dropped_idle++;
+                    }
+                    coopnet_->drop_peer(pid, CoopNetError::IdleTimeout);
+                }
+            }
+        }
+    }
+
+    // Fragment NACK + sender cache TTL.
+    tick_fragment_maintenance(now);
+
+    // Reconnection with exponential backoff. Triggered by signaling_disconnect_
+    // callback setting reconnect_pending_.
+    if (reconnect_pending_ && now >= next_reconnect_at_ && !coopnet_->is_connected()) {
+        reconnect_attempts_++;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.reconnect_attempts++;
+        }
+        BKNET_LOG(Info, "Reconnect attempt %u to %s:%u",
+                  reconnect_attempts_, reconnect_server_.c_str(), reconnect_port_);
+        // Exponential backoff capped at 30s: 2,4,8,16,30,30...
+        double delay = std::min(30.0, static_cast<double>(1u << std::min<uint32_t>(reconnect_attempts_, 5u)));
+        next_reconnect_at_ = now + delay;
+        // CoopNetTransport::begin() refuses if its static s_instance_ is still
+        // pointing to us (from a previous session). shutdown() clears it and
+        // zeroes the socket state; the callback registrations (stored in this
+        // instance, not in s_instance_) survive across the cycle.
+        coopnet_->shutdown();
+        coopnet_->begin(reconnect_server_, reconnect_port_, get_config().player_name);
+        // Clear pending once signaling re-opens — we poll that next tick.
+        if (coopnet_->is_connected()) {
+            reconnect_pending_ = false;
+            reconnect_attempts_ = 0;
+        }
+    }
+}
+
+void NetworkManager::send_keepalive_to_all() {
+    KeepAlivePacket pkt{};
+    pkt.header.type = PacketType::KeepAlive;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = 0; // keepalive is self-describing
+    // Direct SDL-thread send — we're called from update() which already runs here.
+    if (coopnet_) coopnet_->broadcast(&pkt, sizeof(pkt));
+}
+
+void NetworkManager::send_ping_to_all() {
+    if (!coopnet_) return;
+    PingPacket pkt{};
+    pkt.header.type = PacketType::Ping;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = 0;
+    auto now = std::chrono::steady_clock::now();
+    pkt.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now.time_since_epoch()).count();
+    coopnet_->broadcast(&pkt, sizeof(pkt));
+}
+
+void NetworkManager::send_version_check(uint8_t player_id) {
+    if (!coopnet_) return;
+    VersionCheckPacket pkt{};
+    pkt.header.type = PacketType::VersionCheck;
+    pkt.header.player_id = local_player_id_;
+    pkt.header.sequence = 0;
+    pkt.protocol_version = PROTOCOL_VERSION;
+    pkt.feature_flags = SUPPORTED_FEATURES;
+    coopnet_->send_to(player_id, &pkt, sizeof(pkt));
+}
+
+void NetworkManager::handle_ping_packet(uint8_t from_player_id, const PingPacket& pkt) {
+    if (!coopnet_ || from_player_id >= MAX_PLAYERS || from_player_id == local_player_id_) return;
+    PongPacket pong{};
+    pong.header.type = PacketType::Pong;
+    pong.header.player_id = local_player_id_;
+    pong.header.sequence = 0;
+    pong.ping_timestamp_us = pkt.timestamp_us;
+    auto now = std::chrono::steady_clock::now();
+    pong.pong_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now.time_since_epoch()).count();
+    coopnet_->send_to(from_player_id, &pong, sizeof(pong));
+}
+
+void NetworkManager::handle_pong_packet(uint8_t from_player_id, const PongPacket& pkt) {
+    if (!coopnet_ || from_player_id >= MAX_PLAYERS) return;
+    auto now = std::chrono::steady_clock::now();
+    uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now.time_since_epoch()).count();
+    if (now_us <= pkt.ping_timestamp_us) return; // clock weirdness
+    uint64_t rtt_us = now_us - pkt.ping_timestamp_us;
+    uint32_t rtt_ms = static_cast<uint32_t>(rtt_us / 1000);
+
+    // EMA smooth (alpha 0.3). Start from raw sample if no prior.
+    uint32_t prev = coopnet_->get_peer_rtt_ms(from_player_id);
+    uint32_t smoothed = prev == 0 ? rtt_ms
+                                  : static_cast<uint32_t>(prev * 0.7 + rtt_ms * 0.3);
+    coopnet_->set_peer_rtt_ms(from_player_id, smoothed);
+}
+
+void NetworkManager::handle_version_check(uint8_t from_player_id, const VersionCheckPacket& pkt) {
+    if (!coopnet_ || from_player_id >= MAX_PLAYERS) return;
+    if (pkt.protocol_version != PROTOCOL_VERSION) {
+        BKNET_LOG(Error, "Version mismatch with player %u: got %u, expected %u — dropping",
+                  from_player_id, pkt.protocol_version, PROTOCOL_VERSION);
+        coopnet_->drop_peer(from_player_id, CoopNetError::ProtocolMismatch);
+        return;
+    }
+    // Store negotiated feature intersection — downgrades gracefully if peer
+    // lacks a feature we offer (e.g. old builds without FragmentNack).
+    uint32_t common = pkt.feature_flags & SUPPORTED_FEATURES;
+    peer_features_[from_player_id] = common;
+    BKNET_LOG(Info, "Version check OK with player %u (v%u, features=0x%X common=0x%X)",
+              from_player_id, pkt.protocol_version, pkt.feature_flags, common);
+}
+
+// === Sequence freshness for UDP reorder rejection ===
+
+bool NetworkManager::sequence_is_fresh(uint8_t player_id, PacketType type, uint16_t seq) {
+    // Only apply to high-frequency unreliable packets where reorder matters.
+    // Reliable packets are already ordered by ENet/CoopNet per channel.
+    if (type != PacketType::PlayerPosition &&
+        type != PacketType::PlayerState &&
+        type != PacketType::EnemyPositionBulk) {
+        return true;
+    }
+    uint16_t key = (static_cast<uint16_t>(player_id) << 8) | static_cast<uint8_t>(type);
+    auto it = last_seen_seq_.find(key);
+    if (it == last_seen_seq_.end()) {
+        last_seen_seq_[key] = seq;
+        return true;
+    }
+    int16_t delta = static_cast<int16_t>(seq - it->second);
+    if (delta <= 0) return false; // stale or duplicate
+    it->second = seq;
+    return true;
+}
+
+// === Chunked fragment transport ===
+
+void NetworkManager::send_chunked(uint8_t target_player, PacketType original_type,
+                                   const void* data, size_t size) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    // Atomic so future game-thread callers don't tear the counter. Skip 0
+    // (treated as "unknown" in the reassembly maps).
+    uint16_t group = next_fragment_group_id_.fetch_add(1, std::memory_order_relaxed);
+    if (group == 0) group = next_fragment_group_id_.fetch_add(1, std::memory_order_relaxed);
+
+    uint16_t chunk_count = static_cast<uint16_t>(
+        (size + FRAGMENT_CHUNK_PAYLOAD - 1) / FRAGMENT_CHUNK_PAYLOAD);
+    if (chunk_count == 0) chunk_count = 1;
+
+    // Cache each chunk's wire bytes so a later FragmentNack can retransmit
+    // individual pieces without re-serializing the original payload.
+    SentFragmentGroup cache;
+    cache.target_player = target_player;
+    cache.chunk_count = chunk_count;
+    cache.sent_at = get_time();
+    cache.chunks.resize(chunk_count);
+
+    for (uint16_t i = 0; i < chunk_count; i++) {
+        size_t offset = i * FRAGMENT_CHUNK_PAYLOAD;
+        size_t chunk_size = std::min<size_t>(FRAGMENT_CHUNK_PAYLOAD, size - offset);
+
+        FragmentChunkPacket pkt{};
+        pkt.header.type = PacketType::FragmentChunk;
+        pkt.header.player_id = local_player_id_;
+        pkt.header.sequence = send_sequence_++;
+        pkt.group_id = group;
+        pkt.chunk_index = i;
+        pkt.chunk_count = chunk_count;
+        pkt.chunk_size = static_cast<uint16_t>(chunk_size);
+        pkt.original_type = static_cast<uint8_t>(original_type);
+        pkt.total_size = static_cast<uint32_t>(size);
+        std::memcpy(pkt.data, bytes + offset, chunk_size);
+
+        // Only send the populated prefix — this drops ~1KB per chunk on the
+        // wire for short trailing chunks.
+        size_t wire_size = offsetof(FragmentChunkPacket, data) + chunk_size;
+
+        // Cache the exact wire bytes for retransmit.
+        cache.chunks[i].assign(reinterpret_cast<const uint8_t*>(&pkt),
+                               reinterpret_cast<const uint8_t*>(&pkt) + wire_size);
+
+        if (target_player == BROADCAST_TARGET) {
+            enqueue_packet(&pkt, wire_size, CHANNEL_RELIABLE, true);
+        } else {
+            enqueue_packet_to(target_player, &pkt, wire_size, CHANNEL_RELIABLE, true);
+        }
+    }
+
+    // Cap sender-side cache so a host blasting chunked payloads to multiple
+    // joiners can't accumulate unbounded memory before the 30s TTL sweeps.
+    // On overflow, evict the oldest group by sent_at timestamp.
+    if (sent_fragments_.size() >= MAX_SENT_FRAGMENT_GROUPS) {
+        auto oldest = sent_fragments_.begin();
+        for (auto it = sent_fragments_.begin(); it != sent_fragments_.end(); ++it) {
+            if (it->second.sent_at < oldest->second.sent_at) oldest = it;
+        }
+        BKNET_LOG(Warn, "sent_fragments_ cap hit — evicting group %u", oldest->first);
+        sent_fragments_.erase(oldest);
+    }
+    sent_fragments_[group] = std::move(cache);
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.fragments_sent += chunk_count;
+    }
+    BKNET_LOG(Info, "Fragmented %zu-byte payload (type=0x%02X) into %u chunks group=%u",
+              size, static_cast<unsigned>(original_type), chunk_count, group);
+}
+
+void NetworkManager::handle_fragment_nack(uint8_t from_player_id, const FragmentNackPacket& pkt) {
+    auto it = sent_fragments_.find(pkt.group_id);
+    if (it == sent_fragments_.end()) {
+        // Cache expired or we never sent this group — nothing to do.
+        BKNET_LOG(Warn, "NACK from p%u for unknown group %u", from_player_id, pkt.group_id);
+        return;
+    }
+    if (pkt.chunk_count != it->second.chunk_count) return; // mismatched group
+
+    uint32_t resent = 0;
+    for (uint16_t i = 0; i < pkt.chunk_count && i < it->second.chunk_count; i++) {
+        bool missing = (pkt.missing_bitmap[i / 8] >> (i % 8)) & 0x1;
+        if (!missing) continue;
+        const auto& bytes = it->second.chunks[i];
+        if (bytes.empty()) continue;
+        // Retransmit to the requesting peer specifically (even if original was
+        // broadcast) — only that peer needs it.
+        enqueue_packet_to(from_player_id, bytes.data(), bytes.size(),
+                          CHANNEL_RELIABLE, true);
+        resent++;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.fragments_retransmitted += resent;
+    }
+    BKNET_LOG(Info, "Retransmitted %u chunks to p%u for group %u",
+              resent, from_player_id, pkt.group_id);
+}
+
+void NetworkManager::tick_fragment_maintenance(double now) {
+    // Receiver side: emit NACKs for groups stuck with missing chunks > 2s.
+    for (auto& [key, asm_state] : fragment_assembly_) {
+        if (asm_state.chunks_received == asm_state.chunk_count) continue;
+        if (now - asm_state.last_chunk_at < 2.0) continue;
+        if (now - asm_state.last_nack_at < 2.0) continue; // throttle
+        if (asm_state.nack_attempts >= MAX_NACK_ATTEMPTS) continue; // give up gracefully
+
+        uint8_t sender = static_cast<uint8_t>(key >> 16);
+        uint16_t group = static_cast<uint16_t>(key & 0xFFFF);
+
+        // Only NACK if peer declares support for it.
+        if ((peer_features_[sender] & FEATURE_FRAGMENT_NACK) == 0) continue;
+
+        FragmentNackPacket nack{};
+        nack.header.type = PacketType::FragmentNack;
+        nack.header.player_id = local_player_id_;
+        nack.header.sequence = 0;
+        nack.group_id = group;
+        nack.chunk_count = asm_state.chunk_count;
+        // Pack missing-chunk bitmap; cap at bitmap capacity.
+        size_t max_bits = FRAGMENT_NACK_BITMAP_BYTES * 8;
+        for (uint16_t i = 0; i < asm_state.chunk_count && i < max_bits; i++) {
+            if (!asm_state.received_mask[i]) {
+                nack.missing_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+            }
+        }
+        enqueue_packet_to(sender, &nack, sizeof(nack), CHANNEL_RELIABLE, true);
+        asm_state.last_nack_at = now;
+        asm_state.nack_attempts++;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.fragments_nacked++;
+        }
+        BKNET_LOG(Info, "NACK → p%u group %u attempt %u/%u (%u/%u rcvd)",
+                  sender, group, asm_state.nack_attempts, MAX_NACK_ATTEMPTS,
+                  asm_state.chunks_received, asm_state.chunk_count);
+        if (asm_state.nack_attempts == MAX_NACK_ATTEMPTS) {
+            BKNET_LOG(Warn, "NACK retry cap hit for group %u from p%u — "
+                      "waiting for 30s timeout", group, sender);
+        }
+    }
+
+    // Sender side: purge cache entries older than 30s (assume delivered).
+    for (auto it = sent_fragments_.begin(); it != sent_fragments_.end(); ) {
+        if (now - it->second.sent_at > 30.0) {
+            it = sent_fragments_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void NetworkManager::handle_fragment_chunk(uint8_t from_player_id, const FragmentChunkPacket& pkt) {
+    if (from_player_id >= MAX_PLAYERS) return;
+    if (pkt.chunk_count == 0 || pkt.chunk_index >= pkt.chunk_count) return;
+    if (pkt.chunk_size > FRAGMENT_CHUNK_PAYLOAD) return;
+    if (pkt.total_size > 64 * 1024) return; // sanity cap: 64 KB per group
+
+    double now = get_time();
+    uint32_t key = (static_cast<uint32_t>(from_player_id) << 16) | pkt.group_id;
+    auto& asm_state = fragment_assembly_[key];
+    if (asm_state.chunk_count == 0) {
+        asm_state.chunk_count = pkt.chunk_count;
+        asm_state.total_size = pkt.total_size;
+        asm_state.original_type = pkt.original_type;
+        asm_state.started_at = now;
+        asm_state.last_chunk_at = now;
+        asm_state.received_mask.assign(pkt.chunk_count, false);
+        asm_state.buffer.assign(pkt.total_size, 0);
+    }
+    if (pkt.chunk_count != asm_state.chunk_count ||
+        pkt.total_size != asm_state.total_size) {
+        BKNET_LOG(Warn, "Fragment mismatch from p%u group %u", from_player_id, pkt.group_id);
+        fragment_assembly_.erase(key);
+        return;
+    }
+    asm_state.last_chunk_at = now;
+    if (asm_state.received_mask[pkt.chunk_index]) return; // duplicate chunk
+
+    size_t offset = static_cast<size_t>(pkt.chunk_index) * FRAGMENT_CHUNK_PAYLOAD;
+    if (offset + pkt.chunk_size > asm_state.total_size) return;
+    std::memcpy(asm_state.buffer.data() + offset, pkt.data, pkt.chunk_size);
+    asm_state.received_mask[pkt.chunk_index] = true;
+    asm_state.chunks_received++;
+
+    if (asm_state.chunks_received == asm_state.chunk_count) {
+        BKNET_LOG(Info, "Reassembled %u-byte payload (type=0x%02X) from p%u",
+                  asm_state.total_size, asm_state.original_type, from_player_id);
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.fragments_completed++;
+        }
+        // Dispatch the reassembled packet through the normal handler. Skip
+        // accounting — the wire chunks were already counted against BW/stats;
+        // re-counting the reassembled payload would inflate both.
+        std::vector<uint8_t> buf = std::move(asm_state.buffer);
+        fragment_assembly_.erase(key);
+        handle_packet(from_player_id, buf.data(), buf.size(), /*skip_accounting=*/true);
+    }
+
+    // Age out stale in-flight reassemblies (>30s) to avoid leaks.
+    for (auto it = fragment_assembly_.begin(); it != fragment_assembly_.end(); ) {
+        if (now - it->second.started_at > 30.0) {
+            BKNET_LOG(Warn, "Discarding stale fragment group (%u/%u chunks rcvd)",
+                      it->second.chunks_received, it->second.chunk_count);
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                stats_.fragments_timed_out++;
+            }
+            it = fragment_assembly_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // === World ownership ===

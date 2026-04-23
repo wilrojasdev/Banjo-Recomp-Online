@@ -60,7 +60,10 @@ struct InterpolatedState {
 class RemotePlayerInterpolator {
 public:
     static constexpr size_t BUFFER_SIZE = 4;
-    static constexpr double INTERP_DELAY_SEC = 0.1; // 100ms interpolation delay
+    // Base (floor) delay; effective delay grows adaptively with measured jitter
+    // so lossy/WAN links stop snapping to "latest" and can actually interpolate.
+    static constexpr double INTERP_DELAY_MIN_SEC = 0.1;
+    static constexpr double INTERP_DELAY_MAX_SEC = 0.4;
 
     void push_snapshot(const PositionSnapshot& snap);
     InterpolatedState interpolate(double current_time) const;
@@ -73,6 +76,10 @@ private:
     std::array<PositionSnapshot, BUFFER_SIZE> buffer_{};
     size_t write_index_ = 0;
     size_t snapshot_count_ = 0;
+    // Jitter estimate (exp moving avg of |delta_t - expected_tick|).
+    double jitter_ema_ = 0.0;
+    double last_arrival_dt_ = 0.0;
+    double last_push_time_ = 0.0;
     mutable std::mutex mutex_;
 };
 
@@ -115,7 +122,8 @@ struct EnemyInterpolatedState {
 class EnemyInterpolator {
 public:
     static constexpr size_t BUFFER_SIZE = 4;
-    static constexpr double INTERP_DELAY_SEC = 0.1;
+    static constexpr double INTERP_DELAY_MIN_SEC = 0.1;
+    static constexpr double INTERP_DELAY_MAX_SEC = 0.4;
 
     uint16_t marker_type = 0;
 
@@ -127,6 +135,8 @@ private:
     std::array<EnemySnapshot, BUFFER_SIZE> buffer_{};
     size_t write_index_ = 0;
     size_t snapshot_count_ = 0;
+    double jitter_ema_ = 0.0;
+    double last_push_time_ = 0.0;
 };
 
 class EnemyInterpolationManager {

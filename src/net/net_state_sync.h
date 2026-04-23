@@ -53,6 +53,11 @@ public:
 private:
     mutable std::mutex mutex_;
     LocalPlayerSnapshot snapshot_{};
+    // Tracks the last snapshot actually sent so build_state_packet() can emit
+    // a minimal dirty_flags mask (instead of 0xFFFFFFFF every tick).
+    // Mutated inside build_state_packet() under the same mutex.
+    mutable LocalPlayerSnapshot last_snapshot_{};
+    mutable bool last_snapshot_valid_ = false;
 };
 
 } // namespace bknet

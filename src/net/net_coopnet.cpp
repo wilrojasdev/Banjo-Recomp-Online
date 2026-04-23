@@ -3,13 +3,53 @@
 #include <juice/juice.h>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 
 namespace bknet {
 
 CoopNetTransport* CoopNetTransport::s_instance_ = nullptr;
 
+namespace {
+    // Monotonic seconds since a process-local epoch. Used for idle tracking.
+    double coopnet_now_seconds() {
+        static const auto epoch = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(now - epoch).count();
+    }
+
+    const char* error_to_string(CoopNetError e) {
+        switch (e) {
+            case CoopNetError::LobbyNotFound:      return "Lobby not found.";
+            case CoopNetError::LobbyFull:          return "Lobby is full.";
+            case CoopNetError::LobbyJoinFailed:    return "Failed to join lobby.";
+            case CoopNetError::PasswordIncorrect:  return "Incorrect password.";
+            case CoopNetError::VersionMismatch:    return "CoopNet server version mismatch.";
+            case CoopNetError::PeerFailed:         return "Failed to establish P2P connection.";
+            case CoopNetError::IdleTimeout:        return "Peer timed out (no traffic).";
+            case CoopNetError::ProtocolMismatch:   return "Game protocol mismatch — update both players to the same build.";
+            default:                               return "Unknown network error.";
+        }
+    }
+
+    CoopNetError translate_error(int mpacket_error) {
+        switch (mpacket_error) {
+            case MERR_LOBBY_NOT_FOUND:          return CoopNetError::LobbyNotFound;
+            case MERR_LOBBY_JOIN_FULL:          return CoopNetError::LobbyFull;
+            case MERR_LOBBY_JOIN_FAILED:        return CoopNetError::LobbyJoinFailed;
+            case MERR_LOBBY_PASSWORD_INCORRECT: return CoopNetError::PasswordIncorrect;
+            case MERR_COOPNET_VERSION:          return CoopNetError::VersionMismatch;
+            case MERR_PEER_FAILED:              return CoopNetError::PeerFailed;
+            default:                             return CoopNetError::Unknown;
+        }
+    }
+}
+
 CoopNetTransport::CoopNetTransport() {
     player_peers_.fill(INVALID_PEER);
+    last_packet_time_.fill(0.0);
+    // atomic<uint32_t> doesn't participate in array::fill() — store explicitly.
+    for (auto& r : rtt_ms_) r.store(0, std::memory_order_relaxed);
+    cleanup_done_.fill(false);
 }
 
 CoopNetTransport::~CoopNetTransport() {
@@ -71,6 +111,9 @@ void CoopNetTransport::shutdown() {
     local_user_id_ = 0;
     lobby_owner_id_ = 0;
     player_peers_.fill(INVALID_PEER);
+    cleanup_done_.fill(false);
+    last_packet_time_.fill(0.0);
+    for (auto& r : rtt_ms_) r.store(0, std::memory_order_relaxed);
     s_instance_ = nullptr;
 
     std::printf("[CoopNet] Shut down\n");
@@ -128,6 +171,9 @@ bool CoopNetTransport::leave_lobby() {
     current_lobby_id_ = 0;
     is_host_ = false;
     player_peers_.fill(INVALID_PEER);
+    cleanup_done_.fill(false);
+    last_packet_time_.fill(0.0);
+    for (auto& r : rtt_ms_) r.store(0, std::memory_order_relaxed);
 
     std::printf("[CoopNet] Left lobby\n");
     return rc == COOPNET_OK;
@@ -170,6 +216,62 @@ void CoopNetTransport::send_to(uint8_t player_id, const void* data, size_t size)
     coopnet_send_to(peer_id, static_cast<const uint8_t*>(data), static_cast<uint64_t>(size));
 }
 
+uint64_t CoopNetTransport::peer_id_for_player(uint8_t player_id) const {
+    return player_id_to_peer(player_id);
+}
+
+uint32_t CoopNetTransport::get_peer_rtt_ms(uint8_t player_id) const {
+    if (player_id >= MAX_PLAYERS) return 0;
+    return rtt_ms_[player_id].load(std::memory_order_relaxed);
+}
+
+void CoopNetTransport::set_peer_rtt_ms(uint8_t player_id, uint32_t rtt_ms) {
+    if (player_id >= MAX_PLAYERS) return;
+    rtt_ms_[player_id].store(rtt_ms, std::memory_order_relaxed);
+}
+
+void CoopNetTransport::mark_peer_alive(uint8_t player_id) {
+    if (player_id >= MAX_PLAYERS) return;
+    last_packet_time_[player_id] = coopnet_now_seconds();
+}
+
+double CoopNetTransport::seconds_since_last_packet(uint8_t player_id) const {
+    if (player_id >= MAX_PLAYERS || player_peers_[player_id] == INVALID_PEER) return -1.0;
+    double last = last_packet_time_[player_id];
+    if (last <= 0.0) return 0.0; // never seen yet — don't false-positive
+    return coopnet_now_seconds() - last;
+}
+
+void CoopNetTransport::drop_peer(uint8_t player_id, CoopNetError reason) {
+    if (player_id >= MAX_PLAYERS) return;
+    uint64_t peer_id = player_peers_[player_id];
+    if (peer_id == INVALID_PEER) return;
+
+    std::printf("[CoopNet] Dropping player %u: %s\n", player_id, error_to_string(reason));
+
+    // Fire typed error *before* cleanup so UI can show context while we still
+    // have the player_id mapping.
+    if (typed_error_callback_) {
+        typed_error_callback_(reason, error_to_string(reason));
+    }
+
+    // Fire the library unpeer; on_peer_disconnected will finish the cleanup.
+    coopnet_unpeer(peer_id);
+
+    // Defensive: if libcoopnet doesn't fire the callback synchronously, run
+    // our idempotent cleanup path now. Guarded by cleanup_done_ to avoid
+    // double-firing disconnect_callback.
+    if (!cleanup_done_[player_id]) {
+        cleanup_done_[player_id] = true;
+        player_peers_[player_id] = INVALID_PEER;
+        last_packet_time_[player_id] = 0.0;
+        rtt_ms_[player_id].store(0, std::memory_order_relaxed);
+        if (disconnect_callback_) {
+            disconnect_callback_(player_id);
+        }
+    }
+}
+
 uint8_t CoopNetTransport::peer_count() const {
     uint8_t count = 0;
     for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
@@ -190,6 +292,9 @@ uint8_t CoopNetTransport::assign_player_id(uint64_t peer_id) {
     for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
         if (player_peers_[i] == INVALID_PEER) {
             player_peers_[i] = peer_id;
+            cleanup_done_[i] = false;               // fresh slot
+            last_packet_time_[i] = coopnet_now_seconds();
+            rtt_ms_[i].store(0, std::memory_order_relaxed);
             return i;
         }
     }
@@ -290,6 +395,9 @@ void CoopNetTransport::on_lobby_left(uint64_t lobby_id, uint64_t user_id) {
         s_instance_->current_lobby_id_ = 0;
         s_instance_->is_host_ = false;
         s_instance_->player_peers_.fill(INVALID_PEER);
+        s_instance_->cleanup_done_.fill(false);
+        s_instance_->last_packet_time_.fill(0.0);
+        for (auto& r : s_instance_->rtt_ms_) r.store(0, std::memory_order_relaxed);
         std::printf("[CoopNet] Left lobby %llu\n", (unsigned long long)lobby_id);
 
         // If we didn't leave voluntarily, signal unexpected disconnect
@@ -298,15 +406,19 @@ void CoopNetTransport::on_lobby_left(uint64_t lobby_id, uint64_t user_id) {
         }
     } else {
         // Another peer left — on_peer_disconnected may NOT fire (forced disconnect),
-        // so handle it here
+        // so handle it here. Guarded by cleanup_done_ so the callback fires
+        // exactly once regardless of whether on_peer_disconnected races in.
         uint8_t player_id = s_instance_->peer_to_player_id(user_id);
-        if (player_id != 0xFF) {
+        if (player_id != 0xFF && !s_instance_->cleanup_done_[player_id]) {
             std::printf("[CoopNet] Player %u left lobby\n", player_id);
+            s_instance_->cleanup_done_[player_id] = true;
             s_instance_->release_player_id(user_id);
+            s_instance_->last_packet_time_[player_id] = 0.0;
+            s_instance_->rtt_ms_[player_id].store(0, std::memory_order_relaxed);
             if (s_instance_->disconnect_callback_) {
                 s_instance_->disconnect_callback_(player_id);
             }
-        } else {
+        } else if (player_id == 0xFF) {
             std::printf("[CoopNet] User %llu left lobby %llu\n",
                         (unsigned long long)user_id, (unsigned long long)lobby_id);
         }
@@ -345,6 +457,11 @@ void CoopNetTransport::on_receive(uint64_t from_user_id, const uint8_t* data, ui
     if (!s_instance_ || size == 0) return;
 
     uint8_t player_id = s_instance_->peer_to_player_id(from_user_id);
+    // Reset idle timer for this peer on any inbound byte. Even packets we
+    // end up dropping (unknown peer, malformed) count as liveness.
+    if (player_id != 0xFF) {
+        s_instance_->last_packet_time_[player_id] = coopnet_now_seconds();
+    }
 
     // Special case: if we're not yet assigned and this is a PlayerAssignment packet
     if (!s_instance_->is_host_ && size >= sizeof(PacketHeader)) {
@@ -358,6 +475,10 @@ void CoopNetTransport::on_receive(uint64_t from_user_id, const uint8_t* data, ui
             // We know the host's peer_id from lobby_owner_id_
             s_instance_->player_peers_[0] = from_user_id;
             s_instance_->player_peers_[pkt.assigned_player_id] = s_instance_->local_user_id_;
+            s_instance_->cleanup_done_[0] = false;
+            s_instance_->cleanup_done_[pkt.assigned_player_id] = false;
+            s_instance_->last_packet_time_[0] = coopnet_now_seconds();
+            s_instance_->rtt_ms_[0].store(0, std::memory_order_relaxed);
 
             std::printf("[CoopNet] Assigned player_id=%u by host\n", pkt.assigned_player_id);
             return; // Don't forward assignment packet to game logic
@@ -380,6 +501,9 @@ void CoopNetTransport::on_receive(uint64_t from_user_id, const uint8_t* data, ui
             return;
         }
         s_instance_->player_peers_[hdr.player_id] = from_user_id;
+        s_instance_->cleanup_done_[hdr.player_id] = false;
+        s_instance_->last_packet_time_[hdr.player_id] = coopnet_now_seconds();
+        s_instance_->rtt_ms_[hdr.player_id].store(0, std::memory_order_relaxed);
         player_id = hdr.player_id;
         std::printf("[CoopNet] Learned peer mapping: %llu -> player %u\n",
                     (unsigned long long)from_user_id, hdr.player_id);
@@ -402,11 +526,17 @@ void CoopNetTransport::on_receive(uint64_t from_user_id, const uint8_t* data, ui
 
 void CoopNetTransport::on_error(enum MPacketErrorNumber error_number, uint64_t tag) {
     if (!s_instance_) return;
-    std::fprintf(stderr, "[CoopNet] Error: %d (tag=%llu)\n",
-                 static_cast<int>(error_number), (unsigned long long)tag);
+
+    CoopNetError kind = translate_error(static_cast<int>(error_number));
+    const char* msg = error_to_string(kind);
+    std::fprintf(stderr, "[CoopNet] Error: %d (%s) tag=%llu\n",
+                 static_cast<int>(error_number), msg, (unsigned long long)tag);
 
     if (s_instance_->error_callback_) {
         s_instance_->error_callback_(static_cast<int>(error_number));
+    }
+    if (s_instance_->typed_error_callback_) {
+        s_instance_->typed_error_callback_(kind, msg);
     }
 }
 
@@ -481,10 +611,19 @@ void CoopNetTransport::on_peer_disconnected(uint64_t peer_id) {
     uint8_t player_id = s_instance_->peer_to_player_id(peer_id);
     if (player_id == 0xFF) return;
 
+    // Exactly-once cleanup: on_lobby_left may have already processed this peer.
+    if (s_instance_->cleanup_done_[player_id]) {
+        s_instance_->release_player_id(peer_id);
+        return;
+    }
+    s_instance_->cleanup_done_[player_id] = true;
+
     std::printf("[CoopNet] P2P peer disconnected: %llu (player_id=%u)\n",
                 (unsigned long long)peer_id, player_id);
 
     s_instance_->release_player_id(peer_id);
+    s_instance_->last_packet_time_[player_id] = 0.0;
+    s_instance_->rtt_ms_[player_id].store(0, std::memory_order_relaxed);
 
     if (s_instance_->disconnect_callback_) {
         s_instance_->disconnect_callback_(player_id);

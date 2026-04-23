@@ -8,6 +8,18 @@ namespace bknet {
 
 void RemotePlayerInterpolator::push_snapshot(const PositionSnapshot& snap) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Track inter-arrival jitter vs the expected ~50ms tick (20Hz send rate).
+    // jitter_ema_ tracks the deviation from expected spacing; we use it to
+    // grow the interpolation delay just enough to absorb real WAN jitter.
+    constexpr double expected_dt = 0.05;
+    if (last_push_time_ > 0.0) {
+        double dt = snap.timestamp - last_push_time_;
+        double delta = dt - expected_dt;
+        if (delta < 0) delta = -delta;
+        jitter_ema_ = 0.8 * jitter_ema_ + 0.2 * delta;
+    }
+    last_push_time_ = snap.timestamp;
+
     buffer_[write_index_] = snap;
     write_index_ = (write_index_ + 1) % BUFFER_SIZE;
     if (snapshot_count_ < BUFFER_SIZE) snapshot_count_++;
@@ -19,7 +31,12 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
     InterpolatedState result{};
     if (snapshot_count_ == 0) return result;
 
-    double render_time = current_time - INTERP_DELAY_SEC;
+    // Adaptive delay: min 100ms, scales up as jitter grows so we stay inside
+    // the snapshot window on lossy/WAN links and keep interpolating instead
+    // of snapping-to-latest (which produces visible rubber-banding).
+    double delay = INTERP_DELAY_MIN_SEC + 2.5 * jitter_ema_;
+    if (delay > INTERP_DELAY_MAX_SEC) delay = INTERP_DELAY_MAX_SEC;
+    double render_time = current_time - delay;
 
     // Collect valid snapshots sorted by timestamp
     std::array<const PositionSnapshot*, BUFFER_SIZE> sorted{};
@@ -180,6 +197,16 @@ double InterpolationManager::get_time() const {
 // --- EnemyInterpolator ---
 
 void EnemyInterpolator::push_snapshot(const EnemySnapshot& snap) {
+    // Mirror the player jitter EMA so WAN enemies also stop snapping.
+    constexpr double expected_dt = 0.05;
+    if (last_push_time_ > 0.0) {
+        double dt = snap.timestamp - last_push_time_;
+        double delta = dt - expected_dt;
+        if (delta < 0) delta = -delta;
+        jitter_ema_ = 0.8 * jitter_ema_ + 0.2 * delta;
+    }
+    last_push_time_ = snap.timestamp;
+
     buffer_[write_index_] = snap;
     write_index_ = (write_index_ + 1) % BUFFER_SIZE;
     if (snapshot_count_ < BUFFER_SIZE) snapshot_count_++;
@@ -192,7 +219,9 @@ EnemyInterpolatedState EnemyInterpolator::interpolate(double current_time, uint1
 
     if (snapshot_count_ == 0) return result;
 
-    double render_time = current_time - INTERP_DELAY_SEC;
+    double delay = INTERP_DELAY_MIN_SEC + 2.5 * jitter_ema_;
+    if (delay > INTERP_DELAY_MAX_SEC) delay = INTERP_DELAY_MAX_SEC;
+    double render_time = current_time - delay;
 
     // Collect valid snapshots sorted by timestamp
     std::array<const EnemySnapshot*, BUFFER_SIZE> sorted{};

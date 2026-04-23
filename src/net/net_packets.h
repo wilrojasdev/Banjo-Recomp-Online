@@ -13,6 +13,20 @@ constexpr uint8_t CHANNEL_UNRELIABLE = 0; // Position updates
 constexpr uint8_t CHANNEL_RELIABLE = 1;   // Join/leave/world state
 constexpr uint8_t NUM_CHANNELS = 2;
 
+// Application-level protocol version. Bumped whenever packet layout or
+// semantics change. Sent on connect; a mismatch closes the peer immediately
+// with a specific error instead of silently desyncing.
+constexpr uint32_t PROTOCOL_VERSION = 2;
+
+// Optional features negotiated in VersionCheck. Both peers' reported bitmaps
+// are ANDed; behaviour downgrades for features not common to both. This lets
+// us add capability without bumping PROTOCOL_VERSION and breaking old builds.
+constexpr uint32_t FEATURE_FRAGMENT_NACK = 1u << 0;
+constexpr uint32_t FEATURE_DIRTY_DELTA   = 1u << 1;
+constexpr uint32_t FEATURE_BW_CAP        = 1u << 2;
+constexpr uint32_t SUPPORTED_FEATURES =
+    FEATURE_FRAGMENT_NACK | FEATURE_DIRTY_DELTA | FEATURE_BW_CAP;
+
 enum class PacketType : uint8_t {
     // Connection (reliable)
     PlayerJoin       = 0x01,
@@ -20,6 +34,8 @@ enum class PacketType : uint8_t {
     PlayerAssignment = 0x03, // Server assigns player_id to new client
     Ping             = 0x04,
     Pong             = 0x05,
+    KeepAlive        = 0x06, // Idle heartbeat: sent every ~10s by each peer
+    VersionCheck     = 0x07, // First packet after peer connect; mismatch = unpeer
 
     // Phase 1: Position (unreliable)
     PlayerPosition   = 0x10,
@@ -43,6 +59,12 @@ enum class PacketType : uint8_t {
     CongaOrangeSpawn = 0x38,  // Conga orange projectile spawn (world owner → others)
     WorldStateFull   = 0x3F,
     HostEeprom       = 0x40,  // Host ships its full EEPROM (2 KB) to join on connect
+
+    // Fragmented transfer (for payloads > ~1200 bytes): splits reliable packets
+    // into sequenced chunks so a single lost chunk triggers only one small
+    // retransmit instead of the entire bulk.
+    FragmentChunk    = 0x50,
+    FragmentNack     = 0x51, // Receiver → sender: bitmap of missing chunks
 };
 
 #pragma pack(push, 1)
@@ -80,6 +102,52 @@ struct PongPacket {
     PacketHeader header;
     uint64_t ping_timestamp_us;
     uint64_t pong_timestamp_us;
+};
+
+// Empty keepalive: header is enough to reset the receiver's idle timer.
+struct KeepAlivePacket {
+    PacketHeader header;
+};
+
+// Protocol compatibility handshake. Host sends after peer-connected; joiner
+// echoes. Mismatch on protocol_version = unpeer with ProtocolMismatch.
+// feature_flags is a bitmap (FEATURE_*) — peers honor only the intersection.
+struct VersionCheckPacket {
+    PacketHeader header;
+    uint32_t protocol_version;
+    uint32_t feature_flags;
+};
+
+// Fragmented transfer envelope. `group_id` groups chunks of a single logical
+// payload; `chunk_index` is 0-based; `chunk_count` is total chunks. The last
+// chunk may be shorter. `original_type` is the PacketType to materialize after
+// reassembly (so receiver dispatches the result normally).
+constexpr size_t FRAGMENT_CHUNK_PAYLOAD = 1200; // conservative, < typical MTU
+
+struct FragmentChunkPacket {
+    PacketHeader header;
+    uint16_t group_id;
+    uint16_t chunk_index;
+    uint16_t chunk_count;
+    uint16_t chunk_size;        // bytes valid in `data`
+    uint8_t  original_type;     // PacketType of the reassembled packet
+    uint8_t  _pad[3];
+    uint32_t total_size;        // total bytes across all chunks
+    uint8_t  data[FRAGMENT_CHUNK_PAYLOAD];
+};
+
+// Receiver → sender. If chunks_received < chunk_count after 2s of silence
+// on this group, receiver tells sender exactly which indices are missing so
+// only those get retransmitted (complements the reliable channel — catches
+// the rare case where a chunk was dropped before reaching the wire, e.g. by
+// our send_queue backpressure).
+constexpr size_t FRAGMENT_NACK_BITMAP_BYTES = 32; // 256 bits → up to 256 chunks
+
+struct FragmentNackPacket {
+    PacketHeader header;
+    uint16_t group_id;
+    uint16_t chunk_count;
+    uint8_t  missing_bitmap[FRAGMENT_NACK_BITMAP_BYTES];
 };
 
 // --- Position packets (Phase 1) ---

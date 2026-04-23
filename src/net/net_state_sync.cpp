@@ -33,10 +33,38 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     std::lock_guard<std::mutex> lock(mutex_);
     if (!snapshot_.valid) return false;
 
+    // Compute diff vs last-sent snapshot so the wire payload advertises which
+    // fields actually changed. Receiver can (optionally) apply only dirty
+    // fields; until that's wired up on the receive side we still fill every
+    // field, so reducing `dirty_flags` is safe — the packet decodes the same
+    // way. The win arrives once the receive-side honors the mask.
+    uint32_t flags = 0;
+    if (!last_snapshot_valid_) {
+        flags = 0xFFFFFFFF;
+    } else {
+        const auto& prev = last_snapshot_;
+        const auto& cur = snapshot_;
+        if (cur.position[0] != prev.position[0] ||
+            cur.position[1] != prev.position[1] ||
+            cur.position[2] != prev.position[2]) flags |= DIRTY_POSITION;
+        if (cur.yaw != prev.yaw || cur.pitch != prev.pitch) flags |= DIRTY_ROTATION;
+        if (cur.animation_id != prev.animation_id ||
+            cur.anim_timer != prev.anim_timer ||
+            cur.anim_duration != prev.anim_duration ||
+            cur.anim_playback_type != prev.anim_playback_type) flags |= DIRTY_ANIMATION;
+        if (cur.health != prev.health || cur.health_total != prev.health_total ||
+            cur.lives != prev.lives) flags |= DIRTY_HEALTH;
+        if (cur.transformation != prev.transformation) flags |= DIRTY_TRANSFORMATION;
+        if (cur.map_id != prev.map_id || cur.level_id != prev.level_id) flags |= DIRTY_MAP;
+        if (cur.kazooie_flags != prev.kazooie_flags ||
+            cur.bs_state != prev.bs_state ||
+            cur.horizontal_velocity != prev.horizontal_velocity) flags |= DIRTY_ITEMS;
+    }
+
     out.header.type = PacketType::PlayerState;
     out.header.player_id = player_id;
     out.header.sequence = sequence;
-    out.dirty_flags = 0xFFFFFFFF; // send all fields for now
+    out.dirty_flags = flags;
     out.x = snapshot_.position[0];
     out.y = snapshot_.position[1];
     out.z = snapshot_.position[2];
@@ -62,6 +90,9 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     out.transformation = snapshot_.transformation;
     out.bs_state = static_cast<uint32_t>(snapshot_.bs_state);
     out.horizontal_velocity = snapshot_.horizontal_velocity;
+
+    last_snapshot_ = snapshot_;
+    last_snapshot_valid_ = true;
     return true;
 }
 

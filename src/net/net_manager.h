@@ -17,8 +17,32 @@
 #include "net_state_sync.h"
 #include "net_interpolation.h"
 #include "net_config.h"
+#include "net_log.h"
 
 namespace bknet {
+
+// Diagnostic counters. All fields are incremented from the SDL thread; reads
+// from UI or other threads should prefer the snapshot accessor which returns
+// a consistent copy.
+struct NetworkStats {
+    uint64_t packets_sent = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t packets_received = 0;
+    uint64_t bytes_received = 0;
+    uint64_t packets_dropped_queue = 0;       // enqueue_packet overflow
+    uint64_t packets_dropped_stale_seq = 0;   // UDP reorder reject
+    uint64_t packets_dropped_rate_limit = 0;  // chat / bandwidth cap
+    uint64_t packets_dropped_unknown = 0;     // unknown PacketType
+    uint64_t fragments_sent = 0;
+    uint64_t fragments_completed = 0;
+    uint64_t fragments_nacked = 0;            // NACK packets emitted
+    uint64_t fragments_retransmitted = 0;     // chunks resent in response
+    uint64_t fragments_timed_out = 0;         // reassembly abandoned
+    uint64_t reconnect_attempts = 0;
+    uint64_t peers_dropped_idle = 0;
+    uint64_t peers_dropped_bw = 0;
+    uint32_t rtt_ms_by_player[MAX_PLAYERS] = {};
+};
 
 enum class ConnectionState {
     Disconnected,
@@ -63,6 +87,16 @@ public:
     // Chat
     void send_chat(const std::string& message);
     void add_system_message(const std::string& message); // Local-only system message (join/leave)
+
+    // Latency (ms) to a given player — 0 if unknown or self.
+    uint32_t get_player_rtt_ms(uint8_t player_id) const;
+
+    // Typed error callback for UI (maps internal errors to user-friendly strings).
+    void set_typed_error_callback(CoopNetTransport::TypedErrorCallback cb);
+
+    // Diagnostic counters snapshot (cheap — plain copy under the stats mutex).
+    NetworkStats get_stats() const;
+    uint32_t get_peer_features(uint8_t player_id) const;
 
     // World state sync (Phase 3)
     void send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id);
@@ -173,7 +207,11 @@ private:
     NetworkManager& operator=(const NetworkManager&) = delete;
 
     void send_local_state();
-    void handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size);
+    // `skip_accounting` = true when re-entering with a reassembled fragment whose
+    // chunks were already counted at the wire level; avoids double-billing the
+    // BW cap and stats counters.
+    void handle_packet(uint8_t from_player_id, const uint8_t* data, size_t size,
+                       bool skip_accounting = false);
 
     // Unified send helpers (dispatch to ENet or CoopNet)
     void net_broadcast(const void* data, size_t size, uint8_t channel, bool reliable);
@@ -193,6 +231,35 @@ private:
     void assign_world_owner(uint32_t level_id, uint8_t player_id);
     void release_world_owner(uint32_t level_id, uint8_t leaving_player_id);
     void send_kill_list_for_level(uint32_t level_id);
+
+    // Keepalive, ping/pong, version handshake, idle timeout — called once per
+    // SDL-thread update() tick.
+    void tick_network_health();
+    void send_keepalive_to_all();
+    void send_ping_to_all();
+    void send_version_check(uint8_t player_id);
+    void handle_ping_packet(uint8_t from_player_id, const PingPacket& pkt);
+    void handle_pong_packet(uint8_t from_player_id, const PongPacket& pkt);
+    void handle_version_check(uint8_t from_player_id, const VersionCheckPacket& pkt);
+
+    // Fragment transport helpers. send_chunked fragments a large reliable
+    // payload; handle_fragment_chunk reassembles and re-enters the dispatcher.
+    void send_chunked(uint8_t target_player, PacketType original_type,
+                      const void* data, size_t size);
+    void handle_fragment_chunk(uint8_t from_player_id, const FragmentChunkPacket& pkt);
+    void handle_fragment_nack(uint8_t from_player_id, const FragmentNackPacket& pkt);
+
+    // Called from tick_network_health(): emit NACKs for incomplete reassembly
+    // groups that have been stalled >2s, and purge stale sender cache entries.
+    void tick_fragment_maintenance(double now);
+
+    // Reset any per-peer state that must not leak to a new player landing in
+    // the same slot after a disconnect (seq tracking, rate limits, reassembly).
+    void reset_peer_state(uint8_t player_id);
+
+    // Per-player sequence check: returns true if `seq` is newer (or first)
+    // for the given (player_id, type) pair. Handles 16-bit wrap.
+    bool sequence_is_fresh(uint8_t player_id, PacketType type, uint16_t seq);
 
     std::unique_ptr<Server> server_;
     std::unique_ptr<Client> client_;
@@ -268,12 +335,96 @@ private:
         uint8_t target_player;
     };
     static constexpr uint8_t BROADCAST_TARGET = 0xFF;
+    // Hard cap to prevent unbounded memory growth if CoopNet stalls. Unreliable
+    // packets older than this are dropped first; reliable are preserved up to
+    // twice the cap before we log and drop the oldest.
+    static constexpr size_t MAX_SEND_QUEUE = 256;
     mutable std::mutex send_queue_mutex_;
     std::deque<QueuedPacket> packet_send_queue_;
 
     // Thread-safe enqueue (called from game thread)
     void enqueue_packet(const void* data, size_t size, uint8_t channel, bool reliable);
     void enqueue_packet_to(uint8_t target_player, const void* data, size_t size, uint8_t channel, bool reliable);
+
+    // --- Network health state (SDL-thread only) ---
+    double last_keepalive_send_ = 0.0;
+    double last_ping_send_ = 0.0;
+    double last_idle_check_ = 0.0;
+
+    // Per-(player, packet-type) freshness for UDP reorder rejection.
+    // Keyed by ((player_id << 8) | packet_type_low_byte). uint16_t store.
+    std::unordered_map<uint16_t, uint16_t> last_seen_seq_;
+
+    // Fragment reassembly buffer per (sender player_id, group_id).
+    struct FragmentAssembly {
+        uint16_t chunk_count = 0;
+        uint16_t chunks_received = 0;
+        uint32_t total_size = 0;
+        uint8_t original_type = 0;
+        double started_at = 0.0;
+        double last_chunk_at = 0.0;   // last time a chunk for this group arrived
+        double last_nack_at = 0.0;    // throttle NACK emission to once per 2s
+        uint8_t nack_attempts = 0;    // stop NACKing after MAX_NACK_ATTEMPTS
+        std::vector<bool> received_mask;
+        std::vector<uint8_t> buffer;
+    };
+    static constexpr uint8_t MAX_NACK_ATTEMPTS = 5;
+    std::unordered_map<uint32_t, FragmentAssembly> fragment_assembly_;
+
+    // Sender-side cache of chunks for potential retransmit. Key = group_id.
+    // Chunks are retained until all delivered (we can't know that — approximate
+    // via 30s TTL) or the lobby transitions. Entries store raw wire bytes so
+    // the retransmit path doesn't re-serialize.
+    struct SentFragmentGroup {
+        uint8_t target_player = BROADCAST_TARGET;
+        uint16_t chunk_count = 0;
+        double sent_at = 0.0;
+        std::vector<std::vector<uint8_t>> chunks; // raw wire bytes per chunk
+    };
+    std::unordered_map<uint16_t, SentFragmentGroup> sent_fragments_;
+    // Cap in-flight sender-side fragment groups. Beyond this we evict the
+    // oldest (by sent_at) before inserting. Each group can hold up to ~65 KB,
+    // so 32 caps memory at ~2 MB which is tolerable even during bulk sync.
+    static constexpr size_t MAX_SENT_FRAGMENT_GROUPS = 32;
+
+    // Monotonic group_id generator (atomic so future callers from game thread
+    // can't tear the value — send_chunked currently runs SDL-only but this
+    // removes the foot-gun).
+    std::atomic<uint16_t> next_fragment_group_id_{1};
+
+    // Per-player chat rate limit (seconds). Drop chat messages closer than 500ms.
+    std::array<double, MAX_PLAYERS> last_chat_time_{};
+
+    // Per-player inbound bandwidth tracker (1s window). Peers exceeding
+    // MAX_INBOUND_BPS are dropped with CoopNetError::BandwidthExceeded (treated
+    // as a peer-failed equivalent — this protects the host from buggy clients).
+    static constexpr uint32_t MAX_INBOUND_BPS = 256 * 1024; // 256 KB/s per peer
+    std::array<uint32_t, MAX_PLAYERS> bytes_recv_window_{};
+    double last_bw_window_reset_ = 0.0;
+
+    // Receive-side "last known state" for dirty_flags delta apply. When a
+    // PlayerStatePacket arrives with partial dirty_flags, un-dirty fields are
+    // filled from this snapshot. Reset on peer disconnect/reassign.
+    std::array<PositionSnapshot, MAX_PLAYERS> last_recv_state_{};
+    std::array<bool, MAX_PLAYERS> last_recv_state_valid_{};
+
+    // Per-peer negotiated feature bitmap (AND of local & remote SUPPORTED_FEATURES).
+    // 0 means the peer hasn't completed the version handshake yet.
+    std::array<uint32_t, MAX_PLAYERS> peer_features_{};
+
+    // Stats snapshot. Mutated from SDL thread; read via get_stats() which
+    // takes the mutex for a consistent copy.
+    mutable std::mutex stats_mutex_;
+    NetworkStats stats_{};
+
+    // Reconnection backoff state.
+    bool reconnect_pending_ = false;
+    double next_reconnect_at_ = 0.0;
+    uint32_t reconnect_attempts_ = 0;
+    std::string reconnect_server_;
+    uint16_t reconnect_port_ = 0;
+
+    CoopNetTransport::TypedErrorCallback typed_error_callback_;
 };
 
 } // namespace bknet
