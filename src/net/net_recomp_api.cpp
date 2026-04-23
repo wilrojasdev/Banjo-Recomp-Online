@@ -169,9 +169,16 @@ extern "C" void recomp_net_get_save_slot(uint8_t* rdram, recomp_context* ctx) {
     _return(ctx, static_cast<u32>(bknet::get_config().save_slot));
 }
 
-// Returns 1 if join mode, 0 if host or off.
+// Returns 1 if join mode (either ENet LAN or CoopNet WAN), 0 if host or off.
+// NetworkMode has 5 values — originally only Host/Join for ENet; CoopNet added
+// CoopNetHost/CoopNetJoin later. The old exact-equality check against ::Join
+// silently failed for every CoopNet joiner, so the save-override/autoload
+// join branches were bypassed (join was treated like host/off).
 extern "C" void recomp_net_is_join_mode(uint8_t* rdram, recomp_context* ctx) {
-    _return(ctx, bknet::get_config().mode == bknet::NetworkMode::Join ? 1u : 0u);
+    auto m = bknet::get_config().mode;
+    bool is_join = (m == bknet::NetworkMode::Join)
+                || (m == bknet::NetworkMode::CoopNetJoin);
+    _return(ctx, is_join ? 1u : 0u);
 }
 
 // Get remote player's interpolated state.

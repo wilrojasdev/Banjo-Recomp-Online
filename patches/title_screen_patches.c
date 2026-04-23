@@ -27,6 +27,34 @@ extern bool bkrecomp_net_save_override_is_ready(void);
 extern void bkrecomp_net_save_override_enable(void);
 extern s32  bkrecomp_net_save_get_host_slot(void);
 
+// Live state globals — join-side defensive clear. These are populated by the
+// vanilla file-select flow (gameSelect_update) while the join waits for the
+// host's EEPROM packet, because BK's file select previews slots by loading
+// their data into live globals. clearScoreStates() handles jiggyscore /
+// mumboscore / honeycombscore / volatileFlag / loaded_file_extension_data
+// but leaves the flag/note/ability globals below dirty, so WorldStateFull's
+// monotonic merge (OR/MAX/if-greater) never clears whatever the preview load
+// left behind. We bzero them explicitly before applying the host's snapshot.
+extern struct { s32 unk0; s32 unk4; u8 unk8[0x25]; } gFileProgressFlags;
+extern struct { u32 unk0; u32 unk4; u8 unk8[8]; }    D_80383320;     // level_specific_flags
+extern u32 D_80367000;                                                // map_specific_flags
+extern u8  D_80385FF0[0xB];                                           // per-level note high scores
+extern void ability_getSizeAndPtr(s32 *size, u8 **addr);              // live learned/used abilities
+
+static void join_clear_leaked_live_state(void) {
+    bzero(gFileProgressFlags.unk8, sizeof(gFileProgressFlags.unk8));
+    bzero(D_80383320.unk8,        sizeof(D_80383320.unk8));
+    D_80367000 = 0;
+    bzero(D_80385FF0, sizeof(D_80385FF0));
+
+    s32  ab_sz = 0;
+    u8  *ab_ptr = NULL;
+    ability_getSizeAndPtr(&ab_sz, &ab_ptr);
+    if (ab_ptr && ab_sz > 0) {
+        bzero(ab_ptr, ab_sz);
+    }
+}
+
 // @recomp Skip intro cutscenes when online mode is configured — boot directly to file select.
 RECOMP_PATCH enum map_e getDefaultBootMap(void) {
     if (recomp_net_is_online_mode()) {
@@ -72,6 +100,16 @@ RECOMP_PATCH void gameSelect_initAndUpdate(Actor *this) {
         clearScoreStates();
 
         if (is_join) {
+            // Purge live state that clearScoreStates doesn't cover
+            // (gFileProgressFlags, D_80383320, D_80367000, D_80385FF0,
+            // abilities). The vanilla gameSelect_update that ran while
+            // we were waiting for the host's EEPROM packet may have
+            // previewed the local disk's first non-empty slot and
+            // populated these globals — and the full-state sync merges
+            // monotonically, so without this wipe the pre-loaded
+            // progress would survive and show up in pause-menu Totals.
+            join_clear_leaked_live_state();
+
             // Flip the EEPROM backing store to the RAM buffer filled by
             // the HostEeprom packet. Every eeprom_readBlocks/writeBlocks
             // call from here on will target RAM, so: (1) the game sees

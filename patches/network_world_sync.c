@@ -127,14 +127,18 @@ static bool processing_remote = FALSE;
 // === Enemy tracking ===
 #define MAX_TRACKED_ENEMIES 128
 
-// Join: pending kills received before entering the map — applied when map matches
-#define MAX_PENDING_KILLS 32
+// Join: pending kills received before entering the map — applied when map matches.
+// Capacity raised from 32 to 256 after observing silent drops in heavy-combat levels
+// (e.g., Gobi/Clanker) where >32 enemies could die before a late joiner enters the map.
+// Overflows now log a warning instead of failing silently.
+#define MAX_PENDING_KILLS 256
 static struct {
     u16 marker_type;
     u16 spawn_index;
     u32 map_id;
 } pending_kills[MAX_PENDING_KILLS];
 static s32 pending_kill_count = 0;
+static u32 pending_kills_dropped = 0;  // Cumulative count of overflow drops
 
 // World owner: track killed enemies in current level to re-send to late joiners
 #define MAX_KILLED_ON_MAP 64
@@ -152,6 +156,50 @@ typedef struct {
     u16 spawn_index;
     f32 pos_x, pos_y, pos_z;
 } TrackedEnemy;
+
+// --- Recent-kill dedup: prevents duplicate honeycomb drops when the same
+//     (marker, spawn, map) arrives multiple times (rejoin resync overlapping
+//     with a live kill, post-transfer re-broadcast, etc.). Cleared on level change.
+#define MAX_RECENT_KILLS 128
+static struct {
+    u16 marker_type;
+    u16 spawn_index;
+    u32 map_id;
+} recent_kills[MAX_RECENT_KILLS];
+static s32 recent_kill_count = 0;
+static u32 recent_kill_level = 0xFFFFFFFF;
+
+static bool is_recent_kill(u16 marker, u16 spawn, u32 map) {
+    s32 i;
+    for (i = 0; i < recent_kill_count; i++) {
+        if (recent_kills[i].marker_type == marker &&
+            recent_kills[i].spawn_index == spawn &&
+            recent_kills[i].map_id == map) return TRUE;
+    }
+    return FALSE;
+}
+
+static void remember_kill(u16 marker, u16 spawn, u32 map) {
+    if (is_recent_kill(marker, spawn, map)) return;
+    if (recent_kill_count < MAX_RECENT_KILLS) {
+        s32 ki = recent_kill_count;
+        recent_kills[ki].marker_type = marker;
+        recent_kills[ki].spawn_index = spawn;
+        recent_kills[ki].map_id = map;
+        recent_kill_count = ki + 1;
+    } else {
+        // Ring: drop oldest, shift down, append at end
+        s32 i;
+        for (i = 1; i < MAX_RECENT_KILLS; i++) {
+            recent_kills[i - 1].marker_type = recent_kills[i].marker_type;
+            recent_kills[i - 1].spawn_index = recent_kills[i].spawn_index;
+            recent_kills[i - 1].map_id = recent_kills[i].map_id;
+        }
+        recent_kills[MAX_RECENT_KILLS - 1].marker_type = marker;
+        recent_kills[MAX_RECENT_KILLS - 1].spawn_index = spawn;
+        recent_kills[MAX_RECENT_KILLS - 1].map_id = map;
+    }
+}
 
 // --- Dying enemies: stop position override so death animation can play ---
 #define MAX_DYING_ENEMIES 32
@@ -693,6 +741,9 @@ static void poll_enemy_deaths(void) {
         dying_count = 0;
         killed_on_map_count = 0;
         killed_on_level_id = cur_level;
+        // Reset dedup cache on level change (map transitions keep it).
+        recent_kill_count = 0;
+        recent_kill_level = cur_level;
         // Build initial snapshot without sending events
         s32 count = 0;
         s32 i;
@@ -1153,6 +1204,14 @@ static void process_enemy_event(EnemyEventData *evt) {
 
     u32 cur_map = (u32)map_get();
 
+    // Lazy level-change reset for non-owners (owner path already resets in
+    // poll_enemy_deaths). Ensures recent_kills doesn't leak across levels.
+    u32 cur_lvl = (u32)level_get();
+    if (cur_lvl != recent_kill_level) {
+        recent_kill_count = 0;
+        recent_kill_level = cur_lvl;
+    }
+
     if (cur_map != evt->enemy_map_id) {
         // Save for later — join might not be on this map yet
         if (pending_kill_count < MAX_PENDING_KILLS) {
@@ -1162,6 +1221,13 @@ static void process_enemy_event(EnemyEventData *evt) {
             pending_kill_count++;
             recomp_printf("[ENEMY-EVT] saved pending kill: marker=0x%X spawn=%d map=%d (cur=%d)\n",
                 evt->enemy_marker_type, evt->enemy_spawn_index, evt->enemy_map_id, cur_map);
+        } else {
+            pending_kills_dropped++;
+            // Log first drop and every 16th thereafter so floods don't spam.
+            if ((pending_kills_dropped & 0xF) == 1) {
+                recomp_printf("[ENEMY-EVT] *** DROPPED pending kill (buffer full): marker=0x%X spawn=%d map=%d cur=%d (total dropped=%u)\n",
+                    evt->enemy_marker_type, evt->enemy_spawn_index, evt->enemy_map_id, cur_map, pending_kills_dropped);
+            }
         }
         processing_remote = FALSE;
         return;
@@ -1180,11 +1246,21 @@ static void process_enemy_event(EnemyEventData *evt) {
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
             if (si != target_spawn) continue;
 
-            if (is_resync) {
+            // Defensive dedup: if we've already processed a kill for this
+            // (marker, spawn, map) as non-resync, downgrade to silent despawn
+            // to prevent duplicate honeycomb drops (fixes #6).
+            bool already_processed = is_recent_kill(target_marker, target_spawn, cur_map);
+
+            if (is_resync || already_processed) {
                 // Silent despawn — enemy was already killed, just remove on re-entry
                 marker_despawn(actor->marker);
+                if (already_processed && !is_resync) {
+                    recomp_printf("[ENEMY-EVT] dedup: silent despawn for marker=0x%X spawn=%d (already killed)\n",
+                        target_marker, target_spawn);
+                }
             } else {
                 // Real-time kill: honeycomb + death animation
+                remember_kill(target_marker, target_spawn, cur_map);
                 {
                     f32 drop_pos[3];
                     drop_pos[0] = actor->position[0];

@@ -1234,19 +1234,17 @@ void NetworkManager::assign_world_owner(uint32_t level_id, uint8_t player_id) {
 }
 
 void NetworkManager::release_world_owner(uint32_t level_id, uint8_t leaving_player_id) {
-    uint8_t current_owner;
+    // Determine replacement + mutate world_owner_ atomically to avoid TOCTOU:
+    // a concurrent update_player_level() could otherwise change player_levels_[]
+    // between the check and the find-replacement loop.
+    uint8_t new_owner = 0xFF;
+    bool no_one_left = false;
     {
         std::lock_guard<std::mutex> lock(ownership_mutex_);
         auto it = world_owner_.find(level_id);
         if (it == world_owner_.end()) return;
-        current_owner = it->second;
-        if (current_owner != leaving_player_id) return; // Not the owner, nothing to do
-    }
+        if (it->second != leaving_player_id) return;
 
-    // Find another player on the same level
-    uint8_t new_owner = 0xFF;
-    {
-        std::lock_guard<std::mutex> lock(ownership_mutex_);
         for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
             if (i == leaving_player_id) continue;
             if (player_levels_[i] == level_id) {
@@ -1254,32 +1252,33 @@ void NetworkManager::release_world_owner(uint32_t level_id, uint8_t leaving_play
                 break;
             }
         }
+
+        if (new_owner != 0xFF) {
+            world_owner_[level_id] = new_owner;
+        } else {
+            world_owner_.erase(level_id);
+            no_one_left = true;
+        }
     }
 
+    // Broadcast outside the lock (enqueue_packet takes send_queue_mutex_).
+    WorldOwnershipPacket pkt{};
+    pkt.header.type = PacketType::WorldOwnership;
+    pkt.header.player_id = 0;
+    pkt.header.sequence = 0;
+    pkt.level_id = level_id;
+    pkt.owner_player_id = (new_owner != 0xFF) ? new_owner : 0xFF;
+    enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
+
     if (new_owner != 0xFF) {
-        // Transfer ownership
-        assign_world_owner(level_id, new_owner);
         std::printf("[Ownership] Transferred level %u from player %u to player %u\n",
             level_id, leaving_player_id, new_owner);
-    } else {
-        // No one left — remove ownership (world state resets)
-        {
-            std::lock_guard<std::mutex> lock(ownership_mutex_);
-            world_owner_.erase(level_id);
-        }
-
-        WorldOwnershipPacket pkt{};
-        pkt.header.type = PacketType::WorldOwnership;
-        pkt.header.player_id = 0;
-        pkt.header.sequence = 0;
-        pkt.level_id = level_id;
-        pkt.owner_player_id = 0xFF; // No owner
-
-        enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
-
-        // Clear centralized kill tracking (enemies will respawn on re-entry)
+        // Re-send kill list so the new owner's local killed_on_map[] tracking
+        // stays consistent with the centralized registry (fix for bug #4:
+        // pending kills orphaned when owner disconnects).
+        send_kill_list_for_level(level_id);
+    } else if (no_one_left) {
         clear_level_kills(level_id);
-
         std::printf("[Ownership] Level %u has no players — state reset\n", level_id);
     }
 }

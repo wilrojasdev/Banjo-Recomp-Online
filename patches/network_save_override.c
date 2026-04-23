@@ -33,10 +33,56 @@ extern u32 recomp_net_should_send_host_eeprom(u8 *out_target_player);
 extern void recomp_net_send_host_eeprom(void *data, s32 size, u32 target_player, s32 current_slot);
 extern u32 recomp_net_is_host(void);
 extern u32 recomp_net_is_connected(void);
+extern u32 recomp_net_get_save_slot(void);  // config slot chosen in host UI
 extern s32 gameSelect_getGameNumber(void);
 
 // SaveData is 0x78 (120 bytes) -> 15 blocks per slot in vanilla layout.
 #define EEPROM_OVERRIDE_BLOCKS (EEPROM_OVERRIDE_SIZE / EEPROM_BLOCK_SIZE)
+
+// Physical EEPROM layout constants (mirrors save_extensions.c):
+//   0..479    : 4 physical vanilla SaveData slots (120 bytes each). Each has
+//               byte[0]=magic, byte[1]=slotIndex (1-based game slot).
+//   480..511  : unused padding
+//   512..1791 : 4 physical SaveFileExtension slots (320 bytes each), indexed
+//               by filenum which equals the vanilla physical index.
+//   1792..2047: SaveGlobalExtensionData (host live state, kept intact).
+#define SCRUB_VANILLA_SLOT_SIZE 120
+#define SCRUB_EXT_SLOT_SIZE     320
+#define SCRUB_EXT_OFFSET        512
+#define SCRUB_GLOBAL_OFFSET     1792
+
+// Zero every physical slot whose slotIndex doesn't match `keep_slot` (0-based).
+// Prevents the joiner's override buffer from exposing the host's unrelated save
+// slots via file-select / stats-menu reads. Only the active slot's data (plus
+// the global extension with live cumulative stats) remains.
+static void scrub_snapshot_keep_slot(u8 *snapshot, s32 keep_slot) {
+    if (keep_slot < 0 || keep_slot > 2) return;
+    u8 keep_index_1based = (u8)(keep_slot + 1);
+
+    bool keep_phys[4] = {FALSE, FALSE, FALSE, FALSE};
+    s32 phys;
+
+    // Vanilla slots: keep only those matching the active slotIndex.
+    for (phys = 0; phys < 4; phys++) {
+        s32 base = phys * SCRUB_VANILLA_SLOT_SIZE;
+        u8 magic    = snapshot[base + 0];
+        u8 slot_idx = snapshot[base + 1];
+        if (magic != 0 && slot_idx == keep_index_1based) {
+            keep_phys[phys] = TRUE;
+        } else {
+            bzero(&snapshot[base], SCRUB_VANILLA_SLOT_SIZE);
+        }
+    }
+
+    // Extension slots: indexed by the same physical position (filenum).
+    for (phys = 0; phys < 4; phys++) {
+        if (keep_phys[phys]) continue;
+        s32 base = SCRUB_EXT_OFFSET + phys * SCRUB_EXT_SLOT_SIZE;
+        bzero(&snapshot[base], SCRUB_EXT_SLOT_SIZE);
+    }
+    // Global extension (bytes 1792..2047) kept intact — it holds the host's
+    // live cumulative state that the full-state sync also pushes.
+}
 
 // RECOMP_PATCH replaces the engine-level EEPROM entry points. The same
 // address/offset math vanilla uses is preserved; only the backing store
@@ -189,9 +235,21 @@ RECOMP_EXPORT void bkrecomp_net_save_override_tick(void) {
         if (recomp_net_should_send_host_eeprom(&target)) {
             static u8 snapshot[EEPROM_OVERRIDE_SIZE];
             bkrecomp_net_save_read_full_eeprom(snapshot);
-            s32 cur_slot = gameSelect_getGameNumber();
+            // Use the config slot chosen in the host UI (set at click-Start
+            // time) rather than gameSelect_getGameNumber(). The latter reflects
+            // BK's current in-memory game number, which races against the
+            // title-screen autoload: if the joiner connects before the host's
+            // gameSelect_initAndUpdate has run gameSelect_setGameNumber(slot),
+            // gameSelect_getGameNumber() returns BK's default (often the first
+            // populated slot), so the joiner loads unrelated save progress.
+            s32 cur_slot = (s32)recomp_net_get_save_slot();
+            // Clamp to valid range; fall back to 0 on misconfiguration.
+            if (cur_slot < 0 || cur_slot > 2) cur_slot = 0;
+            // Strip the other slots so the joiner's file-select / stats
+            // menu can't read unrelated progress from the host's save file.
+            scrub_snapshot_keep_slot(snapshot, cur_slot);
             recomp_net_send_host_eeprom(snapshot, EEPROM_OVERRIDE_SIZE, (u32)target, cur_slot);
-            recomp_printf("[SAVE-OVERRIDE] host shipped EEPROM to player %d (slot=%d)\n", target, cur_slot);
+            recomp_printf("[SAVE-OVERRIDE] host shipped EEPROM to player %d (slot=%d, scrubbed)\n", target, cur_slot);
         }
     } else {
         // Pop any queued snapshot. Once the buffer is ready, the title
