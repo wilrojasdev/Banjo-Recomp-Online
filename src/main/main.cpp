@@ -964,20 +964,6 @@ static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(reco
     return {backdrop, card};
 }
 
-// --- Helper: add an X close button at the top-right of a card ---
-static recompui::IconButton* add_close_x(recompui::ContextId& context,
-                                          recompui::Element* card,
-                                          std::function<void()> on_close) {
-    auto x_btn = context.create_element<recompui::IconButton>(
-        card, "icons/X.svg", recompui::ButtonStyle::Basic, recompui::IconButtonSize::Small
-    );
-    x_btn->set_position(recompui::Position::Absolute);
-    x_btn->set_top(banjo::ui::space::md);
-    x_btn->set_right(banjo::ui::space::md);
-    x_btn->add_pressed_callback(on_close);
-    return x_btn;
-}
-
 // --- Helper: create a labeled section inside a card (label + content grouped) ---
 static recompui::Element* create_section(recompui::ContextId& context, recompui::Element* card, const char* title) {
     using namespace banjo::ui;
@@ -1020,26 +1006,55 @@ static recompui::Element* make_column(recompui::ContextId& context, recompui::El
     return col;
 }
 
-// --- Helper: centered title (Header2 label + short primary accent underline) ---
-static recompui::Element* make_title_row(recompui::ContextId& context, recompui::Element* parent, const char* title) {
-    auto wrap = context.create_element<recompui::Element>(parent);
-    wrap->set_display(recompui::Display::Flex);
-    wrap->set_flex_direction(recompui::FlexDirection::Column);
-    wrap->set_align_items(recompui::AlignItems::Center);
-    wrap->set_gap(banjo::ui::space::xs);
-    wrap->set_width(100.0f, recompui::Unit::Percent);
-    wrap->set_margin_bottom(banjo::ui::space::sm);
+// --- Helper: centered title (Header2 label + short primary accent underline).
+// If on_close is supplied an X IconButton is placed inline on the right side
+// of the title row. A matching invisible spacer goes on the left so the title
+// stays visually centered.
+static recompui::Element* make_title_row(recompui::ContextId& context, recompui::Element* parent,
+                                          const char* title,
+                                          std::function<void()> on_close = {}) {
+    constexpr float close_btn_size = 32.0f;  // matches IconButtonSize::Small
+    bool has_close = static_cast<bool>(on_close);
 
-    context.create_element<recompui::Label>(wrap, title, recompui::theme::Typography::Header2);
+    auto row = context.create_element<recompui::Element>(parent);
+    row->set_display(recompui::Display::Flex);
+    row->set_flex_direction(recompui::FlexDirection::Row);
+    row->set_align_items(recompui::AlignItems::Center);
+    row->set_justify_content(recompui::JustifyContent::Center);
+    row->set_width(100.0f, recompui::Unit::Percent);
+    row->set_margin_bottom(banjo::ui::space::sm);
+    row->set_gap(banjo::ui::space::md);
 
-    // Primary-colored accent bar under the title — anchors the heading.
-    auto accent = context.create_element<recompui::Element>(wrap);
+    if (has_close) {
+        // Invisible spacer on the left to balance the X on the right and keep
+        // the title genuinely centered in the row.
+        auto spacer = context.create_element<recompui::Element>(row);
+        spacer->set_width(close_btn_size);
+        spacer->set_height(close_btn_size);
+    }
+
+    auto title_wrap = context.create_element<recompui::Element>(row);
+    title_wrap->set_display(recompui::Display::Flex);
+    title_wrap->set_flex_direction(recompui::FlexDirection::Column);
+    title_wrap->set_align_items(recompui::AlignItems::Center);
+    title_wrap->set_gap(banjo::ui::space::xs);
+    title_wrap->set_flex_grow(1.0f);
+    context.create_element<recompui::Label>(title_wrap, title, recompui::theme::Typography::Header2);
+
+    auto accent = context.create_element<recompui::Element>(title_wrap);
     accent->set_width(48.0f);
     accent->set_height(3.0f);
     accent->set_background_color(recompui::theme::color::Primary);
     accent->set_border_radius(2.0f);
 
-    return wrap;
+    if (has_close) {
+        auto x_btn = context.create_element<recompui::IconButton>(
+            row, "icons/X.svg", recompui::ButtonStyle::Basic, recompui::IconButtonSize::Small
+        );
+        x_btn->add_pressed_callback(on_close);
+    }
+
+    return row;
 }
 
 // --- Helper: action row with Back (secondary) + primary CTA ---
@@ -1349,9 +1364,8 @@ static void ensure_host_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     host_panel = backdrop;
 
-    add_close_x(context, card, []() { hide_panel(host_panel); });
-
-    make_title_row(context, card, banjo::locale::tr("host.title").c_str());
+    make_title_row(context, card, banjo::locale::tr("host.title").c_str(),
+                   []() { hide_panel(host_panel); });
 
     // --- Player Name ---
     auto host_name_section = create_section(context, card, banjo::locale::tr("host.player_name").c_str());
@@ -1628,11 +1642,10 @@ static void ensure_join_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     join_panel = backdrop;
 
-    add_close_x(context, card, []() { hide_panel(join_panel); });
-
     // ========== MENU VIEW (main join screen) ==========
     join_menu_view = make_column(context, card, banjo::ui::space::lg, recompui::AlignItems::Center);
-    make_title_row(context, join_menu_view, banjo::locale::tr("join.title").c_str());
+    make_title_row(context, join_menu_view, banjo::locale::tr("join.title").c_str(),
+                   []() { hide_panel(join_panel); });
 
     // --- Player Name ---
     auto join_name_section = create_section(context, join_menu_view, banjo::locale::tr("host.player_name").c_str());
@@ -2188,8 +2201,11 @@ int main(int argc, char** argv) {
     // Initialize networking (ENet)
     bknet::NetworkManager::instance().initialize();
 
-    banjo::init_config();
+    // Locale MUST be initialized before init_config so that add_*_options()
+    // calls can use tr() with the correct language when registering option
+    // titles/descriptions with the config system.
     banjo::locale::init();
+    banjo::init_config();
 
     // Network mode is now set from the launcher UI (Host/Join buttons).
     // The mode is configured when the user clicks Host or Join, and the
