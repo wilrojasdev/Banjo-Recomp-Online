@@ -126,6 +126,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #include "banjo_support.h"
 #include "banjo_game.h"
 #include "banjo_launcher.h"
+#include "ui_tokens.h"
 #include "recomp_data.h"
 #include "ovl_patches.hpp"
 #include "theme.h"
@@ -883,6 +884,8 @@ static SlotInfo read_save_slot(int game_slot) {
 
 // --- Helper: create a full-screen backdrop + centered dialog card ---
 static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(recompui::ContextId& context) {
+    using namespace banjo::ui;
+
     // Backdrop — parented to launcher root so it covers the entire viewport
     auto backdrop = context.create_element<recompui::Element>(static_cast<recompui::Element*>(g_launcher_menu));
     backdrop->set_display(recompui::Display::Flex);
@@ -894,38 +897,42 @@ static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(reco
     backdrop->set_top(0.0f);
     backdrop->set_width(100.0f, recompui::Unit::Percent);
     backdrop->set_height(100.0f, recompui::Unit::Percent);
-    backdrop->set_padding_left(25.0f);
-    backdrop->set_padding_right(25.0f);
-    backdrop->set_background_color(recompui::Color{0, 0, 0, 180});
+    backdrop->set_padding_left(dialog::backdrop_padding);
+    backdrop->set_padding_right(dialog::backdrop_padding);
+    backdrop->set_background_color(recompui::theme::color::ModalOverlay);
     backdrop->display_hide();
 
-    // Card
+    // Card — uses theme tokens so every dialog shares the same shape
     auto card = context.create_element<recompui::Element>(backdrop);
     card->set_display(recompui::Display::Flex);
     card->set_flex_direction(recompui::FlexDirection::Column);
     card->set_align_items(recompui::AlignItems::FlexStart);
-    card->set_gap(12.0f);
-    card->set_padding_top(44.0f);
-    card->set_padding_bottom(44.0f);
-    card->set_padding_left(64.0f);
-    card->set_padding_right(64.0f);
+    card->set_gap(dialog::card_gap);
+    card->set_padding_top(dialog::padding_v);
+    card->set_padding_bottom(dialog::padding_v);
+    card->set_padding_left(dialog::padding_h);
+    card->set_padding_right(dialog::padding_h);
     card->set_width(100.0f, recompui::Unit::Percent);
-    card->set_max_width(700.0f);
-    card->set_background_color(recompui::Color{14, 18, 30, 250});
-    card->set_border_radius(16.0f);
+    card->set_max_width(dialog::max_width);
+    card->set_background_color(recompui::theme::color::Background3);
+    card->set_border_radius(recompui::theme::border::radius_lg);
+    card->set_border_width(1.0f);
+    card->set_border_color(recompui::theme::color::Border);
 
     return {backdrop, card};
 }
 
 // --- Helper: create a labeled section inside a card (label + content grouped) ---
 static recompui::Element* create_section(recompui::ContextId& context, recompui::Element* card, const char* title) {
+    using namespace banjo::ui;
+
     auto section = context.create_element<recompui::Element>(card);
     section->set_display(recompui::Display::Flex);
     section->set_flex_direction(recompui::FlexDirection::Column);
     section->set_align_items(recompui::AlignItems::FlexStart);
-    section->set_gap(8.0f);
+    section->set_gap(dialog::section_gap);
     section->set_width(100.0f, recompui::Unit::Percent);
-    section->set_margin_top(12.0f);
+    section->set_margin_top(dialog::section_top_margin);
 
     context.create_element<recompui::Label>(section, title, recompui::theme::Typography::LabelMD);
     return section;
@@ -1201,7 +1208,7 @@ static void ensure_host_panel() {
     title_row->set_display(recompui::Display::Flex);
     title_row->set_justify_content(recompui::JustifyContent::Center);
     title_row->set_width(100.0f, recompui::Unit::Percent);
-    title_row->set_margin_bottom(8.0f);
+    title_row->set_margin_bottom(banjo::ui::space::sm);
     context.create_element<recompui::Label>(title_row, "Host Game", recompui::theme::Typography::Header2);
 
     // --- Player Name ---
@@ -1215,7 +1222,7 @@ static void ensure_host_panel() {
     auto mode_row = context.create_element<recompui::Element>(mode_section);
     mode_row->set_display(recompui::Display::Flex);
     mode_row->set_flex_direction(recompui::FlexDirection::Row);
-    mode_row->set_gap(8.0f);
+    mode_row->set_gap(banjo::ui::space::sm);
     mode_row->set_width(100.0f, recompui::Unit::Percent);
     mode_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
@@ -1240,7 +1247,7 @@ static void ensure_host_panel() {
     ip_row->set_display(recompui::Display::Flex);
     ip_row->set_flex_direction(recompui::FlexDirection::Row);
     ip_row->set_align_items(recompui::AlignItems::Center);
-    ip_row->set_gap(12.0f);
+    ip_row->set_gap(banjo::ui::space::md);
     ip_row->set_width(100.0f, recompui::Unit::Percent);
     context.create_element<recompui::Label>(ip_row, local_ip, recompui::theme::Typography::LabelLG);
     auto copy_btn = context.create_element<recompui::Button>(
@@ -1272,7 +1279,7 @@ static void ensure_host_panel() {
         auto slot_row = context.create_element<recompui::Element>(slots_section);
         slot_row->set_display(recompui::Display::Flex);
         slot_row->set_flex_direction(recompui::FlexDirection::Row);
-        slot_row->set_gap(8.0f);
+        slot_row->set_gap(banjo::ui::space::sm);
         slot_row->set_width(100.0f, recompui::Unit::Percent);
         slot_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
@@ -1291,7 +1298,7 @@ static void ensure_host_panel() {
         erase_buttons[i] = context.create_element<recompui::Button>(
             slot_row, "Erase", recompui::ButtonStyle::Danger, recompui::ButtonSize::Large
         );
-        erase_buttons[i]->set_min_width(120.0f);
+        erase_buttons[i]->set_min_width(banjo::ui::button::secondary_min_width);
         erase_buttons[i]->set_overflow(recompui::Overflow::Visible);
         erase_buttons[i]->add_pressed_callback([i]() {
             recompui::open_choice_prompt(
@@ -1309,23 +1316,23 @@ static void ensure_host_panel() {
     auto buttons_row = context.create_element<recompui::Element>(card);
     buttons_row->set_display(recompui::Display::Flex);
     buttons_row->set_flex_direction(recompui::FlexDirection::Row);
-    buttons_row->set_gap(20.0f);
+    buttons_row->set_gap(banjo::ui::dialog::action_row_gap);
     buttons_row->set_justify_content(recompui::JustifyContent::Center);
     buttons_row->set_width(100.0f, recompui::Unit::Percent);
-    buttons_row->set_margin_top(16.0f);
+    buttons_row->set_margin_top(banjo::ui::dialog::action_row_top);
     buttons_row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
     auto back_btn = context.create_element<recompui::Button>(
         buttons_row, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    back_btn->set_min_width(160.0f);
+    back_btn->set_min_width(banjo::ui::button::cta_min_width);
     back_btn->set_overflow(recompui::Overflow::Visible);
     back_btn->add_pressed_callback([]() { hide_panel(host_panel); });
 
     auto start_btn = context.create_element<recompui::Button>(
         buttons_row, "Host", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
-    start_btn->set_min_width(160.0f);
+    start_btn->set_min_width(banjo::ui::button::cta_min_width);
     start_btn->set_overflow(recompui::Overflow::Visible);
     start_btn->add_pressed_callback([]() { start_host_game(); });
 
@@ -1513,14 +1520,14 @@ static void ensure_join_panel() {
     join_menu_view->set_display(recompui::Display::Flex);
     join_menu_view->set_flex_direction(recompui::FlexDirection::Column);
     join_menu_view->set_align_items(recompui::AlignItems::Center);
-    join_menu_view->set_gap(16.0f);
+    join_menu_view->set_gap(banjo::ui::space::lg);
     join_menu_view->set_width(100.0f, recompui::Unit::Percent);
 
     auto title_row = context.create_element<recompui::Element>(join_menu_view);
     title_row->set_display(recompui::Display::Flex);
     title_row->set_justify_content(recompui::JustifyContent::Center);
     title_row->set_width(100.0f, recompui::Unit::Percent);
-    title_row->set_margin_bottom(8.0f);
+    title_row->set_margin_bottom(banjo::ui::space::sm);
     context.create_element<recompui::Label>(title_row, "Join Game", recompui::theme::Typography::Header2);
 
     // --- Player Name ---
@@ -1556,7 +1563,7 @@ static void ensure_join_panel() {
     join_private_view->set_display(recompui::Display::Flex);
     join_private_view->set_flex_direction(recompui::FlexDirection::Column);
     join_private_view->set_align_items(recompui::AlignItems::FlexStart);
-    join_private_view->set_gap(12.0f);
+    join_private_view->set_gap(banjo::ui::space::md);
     join_private_view->set_width(100.0f, recompui::Unit::Percent);
     join_private_view->display_hide();
 
@@ -1564,7 +1571,7 @@ static void ensure_join_panel() {
     priv_title->set_display(recompui::Display::Flex);
     priv_title->set_justify_content(recompui::JustifyContent::Center);
     priv_title->set_width(100.0f, recompui::Unit::Percent);
-    priv_title->set_margin_bottom(8.0f);
+    priv_title->set_margin_bottom(banjo::ui::space::sm);
     context.create_element<recompui::Label>(priv_title, "Private Lobbies", recompui::theme::Typography::Header2);
 
     context.create_element<recompui::Label>(join_private_view, "Enter the private lobby's password:", recompui::theme::Typography::Body);
@@ -1575,23 +1582,23 @@ static void ensure_join_panel() {
     auto priv_btns = context.create_element<recompui::Element>(join_private_view);
     priv_btns->set_display(recompui::Display::Flex);
     priv_btns->set_flex_direction(recompui::FlexDirection::Row);
-    priv_btns->set_gap(20.0f);
+    priv_btns->set_gap(banjo::ui::dialog::action_row_gap);
     priv_btns->set_justify_content(recompui::JustifyContent::Center);
     priv_btns->set_width(100.0f, recompui::Unit::Percent);
-    priv_btns->set_margin_top(16.0f);
+    priv_btns->set_margin_top(banjo::ui::dialog::action_row_top);
     priv_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
     auto priv_back = context.create_element<recompui::Button>(
         priv_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    priv_back->set_min_width(160.0f);
+    priv_back->set_min_width(banjo::ui::button::cta_min_width);
     priv_back->set_overflow(recompui::Overflow::Visible);
     priv_back->add_pressed_callback([]() { join_show_menu(); });
 
     auto search_btn = context.create_element<recompui::Button>(
         priv_btns, "Search", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
-    search_btn->set_min_width(160.0f);
+    search_btn->set_min_width(banjo::ui::button::cta_min_width);
     search_btn->set_overflow(recompui::Overflow::Visible);
     search_btn->add_pressed_callback([]() { begin_private_search(); });
 
@@ -1600,7 +1607,7 @@ static void ensure_join_panel() {
     join_lobby_list_view->set_display(recompui::Display::Flex);
     join_lobby_list_view->set_flex_direction(recompui::FlexDirection::Column);
     join_lobby_list_view->set_align_items(recompui::AlignItems::FlexStart);
-    join_lobby_list_view->set_gap(12.0f);
+    join_lobby_list_view->set_gap(banjo::ui::space::md);
     join_lobby_list_view->set_width(100.0f, recompui::Unit::Percent);
     join_lobby_list_view->display_hide();
 
@@ -1608,7 +1615,7 @@ static void ensure_join_panel() {
     list_title->set_display(recompui::Display::Flex);
     list_title->set_justify_content(recompui::JustifyContent::Center);
     list_title->set_width(100.0f, recompui::Unit::Percent);
-    list_title->set_margin_bottom(8.0f);
+    list_title->set_margin_bottom(banjo::ui::space::sm);
     context.create_element<recompui::Label>(list_title, "Private Lobbies", recompui::theme::Typography::Header2);
 
     join_lobby_status_label = context.create_element<recompui::Label>(
@@ -1618,7 +1625,7 @@ static void ensure_join_panel() {
     join_lobby_container = context.create_element<recompui::Element>(join_lobby_list_view);
     join_lobby_container->set_display(recompui::Display::Flex);
     join_lobby_container->set_flex_direction(recompui::FlexDirection::Column);
-    join_lobby_container->set_gap(8.0f);
+    join_lobby_container->set_gap(banjo::ui::space::sm);
     join_lobby_container->set_width(100.0f, recompui::Unit::Percent);
     join_lobby_container->set_min_height(100.0f);
     join_lobby_container->set_max_height(400.0f);
@@ -1627,23 +1634,23 @@ static void ensure_join_panel() {
     auto list_btns = context.create_element<recompui::Element>(join_lobby_list_view);
     list_btns->set_display(recompui::Display::Flex);
     list_btns->set_flex_direction(recompui::FlexDirection::Row);
-    list_btns->set_gap(20.0f);
+    list_btns->set_gap(banjo::ui::dialog::action_row_gap);
     list_btns->set_justify_content(recompui::JustifyContent::Center);
     list_btns->set_width(100.0f, recompui::Unit::Percent);
-    list_btns->set_margin_top(16.0f);
+    list_btns->set_margin_top(banjo::ui::dialog::action_row_top);
     list_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
     auto list_back = context.create_element<recompui::Button>(
         list_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    list_back->set_min_width(140.0f);
+    list_back->set_min_width(banjo::ui::button::cta_min_width);
     list_back->set_overflow(recompui::Overflow::Visible);
     list_back->add_pressed_callback([]() { join_show_private(); });
 
     auto refresh_btn = context.create_element<recompui::Button>(
         list_btns, "Refresh", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
-    refresh_btn->set_min_width(140.0f);
+    refresh_btn->set_min_width(banjo::ui::button::cta_min_width);
     refresh_btn->set_overflow(recompui::Overflow::Visible);
     refresh_btn->add_pressed_callback([]() { begin_private_search(); });
 
@@ -1652,7 +1659,7 @@ static void ensure_join_panel() {
     join_direct_view->set_display(recompui::Display::Flex);
     join_direct_view->set_flex_direction(recompui::FlexDirection::Column);
     join_direct_view->set_align_items(recompui::AlignItems::FlexStart);
-    join_direct_view->set_gap(12.0f);
+    join_direct_view->set_gap(banjo::ui::space::md);
     join_direct_view->set_width(100.0f, recompui::Unit::Percent);
     join_direct_view->display_hide();
 
@@ -1660,7 +1667,7 @@ static void ensure_join_panel() {
     dir_title->set_display(recompui::Display::Flex);
     dir_title->set_justify_content(recompui::JustifyContent::Center);
     dir_title->set_width(100.0f, recompui::Unit::Percent);
-    dir_title->set_margin_bottom(8.0f);
+    dir_title->set_margin_bottom(banjo::ui::space::sm);
     context.create_element<recompui::Label>(dir_title, "Direct Connection", recompui::theme::Typography::Header2);
 
     context.create_element<recompui::Label>(join_direct_view, "Enter direct connection IP and port:", recompui::theme::Typography::Body);
@@ -1678,23 +1685,23 @@ static void ensure_join_panel() {
     auto dir_btns = context.create_element<recompui::Element>(join_direct_view);
     dir_btns->set_display(recompui::Display::Flex);
     dir_btns->set_flex_direction(recompui::FlexDirection::Row);
-    dir_btns->set_gap(20.0f);
+    dir_btns->set_gap(banjo::ui::dialog::action_row_gap);
     dir_btns->set_justify_content(recompui::JustifyContent::Center);
     dir_btns->set_width(100.0f, recompui::Unit::Percent);
-    dir_btns->set_margin_top(16.0f);
+    dir_btns->set_margin_top(banjo::ui::dialog::action_row_top);
     dir_btns->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
     auto dir_back = context.create_element<recompui::Button>(
         dir_btns, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    dir_back->set_min_width(160.0f);
+    dir_back->set_min_width(banjo::ui::button::cta_min_width);
     dir_back->set_overflow(recompui::Overflow::Visible);
     dir_back->add_pressed_callback([]() { join_show_menu(); });
 
     auto join_btn = context.create_element<recompui::Button>(
         dir_btns, "Join", recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
     );
-    join_btn->set_min_width(160.0f);
+    join_btn->set_min_width(banjo::ui::button::cta_min_width);
     join_btn->set_overflow(recompui::Overflow::Visible);
     join_btn->add_pressed_callback([]() {
         begin_join(ip_input->get_text(), join_port_input ? join_port_input->get_text() : "7777");
@@ -1706,7 +1713,7 @@ static void ensure_join_panel() {
     join_status_view->set_flex_direction(recompui::FlexDirection::Column);
     join_status_view->set_align_items(recompui::AlignItems::Center);
     join_status_view->set_justify_content(recompui::JustifyContent::Center);
-    join_status_view->set_gap(20.0f);
+    join_status_view->set_gap(banjo::ui::dialog::action_row_gap);
     join_status_view->set_width(100.0f, recompui::Unit::Percent);
     join_status_view->set_min_height(200.0f);
     join_status_view->display_hide();
@@ -1721,7 +1728,7 @@ static void ensure_join_panel() {
     join_cancel_btn = context.create_element<recompui::Button>(
         join_status_view, "Cancel", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    join_cancel_btn->set_min_width(160.0f);
+    join_cancel_btn->set_min_width(banjo::ui::button::cta_min_width);
     join_cancel_btn->set_overflow(recompui::Overflow::Visible);
     join_cancel_btn->add_pressed_callback([]() {
         join_state.store(static_cast<int>(JoinState::Idle));
@@ -1732,7 +1739,7 @@ static void ensure_join_panel() {
     join_retry_btn = context.create_element<recompui::Button>(
         join_status_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
-    join_retry_btn->set_min_width(160.0f);
+    join_retry_btn->set_min_width(banjo::ui::button::cta_min_width);
     join_retry_btn->set_overflow(recompui::Overflow::Visible);
     join_retry_btn->display_hide();
     join_retry_btn->add_pressed_callback([]() { join_show_menu(); });
@@ -1904,14 +1911,14 @@ static void populate_lobby_list_ui() {
         row->set_display(recompui::Display::Flex);
         row->set_flex_direction(recompui::FlexDirection::Row);
         row->set_align_items(recompui::AlignItems::Center);
-        row->set_gap(12.0f);
+        row->set_gap(banjo::ui::space::md);
         row->set_width(100.0f, recompui::Unit::Percent);
-        row->set_padding_top(8.0f);
-        row->set_padding_bottom(8.0f);
-        row->set_background_color(recompui::Color{30, 34, 50, 200});
-        row->set_border_radius(8.0f);
-        row->set_padding_left(16.0f);
-        row->set_padding_right(16.0f);
+        row->set_padding_top(banjo::ui::space::sm);
+        row->set_padding_bottom(banjo::ui::space::sm);
+        row->set_background_color(recompui::theme::color::Background2);
+        row->set_border_radius(recompui::theme::border::radius_md);
+        row->set_padding_left(banjo::ui::space::lg);
+        row->set_padding_right(banjo::ui::space::lg);
 
         std::string label = lobby.host_name;
         if (label.empty()) label = "Lobby";
@@ -1924,7 +1931,7 @@ static void populate_lobby_list_ui() {
         auto join_btn = context.create_element<recompui::Button>(
             row, "Join", recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
         );
-        join_btn->set_min_width(80.0f);
+        join_btn->set_min_width(banjo::ui::button::list_item_min_width);
         join_btn->set_overflow(recompui::Overflow::Visible);
         join_btn->add_pressed_callback([lid]() {
             begin_coopnet_join(lid);
