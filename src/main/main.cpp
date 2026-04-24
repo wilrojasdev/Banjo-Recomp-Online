@@ -917,7 +917,7 @@ static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(reco
     card->set_background_color(recompui::theme::color::Background3);
     card->set_border_radius(recompui::theme::border::radius_lg);
     card->set_border_width(1.0f);
-    card->set_border_color(recompui::theme::color::Border);
+    card->set_border_color(recompui::theme::color::ElevatedBorder);
 
     return {backdrop, card};
 }
@@ -1213,11 +1213,13 @@ static bool host_coopnet_mode = false; // false = Direct, true = CoopNet
 
 static void host_set_mode(bool coopnet) {
     host_coopnet_mode = coopnet;
-    if (host_mode_direct_btn) host_mode_direct_btn->set_opacity(coopnet ? 0.5f : 1.0f);
-    if (host_mode_coopnet_btn) host_mode_coopnet_btn->set_opacity(coopnet ? 1.0f : 0.5f);
-    if (host_port_section) { if (coopnet) host_port_section->display_hide(); else host_port_section->display_show(); }
+    if (host_mode_coopnet_btn) host_mode_coopnet_btn->apply_button_style(
+        coopnet ? recompui::ButtonStyle::Primary : recompui::ButtonStyle::Secondary);
+    if (host_mode_direct_btn)  host_mode_direct_btn->apply_button_style(
+        coopnet ? recompui::ButtonStyle::Secondary : recompui::ButtonStyle::Primary);
+    if (host_port_section)     { if (coopnet) host_port_section->display_hide();     else host_port_section->display_show(); }
     if (host_password_section) { if (coopnet) host_password_section->display_show(); else host_password_section->display_hide(); }
-    if (host_ip_section) { if (coopnet) host_ip_section->display_hide(); else host_ip_section->display_show(); }
+    if (host_ip_section)       { if (coopnet) host_ip_section->display_hide();       else host_ip_section->display_show(); }
 }
 
 static void start_host_game() {
@@ -1334,14 +1336,18 @@ static void ensure_host_panel() {
         auto slot_row = make_row(context, slots_section);
 
         slot_buttons[i] = context.create_element<recompui::Button>(
-            slot_row, make_slot_label(i), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+            slot_row,
+            make_slot_label(i),
+            i == 0 ? recompui::ButtonStyle::Primary : recompui::ButtonStyle::Secondary,
+            recompui::ButtonSize::Large
         );
         slot_buttons[i]->set_width(100.0f, recompui::Unit::Percent);
-        slot_buttons[i]->set_opacity(i == 0 ? 1.0f : 0.5f);
         slot_buttons[i]->add_pressed_callback([i]() {
             selected_save_slot = i;
             for (int j = 0; j < 3; j++) {
-                slot_buttons[j]->set_opacity(j == i ? 1.0f : 0.5f);
+                slot_buttons[j]->apply_button_style(
+                    j == i ? recompui::ButtonStyle::Primary : recompui::ButtonStyle::Secondary
+                );
             }
         });
 
