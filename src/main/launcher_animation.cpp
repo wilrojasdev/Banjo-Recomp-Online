@@ -181,15 +181,15 @@ void banjo::launcher_animation_setup(recompui::LauncherMenu *menu) {
     launcher_context.wrapper->set_height(100, recompui::Unit::Percent);
     launcher_context.wrapper->set_top(0);
 
-    // Disable and hide the options. Use the standard theme typography (Inter
-    // Variable + Header1 preset) so launcher options match the rest of the UI
-    // instead of the legacy Suplexmentary Comic NC look.
+    // Disable and hide the options.
     for (auto option : menu->get_game_options_menu()->get_options()) {
+        option->set_font_family("Suplexmentary Comic NC");
         option->set_enabled(false);
         option->set_opacity(0.0f);
         option->set_padding(24.0f);
         auto label = option->get_label();
-        label->set_typography(recompui::theme::Typography::Header1);
+        label->set_font_size(56.0f);
+        label->set_letter_spacing(4.0f);
     }
 
     // The creation order of these is important.
