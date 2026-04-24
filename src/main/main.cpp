@@ -964,15 +964,26 @@ static recompui::Element* make_column(recompui::ContextId& context, recompui::El
     return col;
 }
 
-// --- Helper: centered title row (Header2 label + margin-bottom) ---
+// --- Helper: centered title (Header2 label + short primary accent underline) ---
 static recompui::Element* make_title_row(recompui::ContextId& context, recompui::Element* parent, const char* title) {
-    auto title_row = context.create_element<recompui::Element>(parent);
-    title_row->set_display(recompui::Display::Flex);
-    title_row->set_justify_content(recompui::JustifyContent::Center);
-    title_row->set_width(100.0f, recompui::Unit::Percent);
-    title_row->set_margin_bottom(banjo::ui::space::sm);
-    context.create_element<recompui::Label>(title_row, title, recompui::theme::Typography::Header2);
-    return title_row;
+    auto wrap = context.create_element<recompui::Element>(parent);
+    wrap->set_display(recompui::Display::Flex);
+    wrap->set_flex_direction(recompui::FlexDirection::Column);
+    wrap->set_align_items(recompui::AlignItems::Center);
+    wrap->set_gap(banjo::ui::space::xs);
+    wrap->set_width(100.0f, recompui::Unit::Percent);
+    wrap->set_margin_bottom(banjo::ui::space::sm);
+
+    context.create_element<recompui::Label>(wrap, title, recompui::theme::Typography::Header2);
+
+    // Primary-colored accent bar under the title — anchors the heading.
+    auto accent = context.create_element<recompui::Element>(wrap);
+    accent->set_width(48.0f);
+    accent->set_height(3.0f);
+    accent->set_background_color(recompui::theme::color::Primary);
+    accent->set_border_radius(2.0f);
+
+    return wrap;
 }
 
 // --- Helper: action row with Back (secondary) + primary CTA ---
