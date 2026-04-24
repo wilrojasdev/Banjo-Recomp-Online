@@ -118,6 +118,8 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #include "recompui/config.h"
 #include "elements/ui_text_input.h"
 #include "elements/ui_select.h"
+#include "elements/ui_clickable.h"
+#include "elements/ui_icon_button.h"
 #include "util/file.h"
 #include "recompinput/input_events.h"
 #include "recompinput/recompinput.h"
@@ -785,9 +787,26 @@ static std::string load_last_join_ip() {
     return "127.0.0.1";
 }
 
-static void save_last_join_ip(const std::string& ip) {
+static std::string load_last_join_password() {
+    std::ifstream f(get_net_config_path());
+    std::string ip, pass;
+    if (!f.good()) return "";
+    std::getline(f, ip);
+    if (std::getline(f, pass)) return pass;
+    return "";
+}
+
+static void save_last_join_settings(const std::string& ip, const std::string& password) {
     std::ofstream f(get_net_config_path());
-    if (f.good()) f << ip;
+    if (f.good()) f << ip << "\n" << password;
+}
+
+static void save_last_join_ip(const std::string& ip) {
+    save_last_join_settings(ip, load_last_join_password());
+}
+
+static void save_last_join_password(const std::string& password) {
+    save_last_join_settings(load_last_join_ip(), password);
 }
 
 // --- Multiplayer submenu panels ---
@@ -883,12 +902,21 @@ static SlotInfo read_save_slot(int game_slot) {
     return info;
 }
 
+// Set by card's click listener and consumed by backdrop's listener — lets the
+// backdrop tell apart "click outside the card" (close) from "click bubbled up
+// from inside the card" (ignore). RmlUi events bubble target -> root, so the
+// card listener fires before the backdrop listener for any inside click.
+static bool dialog_click_consumed = false;
+
 // --- Helper: create a full-screen backdrop + centered dialog card ---
+// Backdrop is a Clickable so a click outside the card hides the panel.
 static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(recompui::ContextId& context) {
     using namespace banjo::ui;
 
     // Backdrop — parented to launcher root so it covers the entire viewport
-    auto backdrop = context.create_element<recompui::Element>(static_cast<recompui::Element*>(g_launcher_menu));
+    auto backdrop = context.create_element<recompui::Clickable>(
+        static_cast<recompui::Element*>(g_launcher_menu), false
+    );
     backdrop->set_display(recompui::Display::Flex);
     backdrop->set_flex_direction(recompui::FlexDirection::Column);
     backdrop->set_align_items(recompui::AlignItems::Center);
@@ -903,8 +931,18 @@ static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(reco
     backdrop->set_background_color(recompui::theme::color::ModalOverlay);
     backdrop->display_hide();
 
-    // Card — uses theme tokens so every dialog shares the same shape
-    auto card = context.create_element<recompui::Element>(backdrop);
+    auto backdrop_ptr = static_cast<recompui::Element*>(backdrop);
+    backdrop->add_clicked_callback([backdrop_ptr](float, float) {
+        if (dialog_click_consumed) {
+            dialog_click_consumed = false;
+            return;
+        }
+        backdrop_ptr->display_hide();
+    });
+
+    // Card — also Clickable so inside clicks set the consumed flag and the
+    // bubbled event doesn't trigger backdrop's "outside" close logic.
+    auto card = context.create_element<recompui::Clickable>(backdrop, false);
     card->set_display(recompui::Display::Flex);
     card->set_flex_direction(recompui::FlexDirection::Column);
     card->set_align_items(recompui::AlignItems::FlexStart);
@@ -919,8 +957,25 @@ static std::pair<recompui::Element*, recompui::Element*> create_dialog_pair(reco
     card->set_border_radius(recompui::theme::border::radius_lg);
     card->set_border_width(1.0f);
     card->set_border_color(recompui::theme::color::ElevatedBorder);
+    card->add_clicked_callback([](float, float) {
+        dialog_click_consumed = true;
+    });
 
     return {backdrop, card};
+}
+
+// --- Helper: add an X close button at the top-right of a card ---
+static recompui::IconButton* add_close_x(recompui::ContextId& context,
+                                          recompui::Element* card,
+                                          std::function<void()> on_close) {
+    auto x_btn = context.create_element<recompui::IconButton>(
+        card, "icons/X.svg", recompui::ButtonStyle::Basic, recompui::IconButtonSize::Small
+    );
+    x_btn->set_position(recompui::Position::Absolute);
+    x_btn->set_top(banjo::ui::space::md);
+    x_btn->set_right(banjo::ui::space::md);
+    x_btn->add_pressed_callback(on_close);
+    return x_btn;
 }
 
 // --- Helper: create a labeled section inside a card (label + content grouped) ---
@@ -995,7 +1050,8 @@ struct ActionButtons {
 };
 static ActionButtons make_action_row(recompui::ContextId& context, recompui::Element* parent,
                                       const char* primary_text,
-                                      const char* back_text = "Back") {
+                                      const char* back_text = nullptr,
+                                      bool include_back = true) {
     auto row = context.create_element<recompui::Element>(parent);
     row->set_display(recompui::Display::Flex);
     row->set_flex_direction(recompui::FlexDirection::Row);
@@ -1005,11 +1061,17 @@ static ActionButtons make_action_row(recompui::ContextId& context, recompui::Ele
     row->set_margin_top(banjo::ui::dialog::action_row_top);
     row->set_as_navigation_container(recompui::NavigationType::Horizontal);
 
-    auto back_btn = context.create_element<recompui::Button>(
-        row, back_text, recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
-    );
-    back_btn->set_min_width(banjo::ui::button::cta_min_width);
-    back_btn->set_overflow(recompui::Overflow::Visible);
+    recompui::Button* back_btn = nullptr;
+    if (include_back) {
+        std::string resolved_back = (back_text != nullptr)
+            ? std::string(back_text)
+            : banjo::locale::tr("common.back");
+        back_btn = context.create_element<recompui::Button>(
+            row, resolved_back, recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        );
+        back_btn->set_min_width(banjo::ui::button::cta_min_width);
+        back_btn->set_overflow(recompui::Overflow::Visible);
+    }
 
     auto primary_btn = context.create_element<recompui::Button>(
         row, primary_text, recompui::ButtonStyle::Primary, recompui::ButtonSize::Large
@@ -1287,6 +1349,8 @@ static void ensure_host_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     host_panel = backdrop;
 
+    add_close_x(context, card, []() { hide_panel(host_panel); });
+
     make_title_row(context, card, banjo::locale::tr("host.title").c_str());
 
     // --- Player Name ---
@@ -1342,7 +1406,7 @@ static void ensure_host_panel() {
 
     // --- Save slot section ---
     auto slots_section = create_section(context, card, banjo::locale::tr("host.save_slot").c_str());
-    static recompui::Button* erase_buttons[3] = {};
+    static recompui::IconButton* erase_buttons[3] = {};
 
     for (int i = 0; i < 3; i++) {
         auto slot_row = make_row(context, slots_section);
@@ -1363,11 +1427,9 @@ static void ensure_host_panel() {
             }
         });
 
-        erase_buttons[i] = context.create_element<recompui::Button>(
-            slot_row, banjo::locale::tr("common.erase"), recompui::ButtonStyle::Danger, recompui::ButtonSize::Large
+        erase_buttons[i] = context.create_element<recompui::IconButton>(
+            slot_row, "icons/Trash.svg", recompui::ButtonStyle::Danger, recompui::IconButtonSize::Large
         );
-        erase_buttons[i]->set_min_width(banjo::ui::button::secondary_min_width);
-        erase_buttons[i]->set_overflow(recompui::Overflow::Visible);
         erase_buttons[i]->add_pressed_callback([i]() {
             recompui::open_choice_prompt(
                 banjo::locale::tr("host.erase_slot_title") + " " + std::to_string(i + 1),
@@ -1380,9 +1442,10 @@ static void ensure_host_panel() {
         });
     }
 
-    // --- Action buttons ---
-    auto host_actions = make_action_row(context, card, banjo::locale::tr("menu.host").c_str());
-    host_actions.back->add_pressed_callback([]() { hide_panel(host_panel); });
+    // --- Action button (Host) — close X in top-right replaces the Back button ---
+    auto host_actions = make_action_row(
+        context, card, banjo::locale::tr("menu.host").c_str(), nullptr, /*include_back=*/false
+    );
     host_actions.primary->add_pressed_callback([]() { start_host_game(); });
 
     // Default: CoopNet mode
@@ -1497,6 +1560,7 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
 static void begin_private_search() {
     apply_join_player_name();
     std::string pass = join_password_input ? join_password_input->get_text() : "";
+    save_last_join_password(pass);
 
     auto& net = bknet::NetworkManager::instance();
     bknet::set_coopnet_server(COOPNET_SERVER);
@@ -1564,59 +1628,56 @@ static void ensure_join_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     join_panel = backdrop;
 
+    add_close_x(context, card, []() { hide_panel(join_panel); });
+
     // ========== MENU VIEW (main join screen) ==========
     join_menu_view = make_column(context, card, banjo::ui::space::lg, recompui::AlignItems::Center);
-    make_title_row(context, join_menu_view, "Join Game");
+    make_title_row(context, join_menu_view, banjo::locale::tr("join.title").c_str());
 
     // --- Player Name ---
-    auto join_name_section = create_section(context, join_menu_view, "Player Name");
+    auto join_name_section = create_section(context, join_menu_view, banjo::locale::tr("host.player_name").c_str());
     join_name_section->set_align_items(recompui::AlignItems::FlexStart);
     join_name_input = context.create_element<recompui::TextInput>(join_name_section);
     join_name_input->set_text(bknet::get_config().player_name);
     join_name_input->set_width(100.0f, recompui::Unit::Percent);
 
     auto private_btn = context.create_element<recompui::Button>(
-        join_menu_view, "Private Lobbies", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        join_menu_view, banjo::locale::tr("join.private_lobbies"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     private_btn->set_width(100.0f, recompui::Unit::Percent);
     private_btn->set_overflow(recompui::Overflow::Visible);
     private_btn->add_pressed_callback([]() { join_show_private(); });
 
     auto direct_btn = context.create_element<recompui::Button>(
-        join_menu_view, "Direct Connection", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        join_menu_view, banjo::locale::tr("join.direct_connection"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     direct_btn->set_width(100.0f, recompui::Unit::Percent);
     direct_btn->set_overflow(recompui::Overflow::Visible);
     direct_btn->add_pressed_callback([]() { join_show_direct(); });
 
-    auto menu_back = context.create_element<recompui::Button>(
-        join_menu_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
-    );
-    menu_back->set_width(100.0f, recompui::Unit::Percent);
-    menu_back->set_overflow(recompui::Overflow::Visible);
-    menu_back->add_pressed_callback([]() { hide_panel(join_panel); });
+    // Back button removed — close X in top-right replaces it on the main view.
 
     // ========== PRIVATE LOBBIES VIEW (password search) ==========
     join_private_view = make_column(context, card, banjo::ui::space::md);
     join_private_view->display_hide();
-    make_title_row(context, join_private_view, "Private Lobbies");
+    make_title_row(context, join_private_view, banjo::locale::tr("join.private_lobbies").c_str());
 
-    context.create_element<recompui::Label>(join_private_view, "Enter the private lobby's password:", recompui::theme::Typography::Body);
+    context.create_element<recompui::Label>(join_private_view, banjo::locale::tr("join.password_prompt"), recompui::theme::Typography::Body);
     join_password_input = context.create_element<recompui::TextInput>(join_private_view);
-    join_password_input->set_text("");
+    join_password_input->set_text(load_last_join_password());
     join_password_input->set_width(100.0f, recompui::Unit::Percent);
 
-    auto priv_actions = make_action_row(context, join_private_view, "Search");
+    auto priv_actions = make_action_row(context, join_private_view, banjo::locale::tr("join.search").c_str());
     priv_actions.back->add_pressed_callback([]() { join_show_menu(); });
     priv_actions.primary->add_pressed_callback([]() { begin_private_search(); });
 
     // ========== LOBBY LIST VIEW ==========
     join_lobby_list_view = make_column(context, card, banjo::ui::space::md);
     join_lobby_list_view->display_hide();
-    make_title_row(context, join_lobby_list_view, "Private Lobbies");
+    make_title_row(context, join_lobby_list_view, banjo::locale::tr("join.private_lobbies").c_str());
 
     join_lobby_status_label = context.create_element<recompui::Label>(
-        join_lobby_list_view, "Searching...", recompui::theme::Typography::Body
+        join_lobby_list_view, banjo::locale::tr("join.searching"), recompui::theme::Typography::Body
     );
 
     join_lobby_container = context.create_element<recompui::Element>(join_lobby_list_view);
@@ -1628,28 +1689,28 @@ static void ensure_join_panel() {
     join_lobby_container->set_max_height(400.0f);
     join_lobby_container->set_overflow_y(recompui::Overflow::Scroll);
 
-    auto list_actions = make_action_row(context, join_lobby_list_view, "Refresh");
+    auto list_actions = make_action_row(context, join_lobby_list_view, banjo::locale::tr("common.refresh").c_str());
     list_actions.back->add_pressed_callback([]() { join_show_private(); });
     list_actions.primary->add_pressed_callback([]() { begin_private_search(); });
 
     // ========== DIRECT CONNECTION VIEW ==========
     join_direct_view = make_column(context, card, banjo::ui::space::md);
     join_direct_view->display_hide();
-    make_title_row(context, join_direct_view, "Direct Connection");
+    make_title_row(context, join_direct_view, banjo::locale::tr("join.direct_connection").c_str());
 
-    context.create_element<recompui::Label>(join_direct_view, "Enter direct connection IP and port:", recompui::theme::Typography::Body);
+    context.create_element<recompui::Label>(join_direct_view, banjo::locale::tr("join.direct_prompt"), recompui::theme::Typography::Body);
 
-    auto ip_section = create_section(context, join_direct_view, "Host IP Address");
+    auto ip_section = create_section(context, join_direct_view, banjo::locale::tr("join.host_ip_address").c_str());
     ip_input = context.create_element<recompui::TextInput>(ip_section);
     ip_input->set_text(load_last_join_ip());
     ip_input->set_width(100.0f, recompui::Unit::Percent);
 
-    auto port_section = create_section(context, join_direct_view, "Port");
+    auto port_section = create_section(context, join_direct_view, banjo::locale::tr("host.port").c_str());
     join_port_input = context.create_element<recompui::TextInput>(port_section);
     join_port_input->set_text("7777");
     join_port_input->set_width(100.0f, recompui::Unit::Percent);
 
-    auto dir_actions = make_action_row(context, join_direct_view, "Join");
+    auto dir_actions = make_action_row(context, join_direct_view, banjo::locale::tr("join.join_btn").c_str());
     dir_actions.back->add_pressed_callback([]() { join_show_menu(); });
     dir_actions.primary->add_pressed_callback([]() {
         begin_join(ip_input->get_text(), join_port_input ? join_port_input->get_text() : "7777");
@@ -1667,14 +1728,14 @@ static void ensure_join_panel() {
     join_status_view->display_hide();
 
     join_status_label = context.create_element<recompui::Label>(
-        join_status_view, "Connecting...", recompui::theme::Typography::Header3
+        join_status_view, banjo::locale::tr("join.connecting"), recompui::theme::Typography::Header3
     );
     join_timer_label = context.create_element<recompui::Label>(
         join_status_view, "0s", recompui::theme::Typography::Body
     );
 
     join_cancel_btn = context.create_element<recompui::Button>(
-        join_status_view, "Cancel", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        join_status_view, banjo::locale::tr("common.cancel"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     join_cancel_btn->set_min_width(banjo::ui::button::cta_min_width);
     join_cancel_btn->set_overflow(recompui::Overflow::Visible);
@@ -1685,7 +1746,7 @@ static void ensure_join_panel() {
     });
 
     join_retry_btn = context.create_element<recompui::Button>(
-        join_status_view, "Back", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        join_status_view, banjo::locale::tr("common.back"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     join_retry_btn->set_min_width(banjo::ui::button::cta_min_width);
     join_retry_btn->set_overflow(recompui::Overflow::Visible);
@@ -1877,7 +1938,7 @@ static void populate_lobby_list_ui() {
 
         uint64_t lid = lobby.lobby_id;
         auto join_btn = context.create_element<recompui::Button>(
-            row, "Join", recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
+            row, banjo::locale::tr("join.join_btn"), recompui::ButtonStyle::Primary, recompui::ButtonSize::Medium
         );
         join_btn->set_min_width(banjo::ui::button::list_item_min_width);
         join_btn->set_overflow(recompui::Overflow::Visible);
@@ -2151,6 +2212,17 @@ int main(int argc, char** argv) {
         update_join_state();
         update_coopnet_state();
         refresh_coopnet_indicator();
+        static bool language_restart_prompt_shown = false;
+        if (banjo::locale::refresh() && !language_restart_prompt_shown) {
+            language_restart_prompt_shown = true;
+            recompui::open_info_prompt(
+                banjo::locale::tr("settings.language_restart_title"),
+                banjo::locale::tr("settings.language_restart_body"),
+                banjo::locale::tr("settings.language_restart_btn"),
+                []() { return_to_launcher(); },
+                recompui::ButtonStyle::Primary
+            );
+        }
         banjo::launcher_animation_update(menu);
     });
 
