@@ -45,6 +45,7 @@ extern char **environ;
 #include "../net/net_chat_ui.h"
 #include "../net/net_playerlist_ui.h"
 #include "../net/net_nametag_ui.h"
+#include "../locale/locale.h"
 
 // Network recomp API functions (defined in net_recomp_api.cpp)
 #include "recomp.h"
@@ -1286,40 +1287,40 @@ static void ensure_host_panel() {
     auto [backdrop, card] = create_dialog_pair(context);
     host_panel = backdrop;
 
-    make_title_row(context, card, "Host Game");
+    make_title_row(context, card, banjo::locale::tr("host.title").c_str());
 
     // --- Player Name ---
-    auto host_name_section = create_section(context, card, "Player Name");
+    auto host_name_section = create_section(context, card, banjo::locale::tr("host.player_name").c_str());
     host_name_input = context.create_element<recompui::TextInput>(host_name_section);
     host_name_input->set_text(bknet::get_config().player_name);
     host_name_input->set_width(100.0f, recompui::Unit::Percent);
 
     // --- Network System selector ---
-    auto mode_section = create_section(context, card, "Network System");
+    auto mode_section = create_section(context, card, banjo::locale::tr("host.network_system").c_str());
     auto mode_row = make_row(context, mode_section);
 
     host_mode_coopnet_btn = context.create_element<recompui::Button>(
-        mode_row, "CoopNet", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        mode_row, banjo::locale::tr("host.coopnet"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     host_mode_coopnet_btn->set_flex_grow(1.0f);
     host_mode_coopnet_btn->set_overflow(recompui::Overflow::Visible);
     host_mode_coopnet_btn->add_pressed_callback([]() { host_set_mode(true); });
 
     host_mode_direct_btn = context.create_element<recompui::Button>(
-        mode_row, "Direct Connection", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
+        mode_row, banjo::locale::tr("host.direct_connection"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Large
     );
     host_mode_direct_btn->set_flex_grow(1.0f);
     host_mode_direct_btn->set_overflow(recompui::Overflow::Visible);
     host_mode_direct_btn->add_pressed_callback([]() { host_set_mode(false); });
 
     // --- IP Address section (Direct only) ---
-    host_ip_section = create_section(context, card, "Your IP Address");
+    host_ip_section = create_section(context, card, banjo::locale::tr("host.your_ip_address").c_str());
     std::string local_ip = get_local_ip();
     auto ip_row = make_row(context, host_ip_section, banjo::ui::space::md, /*nav=*/false);
     ip_row->set_align_items(recompui::AlignItems::Center);
     context.create_element<recompui::Label>(ip_row, local_ip, recompui::theme::Typography::LabelLG);
     auto copy_btn = context.create_element<recompui::Button>(
-        ip_row, "Copy", recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
+        ip_row, banjo::locale::tr("common.copy"), recompui::ButtonStyle::Secondary, recompui::ButtonSize::Medium
     );
     copy_btn->set_overflow(recompui::Overflow::Visible);
     copy_btn->add_pressed_callback([local_ip]() {
@@ -1327,20 +1328,20 @@ static void ensure_host_panel() {
     });
 
     // --- Port section (Direct only) ---
-    host_port_section = create_section(context, card, "Port");
+    host_port_section = create_section(context, card, banjo::locale::tr("host.port").c_str());
     host_port_input = context.create_element<recompui::TextInput>(host_port_section);
     host_port_input->set_text("7777");
     host_port_input->set_width(100.0f, recompui::Unit::Percent);
 
     // --- Password section (CoopNet only, hidden by default) ---
-    host_password_section = create_section(context, card, "Password");
+    host_password_section = create_section(context, card, banjo::locale::tr("host.password").c_str());
     host_password_input = context.create_element<recompui::TextInput>(host_password_section);
     host_password_input->set_text("");
     host_password_input->set_width(100.0f, recompui::Unit::Percent);
     host_password_section->display_hide();
 
     // --- Save slot section ---
-    auto slots_section = create_section(context, card, "Save Slot");
+    auto slots_section = create_section(context, card, banjo::locale::tr("host.save_slot").c_str());
     static recompui::Button* erase_buttons[3] = {};
 
     for (int i = 0; i < 3; i++) {
@@ -1363,15 +1364,15 @@ static void ensure_host_panel() {
         });
 
         erase_buttons[i] = context.create_element<recompui::Button>(
-            slot_row, "Erase", recompui::ButtonStyle::Danger, recompui::ButtonSize::Large
+            slot_row, banjo::locale::tr("common.erase"), recompui::ButtonStyle::Danger, recompui::ButtonSize::Large
         );
         erase_buttons[i]->set_min_width(banjo::ui::button::secondary_min_width);
         erase_buttons[i]->set_overflow(recompui::Overflow::Visible);
         erase_buttons[i]->add_pressed_callback([i]() {
             recompui::open_choice_prompt(
-                "Erase Save " + std::to_string(i + 1),
-                "All progress in this slot will be permanently deleted.",
-                "Erase", "Cancel",
+                banjo::locale::tr("host.erase_slot_title") + " " + std::to_string(i + 1),
+                banjo::locale::tr("host.erase_slot_body"),
+                banjo::locale::tr("common.erase"), banjo::locale::tr("common.cancel"),
                 [i]() { erase_save_slot(i); host_slots_dirty = true; },
                 []() {},
                 recompui::ButtonStyle::Danger, recompui::ButtonStyle::Secondary, true
@@ -1380,7 +1381,7 @@ static void ensure_host_panel() {
     }
 
     // --- Action buttons ---
-    auto host_actions = make_action_row(context, card, "Host");
+    auto host_actions = make_action_row(context, card, banjo::locale::tr("menu.host").c_str());
     host_actions.back->add_pressed_callback([]() { hide_panel(host_panel); });
     host_actions.primary->add_pressed_callback([]() { start_host_game(); });
 
@@ -1905,7 +1906,10 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
     g_launcher_menu = menu;
 
     // Online menu: Host, Join, Settings, Exit
-    game_options_menu->add_start_game_or_load_rom_option("Load ROM", "Host");
+    game_options_menu->add_start_game_or_load_rom_option(
+        banjo::locale::tr("menu.load_rom"),
+        banjo::locale::tr("menu.host")
+    );
     if (auto* host_opt = game_options_menu->get_start_game_option()) {
         host_opt->set_callback([]() {
             ensure_host_panel();
@@ -1913,12 +1917,12 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
         });
     }
 
-    game_options_menu->add_option("Join", []() {
+    game_options_menu->add_option(banjo::locale::tr("menu.join"), []() {
         ensure_join_panel();
         show_panel(join_panel);
     });
-    game_options_menu->add_settings_option();
-    game_options_menu->add_exit_option();
+    game_options_menu->add_settings_option(banjo::locale::tr("menu.settings"));
+    game_options_menu->add_exit_option(banjo::locale::tr("menu.exit"));
     game_options_menu->set_width(30, recompui::Unit::Percent);
 
     for (auto option : game_options_menu->get_options()) {
@@ -2055,9 +2059,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to load controller mappings: %s\n", SDL_GetError());
     }
 
-    // Register fonts.
-    recompui::register_primary_font("InterVariable.ttf", "Inter Variable");
-    recompui::register_extra_font("Suplexmentary Comic NC.ttf");
+    // Register fonts. Suplexmentary Comic NC is the primary font so every
+    // typography preset (Header*, Label*, Body) inherits the launcher's
+    // playful display style. Inter Variable stays available as a fallback.
+    recompui::register_primary_font("Suplexmentary Comic NC.ttf", "Suplexmentary Comic NC");
+    recompui::register_extra_font("InterVariable.ttf");
 
     // Register configuration path.
     recomp::register_config_path(recompui::file::get_app_folder_path());
@@ -2122,6 +2128,7 @@ int main(int argc, char** argv) {
     bknet::NetworkManager::instance().initialize();
 
     banjo::init_config();
+    banjo::locale::init();
 
     // Network mode is now set from the launcher UI (Host/Join buttons).
     // The mode is configured when the user clicks Host or Join, and the

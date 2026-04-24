@@ -181,9 +181,9 @@ void banjo::launcher_animation_setup(recompui::LauncherMenu *menu) {
     launcher_context.wrapper->set_height(100, recompui::Unit::Percent);
     launcher_context.wrapper->set_top(0);
 
-    // Disable and hide the options.
+    // Disable and hide the options. Font family is inherited from the
+    // primary font (Suplexmentary Comic NC) — no need to set it explicitly.
     for (auto option : menu->get_game_options_menu()->get_options()) {
-        option->set_font_family("Suplexmentary Comic NC");
         option->set_enabled(false);
         option->set_opacity(0.0f);
         option->set_padding(24.0f);
