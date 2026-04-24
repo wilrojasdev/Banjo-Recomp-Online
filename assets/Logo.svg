@@ -2,7 +2,7 @@
 <svg
    width="6840"
    height="4100"
-   viewBox="0 -400 6840 4100"
+   viewBox="0 0 6840 4100"
    version="1.1"
    xml:space="preserve"
    style="clip-rule:evenodd;fill-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2"
@@ -38,7 +38,7 @@
    inkscape:current-layer="Online" />
     <g
    id="Logo_Straight_Flat"
-   transform="matrix(10,0,0,10,-3663.81,-2085)">
+   transform="matrix(10,0,0,10,-3663.81,-1685)">
         <g
    id="Recompiled"
    transform="matrix(0.360118,0,0,0.360118,423.391,291.626)">
