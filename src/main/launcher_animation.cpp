@@ -204,7 +204,7 @@ void banjo::launcher_animation_setup(recompui::LauncherMenu *menu) {
     launcher_context.cloud_svgs[2] = create_animated_svg(context, background_container, "Cloud3.svg", 295.0f, 167.0f);
     launcher_context.cloud_svgs[3] = create_animated_svg(context, background_container, "Cloud1.svg", 461.0f, 154.0f);
 
-    launcher_context.logo_svg = create_animated_svg(context, background_container, "Logo.svg", 6187.0f * 0.125f, 2625.0f * 0.125f);
+    launcher_context.logo_svg = create_animated_svg(context, background_container, "Logo.svg", 6840.0f * 0.11f, 4100.0f * 0.11f);
 
     // Animate the jiggy hole.
     launcher_context.jiggy_hole_svg.position_keyframes = {

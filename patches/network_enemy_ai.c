@@ -7,42 +7,28 @@
 // "player" is nearby. Remote players see animations play but no
 // movement, because the owner broadcasts static positions.
 //
-// Status: PARTIAL fix. Aggro detection works across all players.
-// Chase targeting still locks onto the local Banjo (see TODO below).
+// Status: full remote-aware aggro + chase. Verify in-game.
 //
 //   1. core1_ce60_isPlayerInRange(x, z, distance)  — ACTIVE
 //      Returns TRUE if ANY player (local or remote in the same map) is
-//      within `distance` of (x, z). Replaces the original check that
-//      only looked at the local player. Safe because this helper is
-//      only used by enemy / zone-trigger code.
+//      within `distance` of (x, z).
 //
 //   2. core1_ce60_getPlayerDistance(x, z)  — ACTIVE
-//      Returns the XZ distance from (x, z) to the CLOSEST player
-//      (local + remote). Same safety argument as above.
+//      Returns the XZ distance from (x, z) to the CLOSEST player.
 //
-//   3. player_getPosition(dst[3])  — ACTIVE but currently a no-op
-//      This one is also used by camera, HUD, bottles, etc. — so we
-//      can't redirect it globally or the camera would chase remote
-//      players. We gate the redirect with g_current_ai_actor, set by
-//      the patched actor-update dispatcher around each update call.
-//      The dispatcher patch (#4) is DISABLED right now, so the flag is
-//      never set and this falls through to vanilla every time.
+//   3. player_getPosition(dst[3])  — ACTIVE
+//      Redirects to the closest player ONLY while an enemy actor's
+//      update function is running (gated by g_current_ai_actor).
+//      Camera, HUD, dialog and other consumers keep seeing the local
+//      player because the flag is clear outside the dispatcher.
 //
-//   4. func_803268B4 (actor-update dispatcher)  — DISABLED (#if 0)
-//      Copy of the vanilla body with g_current_ai_actor set/clear
-//      around actorUpdateFunc / actorUpdate2Func calls. Enabling it
-//      caused a boot-time black screen on the join even though the
-//      only logical additions were two assignments. Root cause not
-//      identified yet — possible Actor struct field mismatch or an
-//      extern type discrepancy breaks one of the vanilla helpers.
-//
-// TODO [ENEMY-AI-CHASE]: Re-enable the dispatcher patch so enemies
-// chase the closest player, not just aggro on them. Options to explore:
-//   - Narrow the dispatcher patch to only set the flag for killable
-//     enemies (skip props, NPCs, bundles) to rule out interference.
-//   - Instead of patching the dispatcher, patch actor_update_func_80326224
-//     or a more-specific mid-level helper that only enemy AIs hit.
-//   - Full per-object ownership migration (bigger architectural change).
+//   4. func_803268B4 (actor-update dispatcher)  — ACTIVE (narrow)
+//      Mirrors the vanilla body and sets g_current_ai_actor only when
+//      the actor has a dieFunc (i.e. is a killable enemy). Props,
+//      NPCs, pads and bundles pass through with the flag unchanged.
+//      Extern types match the vanilla decomp exactly to avoid any
+//      silent ABI mismatch that might have caused the earlier
+//      boot-time black screen.
 
 #include "patches.h"
 #include "functions.h"
@@ -78,9 +64,16 @@ extern enum map_e map_get(void);
 // ---- Dispatcher externs (for the func_803268B4 patch) ----
 // Most helpers and globals are already declared in functions.h / variables.h
 // via patches.h. Only a few missing pieces need manual externs.
+//
+// NOTE: types here must match the vanilla decomp exactly. A prior attempt
+// declared D_8036E570 as s32 (vanilla: void *), dustEmitter_isActive as
+// void (vanilla: bool), and func_802F2D8C as taking s32 (vanilla: Struct64s *).
+// Those mismatches happen to be ABI-compatible on MIPS register calls, but
+// are retained correctly now to rule them out as a cause of the earlier
+// boot-time black screen.
 extern ActorArray *suBaddieActorArray;
 extern s32 D_8036E56C;
-extern s32 D_8036E570;
+extern void *D_8036E570;
 extern bool func_803296D8(Actor *this, s32 arg);
 extern BKVertexList *func_80330C74(Actor *actor);
 extern void func_8033F7A4(ActorMarker *marker, BKVertexList *list);
@@ -89,8 +82,8 @@ extern void func_8032F6A4(s32 position[3], ActorMarker *marker, s32 rotation[3])
 extern void func_80326324(Actor *this);
 extern void func_802D7124(Actor *actor, f32 scale);
 extern void bundle_update(Actor *actor);
-extern void dustEmitter_isActive(s32 emitter);
-extern void func_802F2D8C(s32 arg);
+extern bool dustEmitter_isActive(s32 emitter);
+extern void func_802F2D8C(Struct64s *arg);
 
 // === Actor-update context ===
 // Set by the patched func_803268B4 before each actorUpdateFunc call,
@@ -186,16 +179,17 @@ RECOMP_PATCH void player_getPosition(f32 dst[3]) {
 //
 // Vanilla func_803268B4 iterates suBaddieActorArray and calls each
 // actor's actorUpdateFunc / actorUpdate2Func. We mirror the original
-// body byte-for-byte and only add the g_current_ai_actor set/clear
-// around the two update calls. Everything else is unchanged.
+// body and add g_current_ai_actor set/clear around the two update calls,
+// but ONLY for killable enemies (marker->dieFunc != NULL). Props, NPCs,
+// pads, platforms and collectibles pass through untouched, so their
+// player_getPosition consumers (dialog framing, camera hints, etc.)
+// continue to see the local player. This narrow-scope approach was the
+// first recommended next step in todo_enemy_ai_chase.md.
 //
-// *** TEMPORARILY DISABLED *** — the join was getting a black screen
-// with this patch active. Without the dispatcher hook, g_current_ai_actor
-// stays NULL, so the player_getPosition patch falls through to vanilla
-// (enemies still chase local Banjo, but at least aggro works remotely
-// via the core1_ce60_* patches above). Re-enable once the interaction
-// causing the hang is identified.
-#if 0
+// Extern types match vanilla decomp exactly (D_8036E570 as void *,
+// dustEmitter_isActive as bool, func_802F2D8C as Struct64s *) to rule
+// out any silent ABI divergence that might have caused the earlier
+// boot-time black screen.
 RECOMP_PATCH void func_803268B4(void) {
     s32 temp_v1;
     Actor *actor;
@@ -207,6 +201,13 @@ RECOMP_PATCH void func_803268B4(void) {
     BKVertexList *temp_v0_3;
     bool sp54;
     s32 temp_s1;
+    bool is_enemy;
+
+    static bool traced = FALSE;
+    if (!traced) {
+        traced = TRUE;
+        recomp_printf("[enemy_ai] dispatcher patch active\n");
+    }
 
     if (suBaddieActorArray != NULL) {
         sp54 = volatileFlag_get(VOLATILE_FLAG_65_CHEAT_ENTERED);
@@ -223,18 +224,19 @@ RECOMP_PATCH void func_803268B4(void) {
                     }
                 }
                 if (!actor->despawn_flag) {
+                    is_enemy = (marker->dieFunc != NULL);
                     if (marker->unk2C_2) {
-                        g_current_ai_actor = actor;
+                        if (is_enemy) g_current_ai_actor = actor;
                         marker->actorUpdate2Func(actor);
-                        g_current_ai_actor = NULL;
+                        if (is_enemy) g_current_ai_actor = NULL;
                         if (anim_ctrl != NULL) {
                             actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
                         }
                     } else if (!temp_s1 || (temp_s1 && func_803296D8(actor, temp_s1))) {
                         if (marker->actorUpdateFunc != NULL) {
-                            g_current_ai_actor = actor;
+                            if (is_enemy) g_current_ai_actor = actor;
                             marker->actorUpdateFunc(actor);
-                            g_current_ai_actor = NULL;
+                            if (is_enemy) g_current_ai_actor = NULL;
                             if (anim_ctrl != NULL) {
                                 actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
                             }
@@ -283,8 +285,7 @@ RECOMP_PATCH void func_803268B4(void) {
     if (D_8036E56C != 0) {
         dustEmitter_isActive(D_8036E56C);
     }
-    if (D_8036E570 != 0) {
+    if (D_8036E570 != NULL) {
         func_802F2D8C(D_8036E570);
     }
 }
-#endif

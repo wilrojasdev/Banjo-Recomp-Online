@@ -2,8 +2,8 @@
 <component type="desktop-application">
   <id>io.github.banjorecomp.banjorecomp</id>
   
-  <name>Banjo: Recompiled</name>
-  <summary>Static recompilation of Banjo-Kazooie for PC.</summary>
+  <name>Banjo: Recompiled Online</name>
+  <summary>Online multiplayer fork of Banjo: Recompiled.</summary>
   
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0+</project_license>
@@ -17,7 +17,7 @@
   
   <description>
     <p>
-      Banjo: Recompiled is a project that uses N64: Recompiled to statically recompile Banjo-Kazoie into a native port with many new features and enhancements. This project uses RT64 as the rendering engine to provide some of these enhancements.
+      Banjo: Recompiled Online is an online multiplayer fork of Banjo: Recompiled, which uses N64: Recompiled to statically recompile Banjo-Kazooie into a native port with many new features and enhancements. This project uses RT64 as the rendering engine to provide some of these enhancements.
 
       The original game is required to run this project.
 

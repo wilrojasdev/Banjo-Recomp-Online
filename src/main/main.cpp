@@ -27,6 +27,10 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <cerrno>
 extern char **environ;
 #endif
 #include <stdexcept>
@@ -145,7 +149,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 
 #include "../../lib/rt64/src/contrib/stb/stb_image.h"
 
-const std::string version_string = "1.0.1";
+const std::string version_string = "0.16.0";
 
 template<typename... Ts>
 void exit_error(const char* str, Ts ...args) {
@@ -247,7 +251,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     flags |= SDL_WINDOW_VULKAN;
 #endif
 
-    window = SDL_CreateWindow("Banjo: Recompiled", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 900,  flags);
+    window = SDL_CreateWindow("Banjo: Recompiled Online", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 900,  flags);
 
     if (window == nullptr) {
         exit_error("Failed to create window: %s\n", SDL_GetError());
@@ -524,7 +528,7 @@ std::vector<recomp::GameEntry> supported_games = {
     {
         .rom_hash = 0x1B67585D56E07F8CULL,
         .internal_name = "Banjo-Kazooie",
-        .display_name = "Banjo-Kazooie",
+        .display_name = "Banjo: Recompiled Online",
         .game_id = u8"bk.n64.us.1.0",
         .mod_game_id = "bk",
         // Eep16k instead of Eep4k to have room for extra save file data.
@@ -1009,6 +1013,108 @@ static constexpr uint16_t COOPNET_PORT = 34197;
 
 static std::vector<bknet::LobbyInfo> cached_lobby_list;
 static std::atomic<bool> lobby_list_dirty{false};
+
+// ===== CoopNet connectivity indicator =====
+// Background thread probes the signaling server every 5s via TCP connect.
+// UI reads the atomic each frame from the launcher update callback.
+enum class CoopNetProbeStatus : int { Checking = 0, Online = 1, Offline = 2 };
+static std::atomic<int> coopnet_probe_status{static_cast<int>(CoopNetProbeStatus::Checking)};
+static std::atomic<bool> coopnet_probe_running{false};
+static std::thread coopnet_probe_thread;
+static recompui::Label* coopnet_indicator_label = nullptr;
+static int coopnet_indicator_last_status = -1;
+
+static bool probe_coopnet_reachable() {
+#ifdef _WIN32
+    SOCKET sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) return false;
+    u_long nonblocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonblocking);
+#else
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(COOPNET_PORT);
+    inet_pton(AF_INET, COOPNET_SERVER, &addr.sin_addr);
+
+    bool success = false;
+    int rc = ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+#ifdef _WIN32
+    bool in_progress = (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+    bool in_progress = (rc < 0 && errno == EINPROGRESS);
+#endif
+    if (rc == 0) {
+        success = true;
+    } else if (in_progress) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval tv{3, 0};
+        int sel = ::select(static_cast<int>(sock) + 1, nullptr, &wfds, nullptr, &tv);
+        if (sel > 0) {
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            ::getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errlen);
+            success = (err == 0);
+        }
+    }
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    ::close(sock);
+#endif
+    return success;
+}
+
+static void coopnet_probe_loop() {
+    while (coopnet_probe_running.load()) {
+        bool reachable = probe_coopnet_reachable();
+        coopnet_probe_status.store(static_cast<int>(
+            reachable ? CoopNetProbeStatus::Online : CoopNetProbeStatus::Offline
+        ));
+        // Poll shutdown every 100ms so exit doesn't wait 5s.
+        for (int i = 0; i < 50 && coopnet_probe_running.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
+static void start_coopnet_probe() {
+    if (coopnet_probe_running.exchange(true)) return;
+    coopnet_probe_thread = std::thread(coopnet_probe_loop);
+}
+
+static void stop_coopnet_probe() {
+    if (!coopnet_probe_running.exchange(false)) return;
+    if (coopnet_probe_thread.joinable()) coopnet_probe_thread.join();
+}
+
+static void refresh_coopnet_indicator() {
+    if (coopnet_indicator_label == nullptr) return;
+    int s = coopnet_probe_status.load();
+    if (s == coopnet_indicator_last_status) return;
+    coopnet_indicator_last_status = s;
+    switch (static_cast<CoopNetProbeStatus>(s)) {
+        case CoopNetProbeStatus::Online:
+            coopnet_indicator_label->set_text("CoopNet: Online");
+            coopnet_indicator_label->set_color(recompui::theme::color::Success);
+            break;
+        case CoopNetProbeStatus::Offline:
+            coopnet_indicator_label->set_text("CoopNet: Offline");
+            coopnet_indicator_label->set_color(recompui::theme::color::Danger);
+            break;
+        case CoopNetProbeStatus::Checking:
+        default:
+            coopnet_indicator_label->set_text("CoopNet: Checking...");
+            coopnet_indicator_label->set_color(recompui::theme::color::Warning);
+            break;
+    }
+}
 
 static void begin_coopnet_connect();
 static void begin_coopnet_host();
@@ -1886,6 +1992,19 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
 
     menu->remove_default_title();
 
+    // CoopNet connectivity indicator (bottom-left, above the version label)
+    {
+        auto ctx = recompui::get_launcher_context_id();
+        coopnet_indicator_label = ctx.create_element<recompui::Label>(
+            menu, "CoopNet: Checking...", recompui::LabelStyle::Small
+        );
+        coopnet_indicator_label->set_color(recompui::theme::color::Warning);
+        coopnet_indicator_label->set_position(recompui::Position::Absolute);
+        coopnet_indicator_label->set_bottom(28.0f);
+        coopnet_indicator_label->set_left(4.0f);
+        coopnet_indicator_last_status = -1;
+    }
+
     banjo::launcher_animation_setup(menu);
 }
 
@@ -2070,6 +2189,7 @@ int main(int argc, char** argv) {
         refresh_host_slots();
         update_join_state();
         update_coopnet_state();
+        refresh_coopnet_indicator();
         banjo::launcher_animation_update(menu);
     });
 
@@ -2129,6 +2249,8 @@ int main(int argc, char** argv) {
     // Register the .rtz texture pack file format with the previous content type as its only allowed content type.
     recomp::mods::register_mod_container_type("rtz", std::vector{ texture_pack_content_type_id }, false);
 
+    start_coopnet_probe();
+
     recomp::start(
         project_version,
         {},
@@ -2141,6 +2263,8 @@ int main(int argc, char** argv) {
         error_handling_callbacks,
         threads_callbacks
     );
+
+    stop_coopnet_probe();
 
     bknet::NetworkManager::instance().shutdown();
 
