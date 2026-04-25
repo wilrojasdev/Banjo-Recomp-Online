@@ -25,7 +25,9 @@ u32  recomp_net_is_host(void);
  * Each NPC that uses post-dialog animation sync gets a unique tag so
  * future quests (Mumbo, Tanktup, Boggy, Trunker, etc.) can reuse the
  * same channel without needing a new flag type. */
-#define NPC_DIALOG_ANIM_CHIMPY 1
+#define NPC_DIALOG_ANIM_CHIMPY          1
+#define NPC_DIALOG_ANIM_CONGA_DEFEAT    2
+#define NPC_DIALOG_ANIM_ORANGEPAD_JIGGY 3
 
 /* ============================================================
  * Core game function declarations (NOT in headers)
@@ -130,6 +132,21 @@ static bool local_orangepad_triggered = FALSE;
 // machine transitions STATE_4 -> STATE_3 to start the walking
 // animation in lockstep with the deliverer closing their dialog.
 static bool chimpy_remote_anim_armed = FALSE;
+
+// Tracks Conga's previous state on non-owner so we can detect transitions
+// (e.g., ROAR -> MOPEY) and fire scene-local effects (defeat dialog) at the
+// right moment without running the full state machine locally. Initialized
+// to 0 (sentinel — no prior state observed) and updated each frame in
+// chConga_update on non-owner.
+static s32 conga_prev_synced_state = 0;
+
+// Last-known position where the orange-pad jiggy should spawn. Set on every
+// peer the moment handleOrangeCollision detects the LAST pad hit, so when
+// the trigger peer's dialog closes and broadcasts the spawn cue, every peer
+// (including the trigger) spawns the jiggy at the correct position.
+// Updated again on subsequent puzzle solves (e.g., second playthrough).
+static f32 saved_orangepad_jiggy_pos[3] = {0.0f, 0.0f, 0.0f};
+static bool saved_orangepad_jiggy_pos_valid = FALSE;
 
 /* ============================================================
  * Helpers
@@ -300,12 +317,21 @@ static void net_conga_set_state_sfx(Actor *this, s32 anim_id) {
 }
 
 /* func_80387370 — defeat dialog callback.
- * Scene-local bits (camera 0x11, ending fade) only run on the defeater.
- * velocity_x is set unconditionally: for the defeater it feeds the local
- * countdown; for any non-defeater path that somehow reaches this callback,
- * velocity_x is redundant since apply_conga_hit already primed it. */
+ * Fires when the defeater's defeat dialog closes. Sets the local jiggy-spawn
+ * countdown (velocity_x = 9), broadcasts the same cue so remote peers start
+ * their countdown in lockstep (no longer triggered from apply_conga_hit), and
+ * runs the scene-local cinematic camera + fade only on the defeater. */
 static void net_conga_defeat_dialog_cb(ActorMarker *this_marker, enum asset_e text_id, s32 arg2) {
     marker_getActor(this_marker)->velocity_x = 9.0f;
+
+    /* Broadcast so remote peers also start their countdown now, instead of
+     * spawning the jiggy seconds earlier (when the 3rd hit landed). Gated by
+     * local_defeated_conga so only the actual defeater broadcasts. */
+    if (recomp_net_is_connected() && local_defeated_conga) {
+        recomp_net_send_flag_change(NET_FLAG_DIALOG_COMPLETE_ANIM,
+            NPC_DIALOG_ANIM_CONGA_DEFEAT, 0, (u32)map_get());
+    }
+
     if (recomp_net_is_connected() && !local_defeated_conga) {
         return;
     }
@@ -519,6 +545,7 @@ RECOMP_PATCH void chConga_update(Actor *this) {
     f32 unused;
     NodeProp *node_prop;
     s32 sp3C;
+    bool is_non_owner;
 
     this->marker->propPtr->unk8_3 = timedFuncQueue_is_empty(this) ? 1 : 0;
 
@@ -553,6 +580,65 @@ RECOMP_PATCH void chConga_update(Actor *this) {
 
     /* --- Collision callback (uses our replicated hit handler) --- */
     marker_setCollisionScripts(this->marker, NULL, NULL, (MarkerCollisionFunc)net_conga_hit_callback);
+
+    /* ============================================================
+     * NON-OWNER FAST PATH
+     * The owner runs the full state machine (transitions, randomness,
+     * proximity-driven targets) and the bulk-enemy-position sync mirrors
+     * actor->state, anim_id, anim_timer and anim_direction here every
+     * frame. Running the state machine locally too just fights the sync
+     * (resets anim on every subaddie_set_state_with_direction, flips
+     * direction with its own randf, etc.), producing the visual desyncs
+     * we kept seeing in IDLE and during the two attack types.
+     *
+     * On non-owner we only keep the side-effects that are scene-local
+     * (dialogs the local player must see) or required for cross-machine
+     * behavior (collision callback, jiggy countdown above). The state
+     * machine itself is skipped — the synced state already drives the
+     * visual perfectly.
+     * ============================================================ */
+    is_non_owner = recomp_net_is_connected()
+                && !recomp_net_am_i_world_owner((u32)level_get());
+
+    if (is_non_owner) {
+        s32 cur_synced = (s32)this->state;
+
+        /* Scene-local: "safe up here" dialog when LOCAL player climbs the
+         * tree. Each peer fires its own — gated by net_isLocalPlayerNearTree. */
+        if (!this->unk138_23
+            && net_isLocalPlayerNearTree(this)
+            && gcdialog_showDialog(ASSET_B37_DIALOG_CONGA_SAFE_UP_HERE, 0, 0, 0, 0, 0)) {
+            this->unk138_23 = 1;
+            mapSpecificFlags_set(MM_SPECIFIC_FLAG_A_UNKNOWN, TRUE);
+        }
+
+        /* Scene-local: first-meeting dialog when LOCAL player enters the
+         * throw sphere. Each peer fires its own. */
+        if (subaddie_playerIsWithinSphereAndActive(this, CONGA_THROW_SPHERE)
+            && !this->has_met_before) {
+            if (gcdialog_showDialog(
+                    (player_getTransformation() == TRANSFORM_2_TERMITE)
+                        ? ASSET_B3E_DIALOG_CONGA_MEET_AS_TERMITE
+                        : ASSET_B3C_DIALOG_CONGA_MEET,
+                    0, this->position, 0, 0, 0)) {
+                this->has_met_before = TRUE;
+            }
+        }
+
+        /* Detect ROAR -> MOPEY transition on the synced state to fire the
+         * defeat dialog on the player who actually defeated Conga. The
+         * owner's state machine fires its own dialog when its ROAR anim
+         * completes; non-owner mirrors that moment exactly because the
+         * synced state changes one frame after anim_timer hits ~0.99. */
+        if (conga_prev_synced_state == CONGA_STATE_ROAR
+            && cur_synced == CONGA_STATE_MOPEY
+            && local_defeated_conga) {
+            gcdialog_showDialog(ASSET_B38_DIALOG_CONGA_DEFEAT, 0xe, this->position,
+                                 this->marker, (void *)net_conga_defeat_dialog_cb, NULL);
+        }
+        conga_prev_synced_state = cur_synced;
+        return;
+    }
 
     /* --- Range check: MODIFIED to include remote players --- */
     if (!net_anyPlayerInSphere(this, (f32)CONGA_ACTIVE_SPHERE)
@@ -894,13 +980,13 @@ RECOMP_EXPORT void bkrecomp_net_apply_conga_hit(u32 remote_unk38, u32 remote_unk
     ((ActorLocal_Conga *)&conga->local)->unkC = 0;
 
     if (conga->unk38_31 >= 3 && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
-        /* Defeat — update state/animation but skip camera + SFX for remote player */
+        /* Defeat — update state/animation but skip camera + SFX for remote player.
+         * The jiggy-spawn countdown (velocity_x = 9.0f) is intentionally NOT
+         * triggered here. It now starts from the defeater's defeat-dialog
+         * callback, which broadcasts NPC_DIALOG_ANIM_CONGA_DEFEAT. That keeps
+         * the jiggy spawn in lockstep with the defeater closing their dialog,
+         * instead of appearing on remote peers ~9 frames after the 3rd hit. */
         subaddie_set_state_with_direction(conga, CONGA_STATE_ROAR, 0, 1);
-        /* Shared jiggy spawn: mirror velocity_x=9 here so the countdown runs
-         * on remote clients too and func_80387100 spawns the jiggy for
-         * everyone. The ROAR-state dialog + camera still only fire for the
-         * defeater (gated by local_defeated_conga in chConga_update). */
-        conga->velocity_x = 9.0f;
     } else if (conga->state != CONGA_STATE_MOPEY && conga->state != CONGA_STATE_ROAR) {
         /* Hit reaction — just update state, no SFX on remote side */
         subaddie_set_state_with_direction(conga, CONGA_STATE_HIT, 0, -1);
@@ -1083,13 +1169,44 @@ RECOMP_PATCH void chlmonkey_update(Actor *this) {
 
 /* ============================================================
  * RECOMP_PATCH: handleOrangeCollision (orange vs pad collision)
- * Scene-local: the jiggy-spawn cutscene camera + dialog + fanfare
- * fire only when the LOCAL player is inside Conga's arena at the
- * moment the final pad is hit. Other clients still see the jiggy
- * appear (shared via func_80387100 equivalent here: spawnJiggy).
+ *
+ * Scene-local cutscene + dialog only fire on the world owner so exactly
+ * one peer is "the one who finishes". Jiggy spawn is intentionally NOT
+ * fired immediately — it's deferred to the moment that peer closes the
+ * defeat dialog. At that point the owner spawns locally AND broadcasts
+ * NET_FLAG_DIALOG_COMPLETE_ANIM with NPC_DIALOG_ANIM_ORANGEPAD_JIGGY,
+ * so non-owner peers spawn at the same moment.
+ *
+ * This avoids two issues with the previous "spawn immediately on every
+ * peer" approach:
+ *   1) The blocking cutscene fired on every peer in the arena (radius
+ *      2500), not only on the player who completed the puzzle.
+ *   2) Spawning at +50 above the pad while the OTHER peer was free to
+ *      walk made the jiggy auto-collected the moment it appeared (since
+ *      the skip-jiggy patch makes pickup instant on touch). Deferring the
+ *      spawn until after the cutscene gives non-owner players time to
+ *      step away if they want, while still letting any peer actually
+ *      collect it (shared collectible).
  * ============================================================ */
 extern void gcStaticCamera_activate(s32);
 extern void particleEmitter_setModel(ParticleEmitter *, enum asset_e);
+
+/* Timed callback that fires on the trigger peer ~3s after the last pad hit
+ * (well after the static-camera cutscene + dialog finishes its visible part).
+ * Spawns the jiggy locally and broadcasts the spawn cue so other peers spawn
+ * in lockstep. The 3s delay also gives non-trigger players time to step away
+ * from the pad before the jiggy materializes, preventing the instant-pickup
+ * regression caused by the skip-jiggy patch. */
+static void net_orangepad_spawn_after_cutscene(s32 x, s32 y, s32 z) {
+    if (jiggyscore_isCollected(JIGGY_8_MM_ORANGE_PADS)) return;
+
+    spawnJiggy(x, y, z);
+
+    if (recomp_net_is_connected() && local_orangepad_triggered) {
+        recomp_net_send_flag_change(NET_FLAG_DIALOG_COMPLETE_ANIM,
+            NPC_DIALOG_ANIM_ORANGEPAD_JIGGY, 0, (u32)map_get());
+    }
+}
 
 RECOMP_PATCH void handleOrangeCollision(ActorMarker *marker) {
     f32 distance_to_orange_pad;
@@ -1114,34 +1231,47 @@ RECOMP_PATCH void handleOrangeCollision(ActorMarker *marker) {
         /* More pads remaining — progress ding (shared audio is fine) */
         coMusicPlayer_playMusic(COMUSIC_2B_DING_B, 22000);
     } else {
-        /* Last pad — dispense the jiggy.
-         * Scene-local: the static camera, completion dialog and the
-         * puzzle-solved fanfare run only on the player whose local
-         * orange physics actually triggered this. In our networked
-         * setup, the host (world owner) is the authoritative simulator;
-         * the non-owner only spawns oranges from events (which still
-         * trigger handleOrangeCollision locally when the replicated
-         * orange hits a pad). Gate by proximity to the pad so whoever
-         * is present in Conga's arena sees the cutscene. */
-        bool local_in_arena = subaddie_playerIsWithinSphereAndActive(closest_orange_pad, 2500);
+        /* Last pad — every peer saves the spawn position so when the
+         * trigger peer's dialog closes (broadcast event), they all spawn
+         * at the same place. */
+        saved_orangepad_jiggy_pos[0] = position[0];
+        saved_orangepad_jiggy_pos[1] = position[1] + 50.0f;
+        saved_orangepad_jiggy_pos[2] = position[2];
+        saved_orangepad_jiggy_pos_valid = TRUE;
 
-        if (!recomp_net_is_connected() || local_in_arena) {
+        bool i_am_trigger = !recomp_net_is_connected()
+                         || recomp_net_am_i_world_owner((u32)level_get());
+
+        if (i_am_trigger) {
             camera_id = (closest_orange_pad->secondaryId == 2 /*ORANGE_PAD_RIGHT*/) ? 0x10 /*JIGGY_SPAWN_RIGHT*/
                       : (closest_orange_pad->secondaryId == 1 /*ORANGE_PAD_LEFT*/)  ? 0xF  /*JIGGY_SPAWN_LEFT*/
                                                                                     : 0xE; /*JIGGY_SPAWN_TOP*/
+            /* Vanilla cutscene flow: camera + music + dialog (no callback so
+             * the dialog system shows the puzzle-solved text the same way as
+             * single-player BK does). The jiggy spawn is scheduled separately
+             * via timedFunc with a longer delay than vanilla (3.0s vs 0.6s)
+             * so the spawn lands AFTER the cutscene ends — both visually on
+             * the trigger and via broadcast on remote peers, who receive the
+             * cue at the same moment. */
             gcStaticCamera_activate(camera_id);
             coMusicPlayer_playMusic(COMUSIC_2D_PUZZLE_SOLVED_FANFARE, 0x7FFF);
+            local_orangepad_triggered = TRUE;
+
             if (!jiggyscore_isCollected(JIGGY_8_MM_ORANGE_PADS)) {
                 gcdialog_showDialog(ASSET_B3B_DIALOG_CONGA_ORANGE_PAD_JIGGY, 4,
                                      NULL, NULL, NULL, NULL);
             }
-            local_orangepad_triggered = TRUE;
-        }
 
-        /* Jiggy spawn is shared: every client sees the reward appear. */
-        position[1] += 50.0f;
-        timedFunc_set_3(0.6f, (GenFunction_3)spawnJiggy,
-                         (s32)position[0], (s32)position[1], (s32)position[2]);
+            /* Schedule the spawn-and-broadcast for after the cutscene ends.
+             * In single-player this just delays the jiggy a bit longer than
+             * vanilla (3.0s vs 0.6s) — visually nearly identical. */
+            timedFunc_set_3(3.0f, (GenFunction_3)net_orangepad_spawn_after_cutscene,
+                             (s32)saved_orangepad_jiggy_pos[0],
+                             (s32)saved_orangepad_jiggy_pos[1],
+                             (s32)saved_orangepad_jiggy_pos[2]);
+        }
+        /* Non-trigger peers do nothing here; they wait for the broadcast
+         * cue to arrive, then spawn the jiggy locally from the saved pos. */
     }
 
     /* Orange particles are pure visual — run on every client. */
@@ -1178,5 +1308,26 @@ RECOMP_EXPORT void bkrecomp_net_dialog_complete_anim_remote_apply(u32 npc_id, u3
          * STATE_4_LEAVING. Idempotent: a duplicate event before the
          * state machine consumes it just keeps the flag TRUE. */
         chimpy_remote_anim_armed = TRUE;
+    } else if (npc_id == NPC_DIALOG_ANIM_CONGA_DEFEAT) {
+        /* Defeater closed their defeat dialog. Start the local jiggy-spawn
+         * countdown now so the jiggy appears in lockstep with theirs.
+         * Idempotent: if velocity_x is already counting down (duplicate
+         * event), re-priming to 9.0f just delays the spawn slightly. */
+        Actor *conga = find_conga_actor();
+        if (conga && !jiggyscore_isCollected(JIGGY_A_MM_CONGA)) {
+            conga->velocity_x = 9.0f;
+        }
+    } else if (npc_id == NPC_DIALOG_ANIM_ORANGEPAD_JIGGY) {
+        /* Trigger peer just closed the orange-pad puzzle dialog. Spawn the
+         * jiggy locally from the position saved when handleOrangeCollision
+         * detected the last pad hit. Skipped if no position was saved (e.g.,
+         * late-join without observing the puzzle) or the jiggy was already
+         * collected. spawnJiggy itself is idempotent. */
+        if (saved_orangepad_jiggy_pos_valid
+            && !jiggyscore_isCollected(JIGGY_8_MM_ORANGE_PADS)) {
+            spawnJiggy((s32)saved_orangepad_jiggy_pos[0],
+                       (s32)saved_orangepad_jiggy_pos[1],
+                       (s32)saved_orangepad_jiggy_pos[2]);
+        }
     }
 }

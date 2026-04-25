@@ -106,6 +106,8 @@ struct EnemySnapshot {
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float yaw = 0.0f;
     uint16_t anim_id = 0;
+    uint8_t anim_direction = 1;  // 0=back, 1=forward — snapshot of anctrl playback dir
+    uint8_t state = 0;           // actor->state low byte (0 = no state to apply)
     float anim_timer = 0.0f;
     double timestamp = 0.0;
     bool valid = false;
@@ -117,6 +119,8 @@ struct EnemyInterpolatedState {
     uint16_t spawn_index = 0;
     uint16_t marker_type = 0;
     uint16_t anim_id = 0;
+    uint8_t anim_direction = 1;
+    uint8_t state = 0;
     float anim_timer = 0.0f;
     bool active = false;
 };

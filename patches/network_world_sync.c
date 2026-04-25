@@ -43,6 +43,10 @@ extern enum asset_e anctrl_getIndex(AnimCtrl *this);
 extern f32 anctrl_getAnimTimer(AnimCtrl *this);
 extern void anctrl_setIndex(AnimCtrl *this, enum asset_e index);
 extern void anctrl_setAnimTimer(AnimCtrl *this, f32 timer);
+extern s32 anctrl_isPlayedForwards(AnimCtrl *this);
+extern void anctrl_setDirection(AnimCtrl *this, s32 dir);
+extern void anctrl_setDuration(AnimCtrl *this, f32 duration);
+extern void _anctrl_start(AnimCtrl *this, char *file, s32 line);
 
 // Player marker (for triggering enemy death callbacks)
 extern ActorMarker *baMarker_get(void);
@@ -87,6 +91,23 @@ static bool is_killable_enemy(Actor *actor) {
     if (mid == MARKER_DB_BURIED_TREASURE) return FALSE;
     if (df == (MarkerCollisionFunc)net_enemy_die_proxy) return TRUE;
     return TRUE;
+}
+
+// Bosses/special actors that don't have dieFunc (so is_killable_enemy returns
+// FALSE for them) but whose position+animation must still be replicated to
+// peers so all players see the same visual flow. Add new entries here when a
+// boss has its own scripted defeat path instead of a regular dieFunc.
+static bool is_synced_special_actor(Actor *actor) {
+    if (!actor || !actor->marker) return FALSE;
+    u32 mid = (u32)actor->marker->id;
+    if (mid == MARKER_7_CONGA) return TRUE;
+    return FALSE;
+}
+
+// Combined filter for sync_enemy_positions — includes regular killable enemies
+// and special-case bosses that lack dieFunc.
+static bool is_synced_actor(Actor *actor) {
+    return is_killable_enemy(actor) || is_synced_special_actor(actor);
 }
 
 // Jiggy actor local ID
@@ -1682,7 +1703,8 @@ typedef struct {
     f32 z;            // 0x0C
     f32 yaw;          // 0x10
     u16 anim_id;      // 0x14
-    u16 _pad;         // 0x16
+    u8  anim_direction; // 0x16 — 0=back, 1=fwd (anctrl_isPlayedForwards)
+    u8  state;        // 0x17 — actor->state low byte (0 = no override)
     f32 anim_timer;   // 0x18
 } EnemyPosEntry;      // 0x1C = 28 bytes
 
@@ -1704,13 +1726,14 @@ static void sync_enemy_positions(void) {
         for (i = 0; i < suBaddieActorArray->cnt && count < MAX_ENEMY_POS_ENTRIES; i++) {
             Actor *actor = &suBaddieActorArray->data[i];
             if (!actor->marker) continue;
-            if (!is_killable_enemy(actor)) continue;
+            if (!is_synced_actor(actor)) continue;
 
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
 
             // Install dieFunc proxy on owner too — sends death event immediately
             // when enemy dies, instead of waiting for poll_enemy_deaths detection.
-            // AI is NOT suppressed on owner side.
+            // AI is NOT suppressed on owner side. Special-case bosses without
+            // dieFunc (e.g. Conga) skip this naturally because of the null guard.
             if (actor->marker->dieFunc && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
                 save_enemy_funcs(si, actor->marker->dieFunc,
                                  actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
@@ -1725,11 +1748,18 @@ static void sync_enemy_positions(void) {
             buf[count].yaw = actor->yaw;
             if (actor->anctrl) {
                 buf[count].anim_id = (u16)anctrl_getIndex(actor->anctrl);
+                buf[count].anim_direction = (u8)(anctrl_isPlayedForwards(actor->anctrl) ? 1 : 0);
                 buf[count].anim_timer = anctrl_getAnimTimer(actor->anctrl);
             } else {
                 buf[count].anim_id = 0;
+                buf[count].anim_direction = 1;
                 buf[count].anim_timer = 0.0f;
             }
+            /* Pack actor->state (6-bit bitfield) into the state byte. Used by
+             * special-case bosses on non-owner to adopt owner's state machine
+             * wholesale. Regular enemies tolerate the byte being read; their
+             * state machines just keep running locally. */
+            buf[count].state = (u8)(actor->state & 0x3F);
             count++;
         }
 
@@ -1768,10 +1798,47 @@ static void sync_enemy_positions(void) {
                 actor->position[2] = buf[e].z;
                 actor->yaw = buf[e].yaw;
 
-                // Full animation sync from host (ID + timer every frame)
+                // Full animation sync from host (ID + timer + direction every frame).
+                //
+                // CAREFUL: anctrl_setIndex() only stores the next-index in
+                // ctrl->index; the actually playing animation lives in
+                // ctrl->animation->index and is only swapped when anctrl_start()
+                // (or subaddie_set_state via __subaddie_set_state) is called.
+                //
+                // For "regular" enemies the local state machine on non-owner
+                // calls subaddie_set_state* every state transition, which commits
+                // the index. So setIndex alone is enough — the local commit
+                // happens organically.
+                //
+                // For special-case bosses (Conga) the local state machine is
+                // skipped on non-owner, so nothing commits. We must commit
+                // ourselves via anctrl_start when the synced index actually
+                // changes. Also refresh duration from the actor's animation
+                // table so timer→frame translation matches.
                 if (actor->anctrl && buf[e].anim_id != 0) {
-                    anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
+                    if (is_synced_special_actor(actor)) {
+                        enum asset_e cur_idx = anctrl_getIndex(actor->anctrl);
+                        if ((s32)cur_idx != (s32)buf[e].anim_id) {
+                            anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
+                            if (actor->unk18 && buf[e].state > 0) {
+                                anctrl_setDuration(actor->anctrl,
+                                                    actor->unk18[buf[e].state].duration);
+                            }
+                            _anctrl_start(actor->anctrl, "network_world_sync.c", __LINE__);
+                        }
+                    } else {
+                        anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
+                    }
                     anctrl_setAnimTimer(actor->anctrl, buf[e].anim_timer);
+                    anctrl_setDirection(actor->anctrl, (s32)buf[e].anim_direction);
+                }
+
+                // Apply owner's actor->state for special-case bosses whose
+                // chConga_update / equivalent skips the local state machine
+                // entirely on non-owner. Skipped for regular enemies since
+                // their state machines run unmodified per-machine.
+                if (is_synced_special_actor(actor)) {
+                    actor->state = (u32)buf[e].state;
                 }
 
                 // Install dieFunc proxy to track kills from non-owner side.

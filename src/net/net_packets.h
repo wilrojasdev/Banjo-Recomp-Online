@@ -16,7 +16,14 @@ constexpr uint8_t NUM_CHANNELS = 2;
 // Application-level protocol version. Bumped whenever packet layout or
 // semantics change. Sent on connect; a mismatch closes the peer immediately
 // with a specific error instead of silently desyncing.
-constexpr uint32_t PROTOCOL_VERSION = 3;
+//
+// v4: EnemyPositionEntry repurposes one trailing _pad byte as anim_direction
+// (forward/backward playback) so Conga's idle rocking and other directional
+// animations stay synced across peers.
+// v5: EnemyPositionEntry repurposes the remaining _pad byte as `state`
+// (actor->state cast to u8). Lets non-owner peers adopt the owner's state
+// machine wholesale for bosses (Conga) instead of running their own.
+constexpr uint32_t PROTOCOL_VERSION = 5;
 
 // Optional features negotiated in VersionCheck. Both peers' reported bitmaps
 // are ANDed; behaviour downgrades for features not common to both. This lets
@@ -254,7 +261,8 @@ struct EnemyPositionEntry {
     float x, y, z;
     float yaw;
     uint16_t anim_id;
-    uint16_t _pad;
+    uint8_t  anim_direction;  // 0 = backward, 1 = forward (anctrl playback dir)
+    uint8_t  state;           // actor->state low byte (0 = no state to apply)
     float anim_timer;
 };  // 28 bytes
 

@@ -320,6 +320,8 @@ extern "C" void recomp_net_send_enemy_positions(uint8_t* rdram, recomp_context* 
         entries[i].z = read_f32(rdram, entry_addr, 0x0C);
         entries[i].yaw = read_f32(rdram, entry_addr, 0x10);
         entries[i].anim_id = static_cast<uint16_t>(MEM_HU(0x14, entry_addr));
+        entries[i].anim_direction = static_cast<uint8_t>(MEM_BU(0x16, entry_addr));
+        entries[i].state = static_cast<uint8_t>(MEM_BU(0x17, entry_addr));
         entries[i].anim_timer = read_f32(rdram, entry_addr, 0x18);
     }
 
@@ -344,6 +346,8 @@ extern "C" void recomp_net_get_enemy_positions(uint8_t* rdram, recomp_context* c
         write_f32(rdram, entry_addr, 0x0C, states[i].z);
         write_f32(rdram, entry_addr, 0x10, states[i].yaw);
         MEM_HU(0x14, entry_addr) = states[i].anim_id;
+        MEM_BU(0x16, entry_addr) = states[i].anim_direction;
+        MEM_BU(0x17, entry_addr) = states[i].state;
         write_f32(rdram, entry_addr, 0x18, states[i].anim_timer);
     }
 

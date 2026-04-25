@@ -240,6 +240,8 @@ EnemyInterpolatedState EnemyInterpolator::interpolate(double current_time, uint1
         result.x = s->x; result.y = s->y; result.z = s->z;
         result.yaw = s->yaw;
         result.anim_id = s->anim_id;
+        result.anim_direction = s->anim_direction;
+        result.state = s->state;
         result.anim_timer = s->anim_timer;
         result.active = true;
     };
@@ -272,6 +274,8 @@ EnemyInterpolatedState EnemyInterpolator::interpolate(double current_time, uint1
 
             // Animation: use target snapshot (don't interpolate anim state)
             result.anim_id = b->anim_id;
+            result.anim_direction = b->anim_direction;
+            result.state = b->state;
             result.anim_timer = b->anim_timer;
 
             result.active = true;
@@ -310,6 +314,8 @@ void EnemyInterpolationManager::push_bulk(const EnemyPositionEntry* entries, uin
         snap.z = entries[i].z;
         snap.yaw = entries[i].yaw;
         snap.anim_id = entries[i].anim_id;
+        snap.anim_direction = entries[i].anim_direction;
+        snap.state = entries[i].state;
         snap.anim_timer = entries[i].anim_timer;
         snap.timestamp = timestamp;
         snap.valid = true;
