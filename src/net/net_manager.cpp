@@ -998,6 +998,9 @@ void NetworkManager::handle_state_packet(const PlayerStatePacket& pkt) {
         snap.bs_state = static_cast<uint8_t>(pkt.bs_state);
         snap.horizontal_velocity = pkt.horizontal_velocity;
     }
+    if (full_apply || (pkt.dirty_flags & DIRTY_CARRY)) {
+        snap.carry_kind = pkt.carry_kind;
+    }
     // scale isn't in any flag group — always take it (sender hardcodes 1.0f)
     if (full_apply) snap.scale = 1.0f;
 

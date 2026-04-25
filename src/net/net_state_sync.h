@@ -29,6 +29,7 @@ struct LocalPlayerSnapshot {
     uint8_t transformation;
     uint8_t bs_state;
     float horizontal_velocity;
+    uint8_t carry_kind;     // CarryKind enum (NONE/ORANGE/...)
     uint32_t frame_counter;
     bool valid;
 };

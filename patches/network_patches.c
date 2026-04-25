@@ -23,6 +23,25 @@ extern u8 D_8037D235; // Kazooie feet
 extern u8 D_8037D236; // Kazooie wings
 extern u8 D_8037D238; // Kazooie head
 
+// Carry mechanic — local player's currently-held quest object (Chimpy orange,
+// future bullion / jinjo / etc.). Mirrored to peers so ghosts render the
+// visual prop in their hands.
+extern ActorMarker *bacarry_get_marker(void);
+
+/* Must mirror the CarryKind enum in src/net/net_packets.h. */
+#define NET_CARRY_KIND_NONE   0
+#define NET_CARRY_KIND_ORANGE 1
+
+static u8 compute_local_carry_kind(void) {
+    ActorMarker *m = bacarry_get_marker();
+    if (m == NULL) return NET_CARRY_KIND_NONE;
+    /* Marker id is the canonical "what is being carried" key. Compare
+     * against MARKER_* directly — saves a marker_getActor lookup and
+     * avoids depending on Actor's id field, which is bitfielded. */
+    if (m->id == MARKER_36_ORANGE_COLLECTIBLE) return NET_CARRY_KIND_ORANGE;
+    return NET_CARRY_KIND_NONE;
+}
+
 // Full local player state struct passed to C++ side via pointer.
 // Must match the layout expected in net_recomp_api.cpp.
 typedef struct {
@@ -46,7 +65,9 @@ typedef struct {
     f32 horizontal_velocity;    // 0x30
     f32 anim_subrange_start;    // 0x34
     f32 anim_subrange_end;      // 0x38
-} NetFullState; // 0x3C (60 bytes) — ORIGINAL LAYOUT, do NOT change
+    u8  carry_kind;             // 0x3C — CARRY_KIND_NONE/ORANGE/...
+    u8  _pad3[3];               // 0x3D-0x3F (align to 4)
+} NetFullState; // 0x40 (64 bytes) — original 0x00-0x38 layout preserved; carry_kind appended
 
 // Networking bridge functions (registered on C++ side via REGISTER_FUNC)
 void recomp_net_push_full_state(NetFullState* state);
@@ -97,6 +118,9 @@ static void net_sync_local_state(void) {
     state.health = 0;
     state.health_total = 0;
     state.lives = 0;
+
+    state.carry_kind = compute_local_carry_kind();
+    state._pad3[0] = state._pad3[1] = state._pad3[2] = 0;
 
     recomp_net_push_full_state(&state);
     // Push level_id separately (not in NetFullState to preserve struct layout)

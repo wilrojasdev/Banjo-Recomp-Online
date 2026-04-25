@@ -71,6 +71,7 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
         r.transformation = s->transformation;
         r.bs_state = s->bs_state;
         r.horizontal_velocity = s->horizontal_velocity;
+        r.carry_kind = s->carry_kind;
         r.active = true;
     };
 
@@ -124,6 +125,7 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
             result.transformation = b->transformation;
             result.bs_state = b->bs_state;
             result.horizontal_velocity = b->horizontal_velocity;
+            result.carry_kind = b->carry_kind;
             result.animation_changed = (a->animation_id != b->animation_id);
             result.active = true;
             return result;

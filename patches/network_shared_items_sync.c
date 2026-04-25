@@ -2,6 +2,9 @@
 #include "functions.h"
 #include "enums.h"
 
+extern Actor *actorArray_findActorFromMarkerId(s32 marker_id);
+extern void marker_despawn(ActorMarker *marker);
+
 /*
  * Shared inventory sync: eggs, red feathers, gold feathers.
  *
@@ -45,14 +48,16 @@ static PendingSharedItem s_pending[MAX_PENDING_SHARED_ITEM];
 static s32 s_pending_count = 0;
 
 // -1 sentinel = uninitialized; first poll baselines without broadcasting.
-static s32 s_last_eggs = -1;
-static s32 s_last_red  = -1;
-static s32 s_last_gold = -1;
+static s32 s_last_eggs   = -1;
+static s32 s_last_red    = -1;
+static s32 s_last_gold   = -1;
+static s32 s_last_orange = -1;
 
 static bool is_shared_item(u32 item) {
     return item == ITEM_D_EGGS
         || item == ITEM_F_RED_FEATHER
-        || item == ITEM_10_GOLD_FEATHER;
+        || item == ITEM_10_GOLD_FEATHER
+        || item == ITEM_19_ORANGE;
 }
 
 // Called from network_flag_sync.c when a remote FLAG_SHARED_ITEM event arrives.
@@ -78,9 +83,10 @@ static void send_diff_if_changed(enum item_e item, s32 cur, s32 *last) {
 // Called every frame from bkrecomp_net_process_world_events.
 RECOMP_EXPORT void bkrecomp_net_shared_items_tick(void) {
     if (!recomp_net_is_connected()) {
-        s_last_eggs = -1;
-        s_last_red  = -1;
-        s_last_gold = -1;
+        s_last_eggs   = -1;
+        s_last_red    = -1;
+        s_last_gold   = -1;
+        s_last_orange = -1;
         s_pending_count = 0;
         return;
     }
@@ -95,27 +101,42 @@ RECOMP_EXPORT void bkrecomp_net_shared_items_tick(void) {
             if (d != 0) {
                 item_adjustByDiffWithHud(it, d);
             }
+            /* Side effect: orange tree pickup. Vanilla never sets
+             * MM_SPECIFIC_FLAG_1, so the despawn-by-flag path in
+             * network_flag_sync.c never fires. Use the +diff event itself
+             * as the "someone collected it" trigger and despawn the
+             * world copy here. */
+            if (it == ITEM_19_ORANGE && d > 0) {
+                Actor *orange = actorArray_findActorFromMarkerId(MARKER_36_ORANGE_COLLECTIBLE);
+                if (orange && orange->marker) {
+                    marker_despawn(orange->marker);
+                }
+            }
         }
         s_pending_count = 0;
-        s_last_eggs = item_getCount(ITEM_D_EGGS);
-        s_last_red  = item_getCount(ITEM_F_RED_FEATHER);
-        s_last_gold = item_getCount(ITEM_10_GOLD_FEATHER);
+        s_last_eggs   = item_getCount(ITEM_D_EGGS);
+        s_last_red    = item_getCount(ITEM_F_RED_FEATHER);
+        s_last_gold   = item_getCount(ITEM_10_GOLD_FEATHER);
+        s_last_orange = item_getCount(ITEM_19_ORANGE);
         return;
     }
 
-    s32 cur_eggs = item_getCount(ITEM_D_EGGS);
-    s32 cur_red  = item_getCount(ITEM_F_RED_FEATHER);
-    s32 cur_gold = item_getCount(ITEM_10_GOLD_FEATHER);
+    s32 cur_eggs   = item_getCount(ITEM_D_EGGS);
+    s32 cur_red    = item_getCount(ITEM_F_RED_FEATHER);
+    s32 cur_gold   = item_getCount(ITEM_10_GOLD_FEATHER);
+    s32 cur_orange = item_getCount(ITEM_19_ORANGE);
 
     // First poll after connect: silent baseline, no broadcast.
     if (s_last_eggs < 0) {
-        s_last_eggs = cur_eggs;
-        s_last_red  = cur_red;
-        s_last_gold = cur_gold;
+        s_last_eggs   = cur_eggs;
+        s_last_red    = cur_red;
+        s_last_gold   = cur_gold;
+        s_last_orange = cur_orange;
         return;
     }
 
-    send_diff_if_changed(ITEM_D_EGGS,        cur_eggs, &s_last_eggs);
-    send_diff_if_changed(ITEM_F_RED_FEATHER, cur_red,  &s_last_red);
-    send_diff_if_changed(ITEM_10_GOLD_FEATHER, cur_gold, &s_last_gold);
+    send_diff_if_changed(ITEM_D_EGGS,          cur_eggs,   &s_last_eggs);
+    send_diff_if_changed(ITEM_F_RED_FEATHER,   cur_red,    &s_last_red);
+    send_diff_if_changed(ITEM_10_GOLD_FEATHER, cur_gold,   &s_last_gold);
+    send_diff_if_changed(ITEM_19_ORANGE,       cur_orange, &s_last_orange);
 }

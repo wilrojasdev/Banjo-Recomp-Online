@@ -32,7 +32,9 @@
 // 0x30    f32 horizontal_velocity  4
 // 0x34    f32 anim_subrange_start  4
 // 0x38    f32 anim_subrange_end    4
-// Total: 0x3C (60 bytes)
+// 0x3C    u8  carry_kind           1
+// 0x3D    (pad)                    3
+// Total: 0x40 (64 bytes)
 
 static inline float read_f32(uint8_t* rdram, gpr addr, int offset) {
     u32 raw = MEM_W(offset, addr);
@@ -73,6 +75,7 @@ extern "C" void recomp_net_push_full_state(uint8_t* rdram, recomp_context* ctx) 
     snap.horizontal_velocity = read_f32(rdram, state_ptr, 0x30);
     snap.anim_subrange_start = read_f32(rdram, state_ptr, 0x34);
     snap.anim_subrange_end   = read_f32(rdram, state_ptr, 0x38);
+    snap.carry_kind  = MEM_BU(0x3C, state_ptr);
 
     bknet::NetworkManager::instance().push_local_full_state(snap);
 }
@@ -211,6 +214,7 @@ extern "C" void recomp_net_get_remote_state(uint8_t* rdram, recomp_context* ctx)
         write_f32(rdram, out_ptr, 0x30, state.horizontal_velocity);
         write_f32(rdram, out_ptr, 0x34, state.anim_subrange_start);
         write_f32(rdram, out_ptr, 0x38, state.anim_subrange_end);
+        MEM_BU(0x3C, out_ptr) = state.carry_kind;
         _return(ctx, 1u);
     } else {
         _return(ctx, 0u);

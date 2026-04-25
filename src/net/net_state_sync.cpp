@@ -59,6 +59,7 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
         if (cur.kazooie_flags != prev.kazooie_flags ||
             cur.bs_state != prev.bs_state ||
             cur.horizontal_velocity != prev.horizontal_velocity) flags |= DIRTY_ITEMS;
+        if (cur.carry_kind != prev.carry_kind) flags |= DIRTY_CARRY;
     }
 
     out.header.type = PacketType::PlayerState;
@@ -90,6 +91,7 @@ bool StateSync::build_state_packet(uint8_t player_id, uint16_t sequence, PlayerS
     out.transformation = snapshot_.transformation;
     out.bs_state = static_cast<uint32_t>(snapshot_.bs_state);
     out.horizontal_velocity = snapshot_.horizontal_velocity;
+    out.carry_kind = snapshot_.carry_kind;
 
     last_snapshot_ = snapshot_;
     last_snapshot_valid_ = true;

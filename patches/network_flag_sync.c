@@ -93,6 +93,10 @@ extern void bkrecomp_net_treasurehunt_remote_apply(u32 action, u32 value);
 // Shared items (eggs/feathers) sync
 extern void bkrecomp_net_shared_item_remote_apply(u32 item, u32 value);
 
+// Generic NPC post-dialog animation cue (deliverer broadcasts after closing
+// the completion dialog so all peers fire the leaving animation in lockstep).
+extern void bkrecomp_net_dialog_complete_anim_remote_apply(u32 npc_id, u32 value);
+
 // Ability system
 extern s32 ability_hasLearned(s32 ability);
 extern void ability_getSizeAndPtr(s32 *size, u8 **addr);
@@ -466,6 +470,8 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
         bkrecomp_net_treasurehunt_remote_apply((u32)idx, (u32)evt->flag_value);
     } else if (ft == 16) { /* NET_FLAG_SHARED_ITEM */
         bkrecomp_net_shared_item_remote_apply((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 17) { /* NET_FLAG_DIALOG_COMPLETE_ANIM */
+        bkrecomp_net_dialog_complete_anim_remote_apply((u32)idx, (u32)evt->flag_value);
     } else if (ft == NET_FLAG_MUMBO_ACTION) {
         if (idx == MUMBO_ACTION_LOCK) {
             if (net_mumbo_lock((u8)val)) {

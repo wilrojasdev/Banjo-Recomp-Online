@@ -49,6 +49,8 @@ typedef struct {
     f32 horizontal_velocity;
     f32 anim_subrange_start;
     f32 anim_subrange_end;
+    u8  carry_kind;     // 0x3C — bridge writes this byte; struct must be ≥ 0x40
+    u8  _pad3[3];
 } RemoteState;
 
 // Network bridges

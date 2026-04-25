@@ -43,6 +43,8 @@ typedef struct {
     f32 horizontal_velocity;
     f32 anim_subrange_start;
     f32 anim_subrange_end;
+    u8  carry_kind;     // 0x3C — visual prop replication (CARRY_KIND_*)
+    u8  _pad3[3];
 } RemoteState;
 
 extern void *baModelBin;
@@ -89,6 +91,16 @@ extern void func_8032AA58(Actor *, f32);  // set actor lifetime/fade speed
 // Asset cache (assetcache_get already in functions.h)
 extern void assetcache_release(void *bin);
 
+/* Mirrors CarryKind in src/net/net_packets.h. Add new kinds here when
+ * networking other carryable quest items (bullion, jinjos, etc.). */
+#define NET_CARRY_KIND_NONE   0
+#define NET_CARRY_KIND_ORANGE 1
+
+/* Cached model bins for carried-prop rendering on remote ghosts. Loaded
+ * lazily on first use (one allocation per asset, lives for the session;
+ * BK's asset cache is process-global so re-getting is a no-op anyway). */
+static void *s_carry_orange_model_bin = NULL;
+
 #define MAX_PLAYERS 4
 
 typedef struct {
@@ -114,10 +126,36 @@ typedef struct {
     void *xform_model_bin;        // Loaded model binary (NULL = use baModelBin)
     u8    cached_transformation;  // Which transformation is currently cached
     enum asset_e cached_model_id; // Asset ID of the cached model (for skinning)
+    /* Per-ghost world-space bone buffer. Set as the current bone-output
+     * target via func_8033A450 right before this ghost's modelRender_draw
+     * so the bones the renderer would otherwise write into the local
+     * player's D_80363780 land here instead. Lets carry-prop renders
+     * (e.g. the orange) anchor to the ghost's body center *with*
+     * animation bob, not just rs.position + fixed offset. */
+    struct5Bs *bones_world;
 } GhostModel;
+
+extern struct5Bs *func_8034A2C8(void);
+extern void func_8034A174(struct5Bs *this, s32 indx, f32 dst[3]);
 
 static GhostModel ghost_models[MAX_PLAYERS] = {0};
 static ModelSkinningData ghost_skinning_data[MAX_PLAYERS] = {0};
+
+/* Tracks carry_kind from the previous frame per ghost so we can detect
+ * 0->ORANGE / ORANGE->0 transitions and trigger world-actor side effects:
+ *   - 0 -> ORANGE: despawn the tree-position orange actor on this peer
+ *     (the carrier is now holding it; the local copy should disappear).
+ *   - ORANGE -> 0: spawn an ORANGE_COLLECTIBLE at the carrier's position
+ *     so the throw "lands" visibly here. Vanilla chLevelCollectible_update
+ *     handles its lifetime — it self-despawns on FLAG_3_CHIMPY_HAS_LEAVED.
+ * Reset to 0 implicitly when a slot is cleared. */
+static u8 ghost_prev_carry_kind[MAX_PLAYERS] = {0};
+
+extern Actor *actorArray_findActorFromMarkerId(s32 marker_id);
+extern void marker_despawn(ActorMarker *marker);
+extern Actor *actor_spawnWithYaw_s32(s32 actor_id, s32 position[3], s32 yaw);
+/* nodeprop_findByActorIdAndActorPosition + nodeprop_getPosition come from
+ * functions.h. */
 
 static f32 lerp_angle(f32 current, f32 target, f32 speed) {
     f32 diff = target - current;
@@ -236,6 +274,9 @@ static void ghost_ensure_init(u32 pid) {
     gm->shadow_model = assetcache_get(ASSET_3BF_MODEL_PLAYER_SHADOW);
     gm->bone_save = boneTransformList_new();
     if (!gm->bone_save) return;
+
+    gm->bones_world = func_8034A2C8();   /* world-space bone sink (own buffer) */
+    if (!gm->bones_world) return;
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
@@ -450,6 +491,67 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         RemoteState rs;
         if (!recomp_net_get_remote_state(pid, &rs)) continue;
         if (rs.map_id != local_map || rs.x < -15000.0f) continue;
+
+        /* Carry transition side effects — only when the ghost's map matches
+         * ours, otherwise we'd despawn/spawn actors that aren't relevant
+         * here. We're already past the `rs.map_id != local_map` guard. */
+        {
+            u8 prev = ghost_prev_carry_kind[pid];
+            if (prev != rs.carry_kind) {
+                if (prev == NET_CARRY_KIND_NONE && rs.carry_kind == NET_CARRY_KIND_ORANGE) {
+                    /* Carrier just picked up — despawn the world copy of
+                     * the orange (it was sitting on the tree on every
+                     * peer's machine since FLAG_1 isn't reliably synced). */
+                    Actor *orange = actorArray_findActorFromMarkerId(MARKER_36_ORANGE_COLLECTIBLE);
+                    if (orange && orange->marker) {
+                        marker_despawn(orange->marker);
+                    }
+                } else if (prev == NET_CARRY_KIND_ORANGE && rs.carry_kind == NET_CARRY_KIND_NONE) {
+                    /* Carrier just threw / dropped. Mirror the host's
+                     * landing target exactly: lmonkey calls
+                     * func_8028FA34(0xc6, chimpy) → func_8028DEEC →
+                     * set_throw_target_position(nodeprop), so the orange
+                     * lands at Chimpy's "throw target" node prop (actor
+                     * id 0xc6 anchored on Chimpy). Use the same lookup
+                     * here to spawn at the identical world-space spot.
+                     * Fallbacks: if the node lookup fails, use Chimpy's
+                     * actor position; if Chimpy isn't loaded (peer in
+                     * another sub-area), use the ghost's position. The
+                     * vanilla collectible self-despawns on
+                     * FLAG_3_CHIMPY_HAS_LEAVED. */
+                    if (!actorArray_findActorFromMarkerId(MARKER_36_ORANGE_COLLECTIBLE)) {
+                        Actor *chimpy = actorArray_findActorFromMarkerId(MARKER_A_CHIMPY);
+                        s32 spawn_pos[3];
+                        bool placed = FALSE;
+                        if (chimpy) {
+                            NodeProp *throw_node =
+                                nodeprop_findByActorIdAndActorPosition((enum actor_e)0xc6, chimpy);
+                            if (throw_node) {
+                                f32 nps[3];
+                                nodeprop_getPosition(throw_node, nps);
+                                spawn_pos[0] = (s32)nps[0];
+                                spawn_pos[1] = (s32)nps[1];
+                                spawn_pos[2] = (s32)nps[2];
+                                placed = TRUE;
+                            } else {
+                                spawn_pos[0] = (s32)chimpy->position[0];
+                                spawn_pos[1] = (s32)chimpy->position[1];
+                                spawn_pos[2] = (s32)chimpy->position[2];
+                                placed = TRUE;
+                            }
+                        }
+                        if (!placed) {
+                            spawn_pos[0] = (s32)rs.x;
+                            spawn_pos[1] = (s32)rs.y;
+                            spawn_pos[2] = (s32)rs.z;
+                        }
+                        actor_spawnWithYaw_s32(ACTOR_29_ORANGE_COLLECTIBLE,
+                            spawn_pos, (s32)rs.yaw);
+                    }
+                }
+                ghost_prev_carry_kind[pid] = rs.carry_kind;
+            }
+        }
 
         ghost_ensure_init(pid);
         GhostModel *gm = &ghost_models[pid];
@@ -726,11 +828,56 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             modelRender_setEnvColor(env_color[0], env_color[1], env_color[2], 255);
         }
         func_8033A280(2.0f);
-        // NOTE: func_8033A450 intentionally omitted — corrupts collision system.
+        /* Route world-space bone writes for this draw into the ghost's
+         * own struct5Bs (not D_80363780, which belongs to the local
+         * player and would be clobbered — that's why this call was
+         * originally omitted). With a per-ghost buffer, the renderer
+         * can populate ghost bone positions for our use without
+         * corrupting collision or other systems that read the local
+         * player's bones. */
+        func_8033A450(gm->bones_world);
         modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
         ghost_setup_all_model_nodes(rs.transformation, kazooie_head, kazooie_wings, kazooie_feet);
         bkrecomp_setup_custom_skinning(&ghost_skinning_data[pid], (u32)gm->cached_model_id);
         modelRender_draw(gfx, mtx, pos, rot, rs.scale, ref, gm->xform_model_bin);
+
+        /* Carried-prop visual replication. Mirrors bacarry_update on the
+         * sender: the deliverer's local orange follows
+         * baModel_getPosition, which averages bones 5 and 6 (~body
+         * center). We just rendered the ghost with bone output going
+         * to gm->bones_world, so reading bones 5/6 from there gives
+         * the same world-space body-center position — including the
+         * idle-bob and walk-bob already baked into the animation. */
+        if (rs.carry_kind == NET_CARRY_KIND_ORANGE) {
+            if (!s_carry_orange_model_bin) {
+                s_carry_orange_model_bin = assetcache_get(ASSET_2D2_MODEL_ORANGE);
+            }
+            if (s_carry_orange_model_bin) {
+                f32 b5[3], b6[3];
+                func_8034A174(gm->bones_world, 5, b5);
+                func_8034A174(gm->bones_world, 6, b6);
+                f32 op[3] = {
+                    (b5[0] + b6[0]) * 0.5f,
+                    (b5[1] + b6[1]) * 0.5f,
+                    (b5[2] + b6[2]) * 0.5f
+                };
+                /* Fallback if the bones are still zeroed (first frame
+                 * before the renderer wrote them, or unexpected animation
+                 * with no skin output): anchor above the ghost's feet. */
+                if (op[0] == 0.0f && op[1] == 0.0f && op[2] == 0.0f) {
+                    op[0] = rs.x;
+                    op[1] = rs.y + 100.0f;
+                    op[2] = rs.z;
+                }
+                f32 orot[3] = {0.0f, gm->smooth_yaw, 0.0f};
+                f32 oref[3] = {0.0f, 0.0f, 0.0f};
+                cur_drawn_model_transform_id =
+                    GHOST_TRANSFORM_ID_START + (pid * GHOST_TRANSFORM_ID_STRIDE) + 1;
+                modelRender_setAlpha(0xFF);
+                modelRender_setDepthMode(MODEL_RENDER_DEPTH_FULL);
+                modelRender_draw(gfx, mtx, op, orot, 1.1f, oref, s_carry_orange_model_bin);
+            }
+        }
 
         // Restore local bones
         {

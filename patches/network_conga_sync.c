@@ -19,6 +19,13 @@ void recomp_net_send_flag_change(u32 flag_type, u32 flag_index, u32 value, u32 m
 u32  recomp_net_is_host(void);
 
 #define NET_FLAG_CONGA_HIT 10
+#define NET_FLAG_DIALOG_COMPLETE_ANIM 17
+
+/* NPC tags carried in flag_index of FLAG_DIALOG_COMPLETE_ANIM events.
+ * Each NPC that uses post-dialog animation sync gets a unique tag so
+ * future quests (Mumbo, Tanktup, Boggy, Trunker, etc.) can reuse the
+ * same channel without needing a new flag type. */
+#define NPC_DIALOG_ANIM_CHIMPY 1
 
 /* ============================================================
  * Core game function declarations (NOT in headers)
@@ -78,6 +85,8 @@ typedef struct {
     f32 horizontal_velocity;
     f32 anim_subrange_start;
     f32 anim_subrange_end;
+    u8  carry_kind;     // 0x3C — visual prop replication (CARRY_KIND_*)
+    u8  _pad3[3];
 } RemoteState;
 
 typedef struct {
@@ -115,6 +124,12 @@ static bool local_chimpy_delivered = FALSE;
 // TRUE when the LOCAL player's orange hit the final pad that triggered
 // the JIGGY_8 spawn cutscene. Gates the camera/dialog/fanfare.
 static bool local_orangepad_triggered = FALSE;
+
+// Armed by the dialog-complete-anim event from the deliverer (or by
+// the late-join FLAG_3 fallback). When TRUE, the chlmonkey state
+// machine transitions STATE_4 -> STATE_3 to start the walking
+// animation in lockstep with the deliverer closing their dialog.
+static bool chimpy_remote_anim_armed = FALSE;
 
 /* ============================================================
  * Helpers
@@ -387,6 +402,16 @@ RECOMP_PATCH void __chlmonkey_spawnJiggy(s32 x, s32 y, s32 z); // forward decl
 
 RECOMP_PATCH void __chlmonkey_complete(ActorMarker *marker, enum asset_e unused_1, s32 unused_2) {
     Actor *actor = marker_getActor(marker);
+
+    /* Deliverer just closed the completion dialog — broadcast the cue
+     * so remote peers fire the leaving animation now instead of when
+     * FLAG_2 first synced (~ several seconds earlier). Gated by
+     * local_chimpy_delivered so the late-join branch (which calls this
+     * function with the jiggy already collected) doesn't echo. */
+    if (recomp_net_is_connected() && local_chimpy_delivered) {
+        recomp_net_send_flag_change(NET_FLAG_DIALOG_COMPLETE_ANIM,
+            NPC_DIALOG_ANIM_CHIMPY, 0, (u32)map_get());
+    }
 
     mapSpecificFlags_set(MM_SPECIFIC_FLAG_4_SHAKE, TRUE);
     subaddie_set_state(actor, 3); // LMONKEY_STATE_3_WALKING
@@ -968,17 +993,22 @@ RECOMP_PATCH void chlmonkey_update(Actor *this) {
                                              this->position, this->marker,
                                              (void *)__chlmonkey_complete, NULL);
                     } else {
-                        /* Remote ghost: skip dialog, but still spawn the
-                         * jiggy and transition Chimpy to walking away so
-                         * the world state stays consistent. Duplicate the
-                         * minimal side-effects of __chlmonkey_complete
-                         * without camera or movement lock. */
-                        mapSpecificFlags_set(MM_SPECIFIC_FLAG_4_SHAKE, TRUE);
-                        subaddie_set_state(this, LMONKEY_STATE_3_WALKING);
-                        timedFunc_set_3(2.9f, (void *)__chlmonkey_spawnJiggy,
-                            (s32)this->position_x,
-                            (s32)(this->position_y + 150.0f),
-                            (s32)this->position_z);
+                        /* Remote ghost: stay in STATE_4_LEAVING (idle
+                         * leaving stance) until the deliverer broadcasts
+                         * NET_FLAG_DIALOG_COMPLETE_ANIM at the moment they
+                         * close the completion dialog. STATE_4 case below
+                         * will transition to STATE_3_WALKING + spawn the
+                         * jiggy when chimpy_remote_anim_armed flips TRUE.
+                         *
+                         * Late-join fallback: if FLAG_3_HAS_LEAVED is
+                         * already set, the deliverer's animation is past
+                         * the dialog (FLAG_3 latches at unk48 >= 0.24,
+                         * after STATE_3 starts). The event for that
+                         * transition has already passed, so arm
+                         * immediately to catch up. */
+                        if (mapSpecificFlags_get(MM_SPECIFIC_FLAG_3_CHIMPY_HAS_LEAVED)) {
+                            chimpy_remote_anim_armed = TRUE;
+                        }
                     }
                 } else {
                     /* Jiggy already collected (late-join case). Trigger the
@@ -1013,6 +1043,22 @@ RECOMP_PATCH void chlmonkey_update(Actor *this) {
 
         case LMONKEY_STATE_4_LEAVING:
             actor_loopAnimation(this);
+            /* Remote ghost: arm flips TRUE on dialog-complete event from
+             * the deliverer (or via the FLAG_3 late-join fallback above).
+             * Mirror the world side-effects of __chlmonkey_complete here
+             * minus the camera/input lock. The deliverer reaches STATE_3
+             * directly via __chlmonkey_complete and never needs this
+             * branch — gate by !local_chimpy_delivered just to be safe
+             * against double-firing if both signals coincide. */
+            if (chimpy_remote_anim_armed && !local_chimpy_delivered) {
+                chimpy_remote_anim_armed = FALSE;
+                mapSpecificFlags_set(MM_SPECIFIC_FLAG_4_SHAKE, TRUE);
+                subaddie_set_state(this, LMONKEY_STATE_3_WALKING);
+                timedFunc_set_3(2.9f, (void *)__chlmonkey_spawnJiggy,
+                    (s32)this->position_x,
+                    (s32)(this->position_y + 150.0f),
+                    (s32)this->position_z);
+            }
             break;
 
         case LMONKEY_STATE_3_WALKING:
@@ -1113,4 +1159,24 @@ RECOMP_PATCH void handleOrangeCollision(ActorMarker *marker) {
     particleEmitter_func_802EFA18(p_ctrl, 3);
     particleEmitter_func_802EFA20(p_ctrl, 1.0f, 1.3f);
     particleEmitter_emitN(p_ctrl, 30);
+}
+
+/* ============================================================
+ * Receive: dialog-complete animation cue from a remote peer.
+ * Routed by bkrecomp_net_process_flag_event in network_flag_sync.c
+ * (NET_FLAG_DIALOG_COMPLETE_ANIM = 17).
+ *
+ * Per-NPC dispatch on flag_index. Currently only Chimpy uses this
+ * channel; other NPCs (Mumbo, Tanktup, Boggy, Trunker, etc.) can
+ * register their own tags and arm logic without changing the
+ * transport layer.
+ * ============================================================ */
+RECOMP_EXPORT void bkrecomp_net_dialog_complete_anim_remote_apply(u32 npc_id, u32 value) {
+    (void)value;
+    if (npc_id == NPC_DIALOG_ANIM_CHIMPY) {
+        /* The chlmonkey state machine consumes the arm next frame from
+         * STATE_4_LEAVING. Idempotent: a duplicate event before the
+         * state machine consumes it just keeps the flag TRUE. */
+        chimpy_remote_anim_armed = TRUE;
+    }
 }

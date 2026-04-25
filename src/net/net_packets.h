@@ -16,7 +16,7 @@ constexpr uint8_t NUM_CHANNELS = 2;
 // Application-level protocol version. Bumped whenever packet layout or
 // semantics change. Sent on connect; a mismatch closes the peer immediately
 // with a specific error instead of silently desyncing.
-constexpr uint32_t PROTOCOL_VERSION = 2;
+constexpr uint32_t PROTOCOL_VERSION = 3;
 
 // Optional features negotiated in VersionCheck. Both peers' reported bitmaps
 // are ANDed; behaviour downgrades for features not common to both. This lets
@@ -169,6 +169,15 @@ enum PlayerStateDirtyFlags : uint32_t {
     DIRTY_ITEMS         = 1 << 4,
     DIRTY_TRANSFORMATION = 1 << 5,
     DIRTY_MAP           = 1 << 6,
+    DIRTY_CARRY         = 1 << 7,  // Carried-object kind (e.g. orange)
+};
+
+// Carried-object discriminator. Mirrors the local bacarry_get_marker()
+// state on each peer so ghosts render the visual prop in their hands.
+// Add new kinds here as more carryable quest items get networked.
+enum CarryKind : uint8_t {
+    CARRY_KIND_NONE   = 0,
+    CARRY_KIND_ORANGE = 1, // ACTOR_29_ORANGE_COLLECTIBLE / Chimpy
 };
 
 struct PlayerStatePacket {
@@ -195,6 +204,7 @@ struct PlayerStatePacket {
     uint8_t transformation;
     uint32_t bs_state;
     float horizontal_velocity;
+    uint8_t carry_kind;     // CarryKind enum — visual prop replicated to ghosts
 };
 
 // --- World state packets (Phase 3) ---
@@ -274,6 +284,7 @@ enum WorldFlagType : uint8_t {
     FLAG_BLUBBER_ACTION    = 14,  // TTC Blubber delivery decrement + quest-complete despawn (flag_index=sub-action 0/1)
     FLAG_TREASUREHUNT_ACTION = 15, // TTC Treasure Hunt step counter sync (value=new chtreasureHunt_puzzleCurrentStep 0-6)
     FLAG_SHARED_ITEM       = 16,  // Shared inventory (eggs/red/gold feathers): flag_index = item_e, value = signed int8 diff
+    FLAG_DIALOG_COMPLETE_ANIM = 17, // Generic NPC post-dialog animation cue (flag_index = npc tag id, value = optional u8 param)
 };
 
 struct WorldFlagPacket {

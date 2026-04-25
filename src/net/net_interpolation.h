@@ -31,6 +31,7 @@ struct PositionSnapshot {
     uint8_t transformation = 0;
     uint8_t bs_state = 0;
     float horizontal_velocity = 0.0f;
+    uint8_t carry_kind = 0;  // CarryKind enum (visual-only)
     double timestamp = 0.0;
     bool valid = false;
 };
@@ -53,6 +54,7 @@ struct InterpolatedState {
     uint8_t transformation = 0;
     uint8_t bs_state = 0;
     float horizontal_velocity = 0.0f;
+    uint8_t carry_kind = 0;  // CarryKind enum (visual-only)
     bool active = false;
     bool animation_changed = false;
 };
