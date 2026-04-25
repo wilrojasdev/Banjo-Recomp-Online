@@ -1,12 +1,17 @@
 #include "patches.h"
 #include "functions.h"
 #include "enums.h"
+#include "core2/ba/physics.h"
 
 extern int  bsjig_inJiggyJig(s32 state);
 extern s32  player_getWaterState(void);
 extern s32  player_movementGroup(void);
 extern void func_8029CDA0(void);
 extern void func_8029CCC4(void);
+extern f32  func_8029B41C(void);
+extern void yaw_setIdeal(f32 yaw);
+extern void yaw_setUpdateState(s32 state);
+extern void func_8029957C(s32);
 
 // Make jiggy collection in plain Banjo behave like the transformed/swimming
 // path: skip the BS_44_JIG_JIGGY ceremony entirely, no dance actor spawn,
@@ -32,4 +37,24 @@ RECOMP_PATCH s32 func_80295EE0(s32 arg0) {
         func_8029CCC4();
     }
     return arg0;
+}
+
+// Companion patch to the BS_44 skip above. __baMarker_8028B848 fires the
+// "first jiggy" / "10 jiggies" dialog on MM_LOBBY and MM main, and when the
+// player is plain Banjo it calls __baMarker_8028B7F4 to face them at the
+// camera + freeze velocity for the dance. Vanilla also sets the dynamic
+// camera mode to 6 via func_8029151C(0xC), expecting BS_44 to clear it back
+// via bsjig_jiggy_end → func_80291548 → func_80291488(2). We never enter
+// BS_44, so D_8037C062 stays at 6, and cameraMode_update's `case 0x6: break`
+// drops the C-stick camera handler entirely — the camera locks and the
+// player can't aim it anymore. Replicate the harmless setup (yaw, physics)
+// and drop the func_8029151C call. The dialog still appears with the player
+// facing the camera; C buttons keep working.
+RECOMP_PATCH void __baMarker_8028B7F4(void) {
+    yaw_setIdeal(func_8029B41C());
+    yaw_setUpdateState(1);
+    func_8029957C(3);
+    baphysics_set_type(BA_PHYSICS_NORMAL);
+    baphysics_set_target_horizontal_velocity(0.0f);
+    // Intentionally omit: func_8029151C(0xC) — see comment above.
 }

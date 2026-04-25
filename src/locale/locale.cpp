@@ -126,6 +126,10 @@ namespace {
             {"coopnet.offline",         "CoopNet: Offline"},
             {"coopnet.checking",        "CoopNet: Checking..."},
 
+            {"chat.player_joined",      "{name} joined the game"},
+            {"chat.player_left",        "{name} left the game"},
+            {"chat.player_placeholder", "Player {n}"},
+
             {"quit.title_online",       "Leave Session?"},
             {"quit.body_online",        "You will be disconnected from the current session."},
             {"quit.leave",              "Disconnect"},
@@ -344,6 +348,10 @@ namespace {
             {"coopnet.online",          "CoopNet: En linea"},
             {"coopnet.offline",         "CoopNet: Desconectado"},
             {"coopnet.checking",        "CoopNet: Comprobando..."},
+
+            {"chat.player_joined",      "{name} se ha unido a la partida"},
+            {"chat.player_left",        "{name} ha salido de la partida"},
+            {"chat.player_placeholder", "Jugador {n}"},
 
             {"quit.title_online",       "Salir de la Sesion?"},
             {"quit.body_online",        "Se te desconectara de la sesion actual."},
@@ -564,6 +572,10 @@ namespace {
             {"coopnet.offline",         "CoopNet: Hors ligne"},
             {"coopnet.checking",        "CoopNet: Verification..."},
 
+            {"chat.player_joined",      "{name} a rejoint la partie"},
+            {"chat.player_left",        "{name} a quitte la partie"},
+            {"chat.player_placeholder", "Joueur {n}"},
+
             {"quit.title_online",       "Quitter la Session ?"},
             {"quit.body_online",        "Vous serez deconnecte de la session en cours."},
             {"quit.leave",              "Se deconnecter"},
@@ -782,6 +794,10 @@ namespace {
             {"coopnet.online",          "CoopNet: Online"},
             {"coopnet.offline",         "CoopNet: Offline"},
             {"coopnet.checking",        "CoopNet: Prufe..."},
+
+            {"chat.player_joined",      "{name} ist dem Spiel beigetreten"},
+            {"chat.player_left",        "{name} hat das Spiel verlassen"},
+            {"chat.player_placeholder", "Spieler {n}"},
 
             {"quit.title_online",       "Sitzung verlassen?"},
             {"quit.body_online",        "Du wirst von der aktuellen Sitzung getrennt."},
@@ -1002,6 +1018,10 @@ namespace {
             {"coopnet.offline",         "CoopNet: Offline"},
             {"coopnet.checking",        "CoopNet: Verificando..."},
 
+            {"chat.player_joined",      "{name} entrou na partida"},
+            {"chat.player_left",        "{name} saiu da partida"},
+            {"chat.player_placeholder", "Jogador {n}"},
+
             {"quit.title_online",       "Sair da Sessao?"},
             {"quit.body_online",        "Voce sera desconectado da sessao atual."},
             {"quit.leave",              "Desconectar"},
@@ -1218,5 +1238,15 @@ namespace banjo::locale {
         static thread_local std::string missing;
         missing = k;
         return missing;
+    }
+
+    std::string tr_format(const char* key, const char* token, const std::string& value) {
+        std::string out = tr(key); // copy — we mutate locally
+        std::string needle = std::string("{") + token + "}";
+        size_t pos = out.find(needle);
+        if (pos != std::string::npos) {
+            out.replace(pos, needle.size(), value);
+        }
+        return out;
     }
 }

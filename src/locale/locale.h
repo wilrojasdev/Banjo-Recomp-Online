@@ -20,6 +20,10 @@ namespace banjo::locale {
     // Translate a key to the current language. Falls back to English, then to the key itself.
     const std::string& tr(const char* key);
 
+    // Translate a key and substitute `{token}` with `value`. Used for messages
+    // with embedded names/numbers (e.g. "{name} joined the game").
+    std::string tr_format(const char* key, const char* token, const std::string& value);
+
     // Persist `lang` to language.txt right now, regardless of the recompui::config
     // commit/apply lifecycle. Use this when the user makes a choice that should
     // survive a restart even if they didn't formally Apply (e.g. clicking a

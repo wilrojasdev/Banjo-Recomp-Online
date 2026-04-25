@@ -50,6 +50,13 @@ extern void player_getPosition(f32 pos[3]);
 
 // Jiggy spawn (for jinjo completion)
 extern void jiggy_spawn(enum jiggy_e jiggy_id, f32 pos[3]);
+// Silent variant: instantiates the jiggy actor + sets the spawned bit
+// without playing the spawn music, fade, or core1_ce60 lock counter —
+// used for late-join recovery where the host already played the
+// cinematic and we just need the actor in our world.
+extern void codeABC00_spawnJiggyAtLocation(enum jiggy_e jiggy_id, f32 pos[3]);
+extern int jiggyscore_isSpawned(enum jiggy_e jiggy_id);
+extern Actor *actorArray_findActorFromMarkerId(s32 marker_id);
 
 // Bundle/item drop system (honeycomb on enemy kill)
 extern Actor *__bundle_spawnFromFirstActor(enum bundle_e bundle_id, Actor *actor);
@@ -493,6 +500,34 @@ static void poll_collected_jinjos(void) {
         if (collected & bit) {
             u32 marker_id = jinjo_bit_to_marker_id(bit);
             if (marker_id) despawn_actor_by_marker_id(marker_id);
+        }
+    }
+
+    // Recovery spawn for the jinjo-completion jiggy: if the shared
+    // bitfield is complete but the jiggy actor isn't in our world (and
+    // hasn't been collected yet), spawn it silently. Covers two cases
+    // the realtime collectible event can't catch on the join:
+    //   - Late join: host finished the 5th jinjo before we connected,
+    //     so we received the bitfield via state sync but no <5→5
+    //     transition event ever fires here.
+    //   - Cross-submap: we were in a different sub-area when the host
+    //     completed it, so process_collectible_event's same_map guard
+    //     skipped the spawn and never retries.
+    // Use codeABC00_spawnJiggyAtLocation (not jiggy_spawn) so we don't
+    // replay the music + 3.5s core1_ce60 lock — the host already did
+    // that ceremony when they actually completed the 5th jinjo. Firing
+    // the lock here would stack with the player's normal pickup-of-
+    // -jiggy core1_ce60 lock and leave the camera/input frozen if the
+    // join immediately walks into it. jiggyscore_isSpawned flips true
+    // after the spawn, so this self-throttles to once per level entry.
+    if (collected == 0x1F) {
+        s32 jinjo_jiggy_id = 10 * cur_level - 9;
+        if (jinjo_jiggy_id > 0 && jinjo_jiggy_id < 0x65 &&
+            !jiggyscore_isSpawned(jinjo_jiggy_id)) {
+            f32 pos[3];
+            player_getPosition(pos);
+            pos[1] += 50.0f;
+            codeABC00_spawnJiggyAtLocation(jinjo_jiggy_id, pos);
         }
     }
 }
@@ -1360,13 +1395,26 @@ static void process_collectible_event(WorldEventData *evt) {
                     item_adjustByDiffWithHud(ITEM_12_JINJOS, actual_new);
                     prev_jinjo_bits = item_getCount(ITEM_12_JINJOS);
                 }
-                // Fire the jinjo-completion jiggy only on the transition
-                // <5 -> 5. Guards against a re-broadcast spawning a dup.
+                // Fire the jinjo-completion jiggy on the <5→5
+                // transition. Prefer the local jinjo actor's position
+                // (matches where the host's vanilla path spawned it);
+                // fall back to the sender's player position. jiggy_spawn
+                // is idempotent on the marker, so a duplicate event
+                // won't double-spawn — and poll_collected_jinjos covers
+                // the cross-submap case where same_map is false here.
                 if (!was_complete && now_complete && same_map) {
                     f32 jiggy_pos[3];
-                    jiggy_pos[0] = evt->coll_pos_x;
-                    jiggy_pos[1] = evt->coll_pos_y + 50.0f;
-                    jiggy_pos[2] = evt->coll_pos_z;
+                    u32 marker_id = jinjo_bit_to_marker_id(target_bits);
+                    Actor *jinjo_actor = marker_id ? actorArray_findActorFromMarkerId((s32)marker_id) : NULL;
+                    if (jinjo_actor) {
+                        jiggy_pos[0] = jinjo_actor->position[0];
+                        jiggy_pos[1] = jinjo_actor->position[1] + 50.0f;
+                        jiggy_pos[2] = jinjo_actor->position[2];
+                    } else {
+                        jiggy_pos[0] = evt->coll_pos_x;
+                        jiggy_pos[1] = evt->coll_pos_y + 50.0f;
+                        jiggy_pos[2] = evt->coll_pos_z;
+                    }
                     jiggy_spawn(10 * (s32)level_get() - 9, jiggy_pos);
                 }
             }
@@ -2210,6 +2258,12 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     {
         extern void bkrecomp_net_treasurehunt_tick(void);
         bkrecomp_net_treasurehunt_tick();
+    }
+
+    // Shared inventory (eggs / red feathers / gold feathers)
+    {
+        extern void bkrecomp_net_shared_items_tick(void);
+        bkrecomp_net_shared_items_tick();
     }
 
     WorldEventData evt;

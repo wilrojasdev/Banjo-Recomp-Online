@@ -90,6 +90,9 @@ extern void bkrecomp_net_blubber_on_local_flag1_set(void);
 // Treasure hunt (red X chain + buried treasure) sync
 extern void bkrecomp_net_treasurehunt_remote_apply(u32 action, u32 value);
 
+// Shared items (eggs/feathers) sync
+extern void bkrecomp_net_shared_item_remote_apply(u32 item, u32 value);
+
 // Ability system
 extern s32 ability_hasLearned(s32 ability);
 extern void ability_getSizeAndPtr(s32 *size, u8 **addr);
@@ -461,6 +464,8 @@ RECOMP_EXPORT void bkrecomp_net_process_flag_event(void *data) {
         bkrecomp_net_blubber_remote_apply((u32)idx, (u32)evt->flag_value);
     } else if (ft == 15) { /* NET_FLAG_TREASUREHUNT_ACTION */
         bkrecomp_net_treasurehunt_remote_apply((u32)idx, (u32)evt->flag_value);
+    } else if (ft == 16) { /* NET_FLAG_SHARED_ITEM */
+        bkrecomp_net_shared_item_remote_apply((u32)idx, (u32)evt->flag_value);
     } else if (ft == NET_FLAG_MUMBO_ACTION) {
         if (idx == MUMBO_ACTION_LOCK) {
             if (net_mumbo_lock((u8)val)) {

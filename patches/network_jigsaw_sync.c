@@ -86,6 +86,55 @@ extern void func_80347958(void);
 extern void gcpausemenu_80314AC8(s32);
 extern s32 item_adjustByDiffWithHud(enum item_e, s32);
 extern void func_80324DBC(f32, enum asset_e, s32, f32[3], ActorMarker *, void (*)(ActorMarker *, enum asset_e, s32), void (*)(ActorMarker *, enum asset_e, s32));
+extern Actor *actorArray_findActorFromActorId(enum actor_e actor_id);
+extern void marker_despawn(ActorMarker *marker);
+extern void subaddie_set_state_with_direction(Actor *this, s32 myAnimId, f32 anim_start_position, s32 direction);
+
+// Apply the world-entrance door's visual "open" state to a currently spawned
+// door actor. Mirrors the volatile_initialized branches in lair/code_0.c
+// (door actor init) but works on an already-initialized actor — needed when a
+// remote peer is in the world's lobby at the moment the puzzle is completed,
+// since their door has already initialized in the closed state.
+static void open_world_door_visual(s32 puzzle_id) {
+    enum actor_e door_id;
+    Actor *door;
+
+    switch (puzzle_id) {
+        case 1: door_id = ACTOR_20E_MM_ENTRANCE_DOOR;       break;
+        case 2: door_id = ACTOR_211_TCC_ENTRANCE_CHEST_LID; break;
+        case 3: door_id = ACTOR_212_CC_ENTRANCE_BARS;       break;
+        case 4: door_id = ACTOR_210_BGS_ENTRANCE_DOOR;      break;
+        case 5: door_id = ACTOR_235_FP_ENTANCE_DOOR;        break;
+        case 6: door_id = ACTOR_226_GV_ENTRANCE;            break;
+        case 7: door_id = ACTOR_228_MMM_ENTRANCE_DOOR;      break;
+        case 8: door_id = ACTOR_20F_RBB_ENTRANCE_DOOR;      break;
+        case 9: door_id = ACTOR_234_CCW_ENTRANCE_DOOR;      break;
+        case 0xA: door_id = ACTOR_2E5_DOOR_OF_GRUNTY;       break;
+        default: return;
+    }
+
+    door = actorArray_findActorFromActorId(door_id);
+    if (door == NULL) return;  // Door not spawned in current map — nothing to do.
+
+    switch (puzzle_id) {
+        case 1: door->yaw = 270.0f; break;        // MM
+        case 2: door->pitch = 90.0f; break;       // TTC
+        case 4: door->yaw = 90.0f; break;         // BGS
+        case 7: door->yaw = 90.0f; break;         // MMM
+        case 5: {                                 // FP — also despawn paired actor 0x236
+            Actor *paired = actorArray_findActorFromActorId((enum actor_e)0x236);
+            if (paired != NULL) marker_despawn(paired->marker);
+            marker_despawn(door->marker);
+            break;
+        }
+        case 3: case 6: case 8: case 9:           // CC, GV, RBB, CCW
+            marker_despawn(door->marker);
+            break;
+        case 0xA:                                 // Grunty's door
+            subaddie_set_state_with_direction(door, 0x1B, 0.999f, 1);
+            break;
+    }
+}
 
 // PICTURE_INFO table (needed for flag sync)
 typedef struct {
@@ -792,15 +841,46 @@ RECOMP_EXPORT void bkrecomp_net_process_jigsaw_event(u32 flag_index, u32 value, 
         }
     }
     else if (action == JIGSAW_ACTION_COMPLETE) {
-        comusic_playTrack(COMUSIC_65_WORLD_OPENING_B);
-        if (actor) {
-            if (puzzle_id == 1) {
-                func_80324DBC(1.0f, 0xF7E, 4, NULL, actor->marker, gruntyLaughCallback, NULL);
-            } else if (puzzle_id == 0xA) {
-                func_80324DBC(1.0f, 0xFAC, 4, NULL, actor->marker, gruntyLaughCallback, NULL);
-            }
-            timedFunc_set_1(2.0f, (GenFunction_1) afterPictureComplete, (s32) actor->marker);
+        // On remote peers, open the world without playing the blocking cinematic.
+        // Two flags are involved:
+        //
+        //   1. "cinematic-seen" flag (0x28..0x30 for puzzles 1-9, 0xE2 for Grunty).
+        //      Pre-setting it makes func_802D5178 (lair frame poll) skip the
+        //      world-opening cutscene when the levelSpecificFlags arrives via
+        //      Phase 9 flag sync 2s later.
+        //
+        //   2. "world-open" persistent flag (FILEPROG_31_MM_OPEN..FILEPROG_39_CCW_OPEN
+        //      / FILEPROG_E2_DOOR_OF_GRUNTY_OPEN). The world-entrance door actors
+        //      check this on init to determine their visual state and to gate
+        //      level access. Locally the door actor sets it during init when the
+        //      puzzle is complete (lair/code_0.c), but that only happens when the
+        //      player enters the lobby. We set it eagerly here so the world is
+        //      open for remote regardless of where they are.
+        //
+        // Both flags broadcast back via Phase 9 — the remote_flag_guard prevents
+        // an echo loop, and any duplicate set on the puzzle-completer is harmless.
+        s32 cinematic_flag = -1;
+        s32 world_open_flag = -1;
+        if (puzzle_id >= 1 && puzzle_id <= 9) {
+            cinematic_flag  = 0x27 + puzzle_id;  // MM=0x28..CCW=0x30
+            world_open_flag = 0x30 + puzzle_id;  // FILEPROG_31..FILEPROG_39
+        } else if (puzzle_id == 0xA) {
+            cinematic_flag  = 0xE2;              // Grunty's door
+            world_open_flag = 0xE2;              // (same flag for Grunty)
         }
+        if (cinematic_flag >= 0) {
+            fileProgressFlag_set((enum file_progress_e)cinematic_flag, TRUE);
+        }
+        if (world_open_flag >= 0 && world_open_flag != cinematic_flag) {
+            fileProgressFlag_set((enum file_progress_e)world_open_flag, TRUE);
+        }
+
+        // If the remote peer is currently in the world's lobby map, the door
+        // actor has already initialized in the closed state — its
+        // volatile_initialized block (which reads FILEPROG_xx_OPEN to set the
+        // visual) won't run again. Apply the open visual in place, delayed 3s
+        // so it coincides with the local player's cinematic timing.
+        timedFunc_set_1(3.0f, (GenFunction_1) open_world_door_visual, (s32) puzzle_id);
     }
 
     bkrecomp_net_set_remote_flag_guard(FALSE);

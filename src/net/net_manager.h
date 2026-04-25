@@ -192,6 +192,11 @@ public:
     PlayerInfo get_player_info(uint8_t player_id) const;
     void clear_player_roster();
     void broadcast_local_name();  // Send PlayerJoinPacket with our name
+    // Host-side: mark a freshly-connected peer as present in the roster with a
+    // placeholder name and emit the "joined" chat message right away. Avoids
+    // depending on the joiner's broadcast_local_name() arriving before the UI
+    // can reflect their presence.
+    void register_remote_player_locally(uint8_t player_id);
 
     // Accessors
     bool is_connected() const { return state_ == ConnectionState::Hosting || state_ == ConnectionState::Connected; }

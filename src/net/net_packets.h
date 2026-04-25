@@ -273,6 +273,7 @@ enum WorldFlagType : uint8_t {
     FLAG_NIPPER_ACTION     = 13,  // TTC Nipper state + lifetime sync (flag_index=sub-action, value=new state / lifetime/40 / has_met_before)
     FLAG_BLUBBER_ACTION    = 14,  // TTC Blubber delivery decrement + quest-complete despawn (flag_index=sub-action 0/1)
     FLAG_TREASUREHUNT_ACTION = 15, // TTC Treasure Hunt step counter sync (value=new chtreasureHunt_puzzleCurrentStep 0-6)
+    FLAG_SHARED_ITEM       = 16,  // Shared inventory (eggs/red/gold feathers): flag_index = item_e, value = signed int8 diff
 };
 
 struct WorldFlagPacket {

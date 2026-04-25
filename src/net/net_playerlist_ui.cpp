@@ -10,6 +10,7 @@
 
 #include <string>
 #include <cstdio>
+#include <atomic>
 
 namespace bknet {
 
@@ -17,7 +18,7 @@ using namespace recompui;
 
 static ContextId playerlist_context;
 static bool playerlist_initialized = false;
-static bool playerlist_visible = false;
+static std::atomic<bool> playerlist_manual_visible{false};
 
 // UI elements
 static Label* title_label = nullptr;
@@ -42,7 +43,7 @@ static const Color player_dot_colors[] = {
 
 void playerlist_ui_init() {
     playerlist_initialized = false;
-    playerlist_visible = false;
+    playerlist_manual_visible.store(false);
 }
 
 static void ensure_init() {
@@ -145,18 +146,18 @@ static void ensure_init() {
 }
 
 void playerlist_ui_set_visible(bool visible) {
-    playerlist_visible = visible;
+    playerlist_manual_visible.store(visible);
 }
 
 bool playerlist_ui_is_visible() {
-    return playerlist_visible;
+    return playerlist_manual_visible.load();
 }
 
 void playerlist_ui_update() {
     auto& net = NetworkManager::instance();
 
     if (!net.is_connected()) {
-        playerlist_visible = false;
+        playerlist_manual_visible.store(false);
         if (playerlist_initialized && is_context_shown(playerlist_context)) {
             hide_context(playerlist_context);
         }
@@ -165,7 +166,9 @@ void playerlist_ui_update() {
 
     ensure_init();
 
-    if (!playerlist_visible) {
+    bool visible = playerlist_manual_visible.load();
+
+    if (!visible) {
         if (is_context_shown(playerlist_context)) {
             hide_context(playerlist_context);
         }

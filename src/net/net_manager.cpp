@@ -1,4 +1,6 @@
 #include "net_manager.h"
+#include "net_playerlist_ui.h"
+#include "../locale/locale.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +85,10 @@ bool NetworkManager::host_game() {
         std::printf("[Network] Player %u joined the game\n", player_id);
         request_host_eeprom_send(player_id);  // MIPS will read EEPROM and ship via send_host_eeprom
         request_full_sync(player_id);
+        // Register the joiner in the host's roster immediately with a placeholder
+        // name + system message. The joiner's broadcast_local_name() will arrive
+        // shortly and update the name silently (handle_packet skips re-announce).
+        register_remote_player_locally(player_id);
         // Send host's name directly to the new player
         {
             const auto& config = get_config();
@@ -119,8 +125,11 @@ bool NetworkManager::host_game() {
                 player_roster_[player_id].connected = false;
             }
         }
-        if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
-        add_system_message(leave_name + " left the game");
+        if (leave_name.empty()) {
+            leave_name = banjo::locale::tr_format("chat.player_placeholder", "n",
+                std::to_string(player_id + 1));
+        }
+        add_system_message(banjo::locale::tr_format("chat.player_left", "name", leave_name));
         interpolation_.remove_player(player_id);
         // Release world ownership for this player's level
         uint32_t level;
@@ -244,6 +253,10 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
         send_version_check(player_id);
         request_host_eeprom_send(player_id);
         request_full_sync(player_id);
+        // Register the joiner in the host's roster immediately with a placeholder
+        // name + system message + flash the player list. Joiner's broadcast_local_name()
+        // arrives shortly and updates the name silently (handle_packet skips re-announce).
+        register_remote_player_locally(player_id);
         // Send host's name directly to the new player
         {
             const auto& config = get_config();
@@ -280,8 +293,11 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
                 player_roster_[player_id].connected = false;
             }
         }
-        if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
-        add_system_message(leave_name + " left the game");
+        if (leave_name.empty()) {
+            leave_name = banjo::locale::tr_format("chat.player_placeholder", "n",
+                std::to_string(player_id + 1));
+        }
+        add_system_message(banjo::locale::tr_format("chat.player_left", "name", leave_name));
         interpolation_.remove_player(player_id);
         reset_peer_state(player_id);
         uint32_t level;
@@ -339,8 +355,11 @@ bool NetworkManager::coopnet_join_lobby(uint64_t lobby_id, const std::string& pa
                     player_roster_[player_id].connected = false;
                 }
             }
-            if (leave_name.empty()) leave_name = "Player " + std::to_string(player_id + 1);
-            add_system_message(leave_name + " left the game");
+            if (leave_name.empty()) {
+                leave_name = banjo::locale::tr_format("chat.player_placeholder", "n",
+                    std::to_string(player_id + 1));
+            }
+            add_system_message(banjo::locale::tr_format("chat.player_left", "name", leave_name));
             interpolation_.remove_player(player_id);
             reset_peer_state(player_id);
             BKNET_LOG(Info, "Player %u (%s) left", player_id, leave_name.c_str());
@@ -807,14 +826,32 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
                 pkt.player_name[31] = '\0'; // safety
                 std::string name(pkt.player_name);
                 if (name.empty()) name = "Player";
-                set_player_name(pkt.header.player_id, name);
-                // Only show "joined" if: not ourselves, AND initial roster sync is done
-                // (prevents showing "host joined" when joiner receives roster)
-                if (pkt.header.player_id != local_player_id_ && initial_sync_done_.load()) {
-                    add_system_message(name + " joined the game");
+
+                // Was this player already in our roster? On host, we register
+                // joiners on connect_callback before this packet arrives — so a
+                // PlayerJoin from broadcast_local_name should silently update
+                // the name without re-announcing "X joined".
+                bool was_connected = false;
+                {
+                    std::lock_guard<std::mutex> lock(roster_mutex_);
+                    if (pkt.header.player_id < MAX_PLAYERS) {
+                        was_connected = player_roster_[pkt.header.player_id].connected;
+                    }
                 }
-                std::printf("[Network] Player %u joined as '%s' (sync_done=%d)\n",
-                    pkt.header.player_id, name.c_str(), initial_sync_done_.load() ? 1 : 0);
+
+                set_player_name(pkt.header.player_id, name);
+
+                // Show "X joined" only if: not ourselves, initial roster sync done,
+                // AND the player wasn't already in the roster (otherwise we'd
+                // double-announce when broadcast_local_name follows host's pre-register).
+                if (pkt.header.player_id != local_player_id_ &&
+                    initial_sync_done_.load() &&
+                    !was_connected) {
+                    add_system_message(banjo::locale::tr_format("chat.player_joined", "name", name));
+                }
+                std::printf("[Network] Player %u joined as '%s' (sync_done=%d, was_connected=%d)\n",
+                    pkt.header.player_id, name.c_str(),
+                    initial_sync_done_.load() ? 1 : 0, was_connected ? 1 : 0);
             }
             break;
         }
@@ -830,9 +867,12 @@ void NetworkManager::handle_packet(uint8_t from_player_id, const uint8_t* data, 
                         player_roster_[pkt.header.player_id].connected = false;
                     }
                 }
-                if (leave_name.empty()) leave_name = "Player " + std::to_string(pkt.header.player_id + 1);
+                if (leave_name.empty()) {
+                    leave_name = banjo::locale::tr_format("chat.player_placeholder", "n",
+                        std::to_string(pkt.header.player_id + 1));
+                }
                 interpolation_.remove_player(pkt.header.player_id);
-                add_system_message(leave_name + " left the game");
+                add_system_message(banjo::locale::tr_format("chat.player_left", "name", leave_name));
                 std::printf("[Network] Player %u (%s) left\n", pkt.header.player_id, leave_name.c_str());
             }
             break;
@@ -2063,6 +2103,28 @@ void NetworkManager::clear_player_roster() {
     for (uint8_t i = 0; i < MAX_PLAYERS; i++) {
         player_roster_[i] = {};
     }
+}
+
+void NetworkManager::register_remote_player_locally(uint8_t player_id) {
+    if (player_id >= MAX_PLAYERS || player_id == local_player_id_) return;
+
+    std::string placeholder = banjo::locale::tr_format("chat.player_placeholder", "n",
+        std::to_string(player_id + 1));
+
+    bool was_connected = false;
+    {
+        std::lock_guard<std::mutex> lock(roster_mutex_);
+        was_connected = player_roster_[player_id].connected;
+        if (!was_connected) {
+            player_roster_[player_id].name = placeholder;
+            player_roster_[player_id].connected = true;
+        }
+    }
+
+    if (was_connected) return; // already announced — nothing to do
+
+    add_system_message(banjo::locale::tr_format("chat.player_joined", "name", placeholder));
+    std::printf("[Roster] Pre-registered player %u (placeholder name)\n", player_id);
 }
 
 void NetworkManager::broadcast_local_name() {
