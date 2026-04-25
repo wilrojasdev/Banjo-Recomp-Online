@@ -194,6 +194,7 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_patches.cpp
     ${CMAKE_SOURCE_DIR}/src/main/theme.cpp
+    ${CMAKE_SOURCE_DIR}/src/main/embedded_mods.cpp
 
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp
     ${CMAKE_SOURCE_DIR}/src/game/debug.cpp
@@ -217,6 +218,8 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/net/net_playerlist_ui.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_nametag_ui.cpp
     ${CMAKE_SOURCE_DIR}/src/net/net_coopnet.cpp
+
+    ${CMAKE_SOURCE_DIR}/src/locale/locale.cpp
 )
 
 target_include_directories(BanjoRecompiled PRIVATE
@@ -418,15 +421,23 @@ target_link_libraries(BanjoRecompiled PRIVATE
     coopnet
 )
 
-# Embed all .nrm files in the "mods" directory
-file(GLOB NRM_FILES "${CMAKE_SOURCE_DIR}/mods/*.nrm")
+# Embed all bundled mod files (.nrm code mods and .rtz texture packs) in the
+# "embedded_mods" directory. They get registered via
+# recomp::mods::register_embedded_mod() at startup so users don't need to install
+# them manually. They are also hidden from the in-launcher mod list
+# (see embedded_mods.cpp). Mixing .nrm + .rtz lets us bundle translations whose
+# texture-replacement assets ship as a separate texture pack (e.g. PT-BR).
+file(GLOB NRM_FILES
+    "${CMAKE_SOURCE_DIR}/embedded_mods/*.nrm"
+    "${CMAKE_SOURCE_DIR}/embedded_mods/*.rtz")
 
 set(GENERATED_NRM_SOURCES "")
+set(GENERATED_NRM_HEADERS "")
 
 foreach(NRM_FILE ${NRM_FILES})
     get_filename_component(NRM_NAME ${NRM_FILE} NAME_WE)
-    set(OUT_C "${CMAKE_CURRENT_BINARY_DIR}/mods/${NRM_NAME}.c")
-    set(OUT_H "${CMAKE_CURRENT_BINARY_DIR}/mods/${NRM_NAME}.h")
+    set(OUT_C "${CMAKE_CURRENT_BINARY_DIR}/embedded_mods/${NRM_NAME}.c")
+    set(OUT_H "${CMAKE_CURRENT_BINARY_DIR}/embedded_mods/${NRM_NAME}.h")
 
     add_custom_command(
         OUTPUT ${OUT_C} ${OUT_H}
@@ -435,9 +446,15 @@ foreach(NRM_FILE ${NRM_FILES})
     )
 
     list(APPEND GENERATED_NRM_SOURCES ${OUT_C})
+    list(APPEND GENERATED_NRM_HEADERS ${OUT_H})
 endforeach()
 
 target_sources(BanjoRecompiled PRIVATE ${GENERATED_NRM_SOURCES})
+
+# Custom target so the embedded_mods.cpp translation unit can depend on the
+# generated headers (otherwise the first build can race the file_to_c step).
+add_custom_target(embedded_mod_headers DEPENDS ${GENERATED_NRM_HEADERS})
+add_dependencies(BanjoRecompiled embedded_mod_headers)
 
 target_sources(BanjoRecompiled PRIVATE ${SOURCES})
 

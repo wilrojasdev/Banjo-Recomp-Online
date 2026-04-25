@@ -124,14 +124,15 @@ void CoopNetTransport::update() {
     coopnet_update();
 }
 
-bool CoopNetTransport::create_lobby(const std::string& password, const std::string& description, uint16_t max_players) {
+bool CoopNetTransport::create_lobby(const std::string& password, const std::string& description, uint16_t max_players,
+                                    const std::string& host_name) {
     if (!signaling_connected_) return false;
 
     CoopNetRc rc = coopnet_lobby_create(
-        "BK64-Online",     // game
-        "1.0",             // version
-        "",                // hostName (will use player name from begin)
-        "coop",            // mode
+        "BK64-Online",           // game
+        "1.0",                   // version
+        host_name.c_str(),       // hostName (explicit; empty string is not substituted server-side)
+        "coop",                  // mode
         max_players,
         password.c_str(),
         description.c_str()

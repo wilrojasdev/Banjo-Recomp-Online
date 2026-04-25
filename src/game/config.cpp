@@ -1,4 +1,6 @@
 #include "banjo_config.h"
+#include "../locale/locale.h"
+#include "banjo_launcher.h"
 #include "recompui/recompui.h"
 #include "recompui/config.h"
 #include "recompinput/recompinput.h"
@@ -22,34 +24,109 @@
 #endif
 
 static void add_general_options(recomp::config::Config &config) {
-    using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+    using EnumOptionVector = std::vector<recomp::config::ConfigOptionEnumOption>;
 
-    static EnumOptionVector note_saving_mode_options = {
-        {banjo::NoteSavingMode::Off, "Off", "Off"},
-        {banjo::NoteSavingMode::On, "On", "On"},
+    EnumOptionVector language_options = {
+        {banjo::Language::English,    "English",    "English"},
+        {banjo::Language::Spanish,    "Spanish",    "Espanol"},
+        {banjo::Language::French,     "French",     "Francais"},
+        {banjo::Language::German,     "German",     "Deutsch"},
+        {banjo::Language::Portuguese, "Portuguese", "Portugues (BR)"},
+    };
+    config.add_enum_option(
+        banjo::configkeys::general::language,
+        banjo::locale::tr("settings.language.title"),
+        banjo::locale::tr("settings.language.desc"),
+        language_options,
+        banjo::Language::English
+    );
+    // Show the restart prompt the moment the user picks a different language.
+    // The General tab uses requires_confirmation=false (see create_general_tab in
+    // ui_config_tab_general.cpp), so radio clicks fire Permanent — NOT Temporary.
+    // We accept either, just skipping Load (initial config read at startup).
+    //
+    // Two-button choice prompt: confirm (Restart Now) commits both files and
+    // relaunches; cancel (button OR X / ESC / click-outside) reverts the picker
+    // selection back to the previous language so the UI stays consistent and the
+    // user's saved config doesn't drift from language.txt.
+    //
+    // Re-entrancy guard `s_in_revert` prevents the revert's own set_option_value
+    // call from re-firing this callback and showing a second prompt.
+    {
+        static bool s_lang_prompt_shown = false;
+        static bool s_in_revert = false;
+        config.add_option_change_callback(
+            banjo::configkeys::general::language,
+            [](recomp::config::ConfigValueVariant cur, recomp::config::ConfigValueVariant prev,
+               recomp::config::OptionChangeContext ctx) {
+                if (ctx == recomp::config::OptionChangeContext::Load) return;
+                if (s_in_revert) return;
+                if (s_lang_prompt_shown) return;
+                s_lang_prompt_shown = true;
+
+                auto new_lang = static_cast<banjo::Language>(std::get<uint32_t>(cur));
+                uint32_t prev_raw = std::get<uint32_t>(prev);
+
+                recompui::open_choice_prompt(
+                    banjo::locale::tr("settings.language_restart_title"),
+                    banjo::locale::tr("settings.language_restart_body"),
+                    banjo::locale::tr("settings.language_restart_btn"),  // confirm
+                    banjo::locale::tr("common.cancel"),                  // cancel
+                    [new_lang]() {
+                        // Confirm: persist BOTH files and relaunch. The general.json
+                        // save is what makes the picker remember the new selection on
+                        // next launch; without it the picker would show the old value
+                        // even though language.txt (and so the in-game text) advanced.
+                        banjo::locale::commit_language_to_disk(new_lang);
+                        recompui::config::get_general_config().save_config();
+                        banjo::request_return_to_launcher();
+                    },
+                    [prev_raw]() {
+                        // Cancel (button, X, ESC, click-outside): roll the picker
+                        // back to its previous value so the on-screen state matches
+                        // the language that's actually still in effect.
+                        s_in_revert = true;
+                        recompui::config::get_general_config().set_option_value(
+                            banjo::configkeys::general::language,
+                            recomp::config::ConfigValueVariant{ prev_raw }
+                        );
+                        s_in_revert = false;
+                        s_lang_prompt_shown = false;
+                    },
+                    recompui::ButtonStyle::Primary,    // confirm style
+                    recompui::ButtonStyle::Secondary,  // cancel style (neutral)
+                    true                               // focus on cancel — safer default
+                );
+            }
+        );
+    }
+
+    EnumOptionVector note_saving_mode_options = {
+        {banjo::NoteSavingMode::Off, "Off", banjo::locale::tr("opt.off")},
+        {banjo::NoteSavingMode::On,  "On",  banjo::locale::tr("opt.on")},
     };
     config.add_enum_option(
         banjo::configkeys::general::note_saving_mode,
-        "Note Saving",
-        "Saves collected notes so that you don't need to collect them again when revisiting a level. <recomp-color primary>On</recomp-color> is the default, while <recomp-color primary>off</recomp-color> matches the original game.",
+        banjo::locale::tr("settings.note_saving.title"),
+        banjo::locale::tr("settings.note_saving.desc"),
         note_saving_mode_options,
         banjo::NoteSavingMode::On
     );
-    static EnumOptionVector analog_cam_mode_options = {
-        {banjo::AnalogCamMode::Off, "Off", "Off"},
-        {banjo::AnalogCamMode::On, "On", "On"},
+    EnumOptionVector analog_cam_mode_options = {
+        {banjo::AnalogCamMode::Off, "Off", banjo::locale::tr("opt.off")},
+        {banjo::AnalogCamMode::On,  "On",  banjo::locale::tr("opt.on")},
     };
     config.add_enum_option(
         banjo::configkeys::general::analog_cam_mode,
-        "Analog Camera",
-        "Enables the analog camera.",
+        banjo::locale::tr("settings.analog_cam.title"),
+        banjo::locale::tr("settings.analog_cam.desc"),
         analog_cam_mode_options,
         banjo::AnalogCamMode::Off
     );
     config.add_number_option(
         banjo::configkeys::general::analog_camera_sensitivity,
-        "Analog Camera Sensitivity",
-        "Sets the sensitivity of the right stick analog camera, if enabled.",
+        banjo::locale::tr("settings.analog_cam_sens.title"),
+        banjo::locale::tr("settings.analog_cam_sens.desc"),
         1, 10, 1, 0, false, 3
     );
     config.add_option_hidden_dependency(
@@ -57,42 +134,42 @@ static void add_general_options(recomp::config::Config &config) {
         banjo::configkeys::general::analog_cam_mode,
         banjo::AnalogCamMode::Off
     );
-    static EnumOptionVector camera_invert_mode_options = {
-        {banjo::CameraInvertMode::InvertNone, "InvertNone", "None"},
-        {banjo::CameraInvertMode::InvertX, "InvertX", "Invert X"},
-        {banjo::CameraInvertMode::InvertY, "InvertY", "Invert Y"},
-        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", "Invert Both"}
+    EnumOptionVector camera_invert_mode_options = {
+        {banjo::CameraInvertMode::InvertNone, "InvertNone", banjo::locale::tr("opt.invert.none")},
+        {banjo::CameraInvertMode::InvertX,    "InvertX",    banjo::locale::tr("opt.invert.x")},
+        {banjo::CameraInvertMode::InvertY,    "InvertY",    banjo::locale::tr("opt.invert.y")},
+        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", banjo::locale::tr("opt.invert.both")}
     };
     config.add_enum_option(
         banjo::configkeys::general::third_person_camera_invert_mode,
-        "Invert Camera",
-        "Inverts the camera controls for the third person camera if it's enabled. <recomp-color primary>Invert X</recomp-color> is the default and matches the original game.<br /><br />If analog camera is off, only the <recomp-color primary>Invert X</recomp-color> setting will take effect.",
+        banjo::locale::tr("settings.invert_cam.title"),
+        banjo::locale::tr("settings.invert_cam.desc"),
         camera_invert_mode_options,
         banjo::CameraInvertMode::InvertX
     );
-    static EnumOptionVector first_person_invert_mode_options = {
-        {banjo::CameraInvertMode::InvertNone, "InvertNone", "None"},
-        {banjo::CameraInvertMode::InvertX, "InvertX", "Invert X"},
-        {banjo::CameraInvertMode::InvertY, "InvertY", "Invert Y"},
-        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", "Invert Both"}
+    EnumOptionVector first_person_invert_mode_options = {
+        {banjo::CameraInvertMode::InvertNone, "InvertNone", banjo::locale::tr("opt.invert.none")},
+        {banjo::CameraInvertMode::InvertX,    "InvertX",    banjo::locale::tr("opt.invert.x")},
+        {banjo::CameraInvertMode::InvertY,    "InvertY",    banjo::locale::tr("opt.invert.y")},
+        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", banjo::locale::tr("opt.invert.both")}
     };
     config.add_enum_option(
         banjo::configkeys::general::first_person_invert_mode,
-        "Invert First Person View",
-        "Inverts the camera controls in first person view. <recomp-color primary>Invert Y</recomp-color> is the default and matches the original game.",
+        banjo::locale::tr("settings.invert_fp.title"),
+        banjo::locale::tr("settings.invert_fp.desc"),
         first_person_invert_mode_options,
         banjo::CameraInvertMode::InvertY
     );
-    static EnumOptionVector flying_and_swimming_invert_options = {
-        {banjo::CameraInvertMode::InvertNone, "InvertNone", "None"},
-        {banjo::CameraInvertMode::InvertX, "InvertX", "Invert X"},
-        {banjo::CameraInvertMode::InvertY, "InvertY", "Invert Y"},
-        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", "Invert Both"}
+    EnumOptionVector flying_and_swimming_invert_options = {
+        {banjo::CameraInvertMode::InvertNone, "InvertNone", banjo::locale::tr("opt.invert.none")},
+        {banjo::CameraInvertMode::InvertX,    "InvertX",    banjo::locale::tr("opt.invert.x")},
+        {banjo::CameraInvertMode::InvertY,    "InvertY",    banjo::locale::tr("opt.invert.y")},
+        {banjo::CameraInvertMode::InvertBoth, "InvertBoth", banjo::locale::tr("opt.invert.both")}
     };
     config.add_enum_option(
         banjo::configkeys::general::flying_and_swimming_invert_mode,
-        "Invert Flying & Swimming",
-        "Inverts the controls for swimming and flying. <recomp-color primary>Invert Y</recomp-color> is the default and matches the original game.",
+        banjo::locale::tr("settings.invert_fs.title"),
+        banjo::locale::tr("settings.invert_fs.desc"),
         flying_and_swimming_invert_options,
         banjo::CameraInvertMode::InvertY
     );
@@ -144,8 +221,8 @@ T get_graphics_config_enum_value(const std::string& option_id) {
 static void add_sound_options(recomp::config::Config &config) {
     config.add_percent_number_option(
         banjo::configkeys::sound::bgm_volume,
-        "Background Music Volume",
-        "Controls the overall volume of background music.",
+        banjo::locale::tr("settings.bgm_volume.title"),
+        banjo::locale::tr("settings.bgm_volume.desc"),
         100.0f
     );
 }
@@ -159,19 +236,19 @@ int banjo::get_bgm_volume() {
 }
 
 static void add_graphics_options(recomp::config::Config &config) {
-    using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
-    static EnumOptionVector cutscene_aspect_ratio_mode_options = {
-        {banjo::CutsceneAspectRatioMode::Original, "Original", "Original"},
-        {banjo::CutsceneAspectRatioMode::Clamp16x9, "Clamp16x9", "16:9"},
-        {banjo::CutsceneAspectRatioMode::Full, "Expand", "Expand"},
+    using EnumOptionVector = std::vector<recomp::config::ConfigOptionEnumOption>;
+    EnumOptionVector cutscene_aspect_ratio_mode_options = {
+        {banjo::CutsceneAspectRatioMode::Original,  "Original",  banjo::locale::tr("opt.aspect.original")},
+        {banjo::CutsceneAspectRatioMode::Clamp16x9, "Clamp16x9", banjo::locale::tr("opt.aspect.16x9")},
+        {banjo::CutsceneAspectRatioMode::Full,      "Expand",    banjo::locale::tr("opt.aspect.expand")},
     };
     config.add_enum_option(
         banjo::configkeys::graphics::cutscene_aspect_ratio_mode,
-        "Cutscene Aspect Ratio",
-        "Sets the aspect ratio limit for cutscenes. Cutscenes have been adjusted to work in <recomp-color primary>16:9</recomp-color>, which is the default option. Wider aspect ratios may show details that weren't meant to be on-screen.",
+        banjo::locale::tr("settings.cutscene_aspect.title"),
+        banjo::locale::tr("settings.cutscene_aspect.desc"),
         cutscene_aspect_ratio_mode_options,
         banjo::CutsceneAspectRatioMode::Clamp16x9
-    );    
+    );
 }
 
 static void set_control_defaults() {
@@ -217,25 +294,49 @@ static void set_control_defaults() {
     set_default_mapping_for_controller(GameInput::L, { InputField::controller_digital(SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSTICK) });
 }
 
-static void set_control_descriptions() {
-    recompinput::set_game_input_description(recompinput::GameInput::Y_AXIS_POS, "Used to move and for steering while flying and swimming. Axis inversion for flying and swimming can be configured in the General tab.");
-    recompinput::set_game_input_description(recompinput::GameInput::Y_AXIS_NEG, "Used to move and for steering while flying and swimming. Axis inversion for flying and swimming can be configured in the General tab.");
-    recompinput::set_game_input_description(recompinput::GameInput::X_AXIS_NEG, "Used to move and for steering while flying and swimming. Axis inversion for flying and swimming can be configured in the General tab.");
-    recompinput::set_game_input_description(recompinput::GameInput::X_AXIS_POS, "Used to move and for steering while flying and swimming. Axis inversion for flying and swimming can be configured in the General tab.");
-    recompinput::set_game_input_description(recompinput::GameInput::A, "Used to jump and select options in menus. Also used for flying upwards.");
-    recompinput::set_game_input_description(recompinput::GameInput::B, "Used for attacks, which change depending on whether you are stationary, moving, in the air, or crouching.");
-    recompinput::set_game_input_description(recompinput::GameInput::Z, "Used to crouch, which enables A, B and the C-Buttons to perform different actions.");
-    recompinput::set_game_input_description(recompinput::GameInput::L, "Unused. Mods may use it for additional features.");
-    recompinput::set_game_input_description(recompinput::GameInput::R, "Used to center the camera behind Banjo on the ground, and to perform tighter turns while flying or swimming.");
-    recompinput::set_game_input_description(recompinput::GameInput::START, "Used for pausing and for skipping certain cutscenes.");
-    recompinput::set_game_input_description(recompinput::GameInput::C_UP, "Used to enter first-person mode, and to shoot eggs while holding Z.");
-    recompinput::set_game_input_description(recompinput::GameInput::C_DOWN, "Used to toggle between the different camera zoom levels, and to shoot eggs backwards while holding Z.");
-    recompinput::set_game_input_description(recompinput::GameInput::C_LEFT, "Used to rotate the camera sideways. Axis inversion can be configured in the General tab. Also used to enter Talon Trot while holding Z.");
-    recompinput::set_game_input_description(recompinput::GameInput::C_RIGHT, "Used to rotate the camera sideways. Axis inversion can be configured in the General tab). Also used to enter Wonderwing while holding Z.");
-    recompinput::set_game_input_description(recompinput::GameInput::DPAD_UP, "Unused. Mods may use it for additional features.");
-    recompinput::set_game_input_description(recompinput::GameInput::DPAD_DOWN, "Unused. Mods may use it for additional features.");
-    recompinput::set_game_input_description(recompinput::GameInput::DPAD_LEFT, "Unused. Mods may use it for additional features.");
-    recompinput::set_game_input_description(recompinput::GameInput::DPAD_RIGHT, "Unused. Mods may use it for additional features.");
+static void set_control_names_and_descriptions() {
+    using namespace recompinput;
+    auto T = [](const char* k) { return banjo::locale::tr(k); };
+
+    // --- Names (left column in the Controls tab) ---
+    set_game_input_name(GameInput::Y_AXIS_POS, T("recompui.input.up"));
+    set_game_input_name(GameInput::Y_AXIS_NEG, T("recompui.input.down"));
+    set_game_input_name(GameInput::X_AXIS_NEG, T("recompui.input.left"));
+    set_game_input_name(GameInput::X_AXIS_POS, T("recompui.input.right"));
+    set_game_input_name(GameInput::A,           T("recompui.input.a"));
+    set_game_input_name(GameInput::B,           T("recompui.input.b"));
+    set_game_input_name(GameInput::Z,           T("recompui.input.z"));
+    set_game_input_name(GameInput::L,           T("recompui.input.l"));
+    set_game_input_name(GameInput::R,           T("recompui.input.r"));
+    set_game_input_name(GameInput::START,       T("recompui.input.start"));
+    set_game_input_name(GameInput::C_UP,        T("recompui.input.c_up"));
+    set_game_input_name(GameInput::C_DOWN,      T("recompui.input.c_down"));
+    set_game_input_name(GameInput::C_LEFT,      T("recompui.input.c_left"));
+    set_game_input_name(GameInput::C_RIGHT,     T("recompui.input.c_right"));
+    set_game_input_name(GameInput::DPAD_UP,     T("recompui.input.dpad_up"));
+    set_game_input_name(GameInput::DPAD_DOWN,   T("recompui.input.dpad_down"));
+    set_game_input_name(GameInput::DPAD_LEFT,   T("recompui.input.dpad_left"));
+    set_game_input_name(GameInput::DPAD_RIGHT,  T("recompui.input.dpad_right"));
+
+    // --- Descriptions (right pane when an input is selected) ---
+    set_game_input_description(GameInput::Y_AXIS_POS, T("banjo.input_desc.move"));
+    set_game_input_description(GameInput::Y_AXIS_NEG, T("banjo.input_desc.move"));
+    set_game_input_description(GameInput::X_AXIS_NEG, T("banjo.input_desc.move"));
+    set_game_input_description(GameInput::X_AXIS_POS, T("banjo.input_desc.move"));
+    set_game_input_description(GameInput::A,          T("banjo.input_desc.a"));
+    set_game_input_description(GameInput::B,          T("banjo.input_desc.b"));
+    set_game_input_description(GameInput::Z,          T("banjo.input_desc.z"));
+    set_game_input_description(GameInput::L,          T("banjo.input_desc.unused"));
+    set_game_input_description(GameInput::R,          T("banjo.input_desc.r"));
+    set_game_input_description(GameInput::START,      T("banjo.input_desc.start"));
+    set_game_input_description(GameInput::C_UP,       T("banjo.input_desc.c_up"));
+    set_game_input_description(GameInput::C_DOWN,     T("banjo.input_desc.c_down"));
+    set_game_input_description(GameInput::C_LEFT,     T("banjo.input_desc.c_left"));
+    set_game_input_description(GameInput::C_RIGHT,    T("banjo.input_desc.c_right"));
+    set_game_input_description(GameInput::DPAD_UP,    T("banjo.input_desc.unused"));
+    set_game_input_description(GameInput::DPAD_DOWN,  T("banjo.input_desc.unused"));
+    set_game_input_description(GameInput::DPAD_LEFT,  T("banjo.input_desc.unused"));
+    set_game_input_description(GameInput::DPAD_RIGHT, T("banjo.input_desc.unused"));
 }
 
 banjo::CutsceneAspectRatioMode banjo::get_cutscene_aspect_ratio_mode() {
@@ -244,6 +345,10 @@ banjo::CutsceneAspectRatioMode banjo::get_cutscene_aspect_ratio_mode() {
 
 banjo::NetworkMode banjo::get_network_mode() {
     return get_general_config_enum_value<banjo::NetworkMode>(banjo::configkeys::network::mode);
+}
+
+banjo::Language banjo::get_language() {
+    return get_general_config_enum_value<banjo::Language>(banjo::configkeys::general::language);
 }
 
 uint32_t banjo::get_network_port() {
@@ -285,21 +390,21 @@ void banjo::init_config() {
     general_options.has_gyro_sensitivity = false;
     general_options.has_mouse_sensitivity = false;
 
-    auto &general_config = recompui::config::create_general_tab(general_options);
+    auto &general_config = recompui::config::create_general_tab(general_options, banjo::locale::tr("recompui.tab.general"));
     add_general_options(general_config);
     // Network options removed from Settings — handled by launcher Host/Join buttons
 
-    auto &graphics_config = recompui::config::create_graphics_tab();
+    auto &graphics_config = recompui::config::create_graphics_tab(banjo::locale::tr("recompui.tab.graphics"));
     add_graphics_options(graphics_config);
 
     set_control_defaults();
-    set_control_descriptions();
-    recompui::config::create_controls_tab();
+    set_control_names_and_descriptions();
+    recompui::config::create_controls_tab(banjo::locale::tr("recompui.tab.controls"));
 
-    auto &sound_config = recompui::config::create_sound_tab();
+    auto &sound_config = recompui::config::create_sound_tab(banjo::locale::tr("recompui.tab.sound"));
     add_sound_options(sound_config);
 
-    recompui::config::create_mods_tab();
+    recompui::config::create_mods_tab(banjo::locale::tr("recompui.tab.mods"));
 
     recompui::config::finalize();
 

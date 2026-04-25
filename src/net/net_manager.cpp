@@ -307,7 +307,7 @@ bool NetworkManager::coopnet_host_lobby(const std::string& password, const std::
         std::printf("[CoopNet] Lost connection\n");
     });
 
-    if (!coopnet_->create_lobby(password, description, MAX_PLAYERS)) {
+    if (!coopnet_->create_lobby(password, description, MAX_PLAYERS, get_config().player_name)) {
         return false;
     }
 

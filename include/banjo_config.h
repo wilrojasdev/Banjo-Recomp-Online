@@ -13,6 +13,7 @@ namespace banjo {
 
     namespace configkeys {
         namespace general {
+            inline const std::string language = "language";
             inline const std::string note_saving_mode = "note_saving_mode";
             inline const std::string camera_invert_mode = "camera_invert_mode";
             inline const std::string analog_cam_mode = "analog_cam_mode";
@@ -106,6 +107,25 @@ namespace banjo {
 
     NetworkMode get_network_mode();
     uint32_t get_network_port();
+
+    enum class Language {
+        English,
+        Spanish,
+        French,
+        German,
+        Portuguese,
+        OptionCount
+    };
+
+    NLOHMANN_JSON_SERIALIZE_ENUM(banjo::Language, {
+        {banjo::Language::English, "English"},
+        {banjo::Language::Spanish, "Spanish"},
+        {banjo::Language::French, "French"},
+        {banjo::Language::German, "German"},
+        {banjo::Language::Portuguese, "Portuguese"}
+    });
+
+    Language get_language();
 
     void open_quit_game_prompt();
 };

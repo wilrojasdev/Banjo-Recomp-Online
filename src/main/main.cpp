@@ -116,6 +116,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #include "recompui/program_config.h"
 #include "recompui/renderer.h"
 #include "recompui/config.h"
+#include "recompui/i18n.h"
 #include "elements/ui_text_input.h"
 #include "elements/ui_select.h"
 #include "elements/ui_clickable.h"
@@ -133,6 +134,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #include "recomp_data.h"
 #include "ovl_patches.hpp"
 #include "theme.h"
+#include "embedded_mods.h"
 #include "librecomp/game.hpp"
 #include "librecomp/mods.hpp"
 #include "librecomp/helpers.hpp"
@@ -153,7 +155,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 
 #include "../../lib/rt64/src/contrib/stb/stb_image.h"
 
-const std::string version_string = "0.16.0";
+const std::string version_string = "1.1.0";
 
 template<typename... Ts>
 void exit_error(const char* str, Ts ...args) {
@@ -294,6 +296,11 @@ static std::atomic<bool> return_to_launcher_requested{false};
 
 static void return_to_launcher() {
     return_to_launcher_requested.store(true);
+}
+
+// Public entry point — see banjo_launcher.h.
+void banjo::request_return_to_launcher() {
+    return_to_launcher();
 }
 
 static void process_return_to_launcher() {
@@ -902,6 +909,18 @@ static SlotInfo read_save_slot(int game_slot) {
     return info;
 }
 
+// Build a compact progress string advertised by the host in the CoopNet
+// lobby description. Joiners see this below the host name in the lobby list.
+// Format: "42 jiggys - 320 notes". Empty slots report "0 jiggys - 0 notes".
+static std::string build_host_progress_description(int game_slot) {
+    SlotInfo info = read_save_slot(game_slot);
+    int jiggies = info.valid ? info.jiggies : 0;
+    int notes   = info.valid ? info.notes   : 0;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%d jiggys - %d notes", jiggies, notes);
+    return std::string(buf);
+}
+
 // Set by card's click listener and consumed by backdrop's listener — lets the
 // backdrop tell apart "click outside the card" (close) from "click bubbled up
 // from inside the card" (ignore). RmlUi events bubble target -> root, so the
@@ -1267,16 +1286,16 @@ static void refresh_coopnet_indicator() {
     coopnet_indicator_last_status = s;
     switch (static_cast<CoopNetProbeStatus>(s)) {
         case CoopNetProbeStatus::Online:
-            coopnet_indicator_label->set_text("CoopNet: Online");
+            coopnet_indicator_label->set_text(banjo::locale::tr("coopnet.online"));
             coopnet_indicator_label->set_color(recompui::theme::color::Success);
             break;
         case CoopNetProbeStatus::Offline:
-            coopnet_indicator_label->set_text("CoopNet: Offline");
+            coopnet_indicator_label->set_text(banjo::locale::tr("coopnet.offline"));
             coopnet_indicator_label->set_color(recompui::theme::color::Danger);
             break;
         case CoopNetProbeStatus::Checking:
         default:
-            coopnet_indicator_label->set_text("CoopNet: Checking...");
+            coopnet_indicator_label->set_text(banjo::locale::tr("coopnet.checking"));
             coopnet_indicator_label->set_color(recompui::theme::color::Warning);
             break;
     }
@@ -1335,7 +1354,7 @@ static void start_host_game() {
             // Will chain to host after connect via update_coopnet_state
         } else {
             coopnet_state.store(static_cast<int>(CoopNetState::CreatingLobby));
-            bool ok = net.coopnet_host_lobby(pass, "");
+            bool ok = net.coopnet_host_lobby(pass, build_host_progress_description(selected_save_slot));
             if (ok) {
                 coopnet_state.store(static_cast<int>(CoopNetState::Connected));
             } else {
@@ -1552,7 +1571,7 @@ static void begin_join(const std::string& ip, const std::string& port_str) {
     join_state.store(static_cast<int>(JoinState::Connecting));
     join_start_time = std::chrono::steady_clock::now();
 
-    if (join_status_label) join_status_label->set_text("Connecting to " + join_target_ip + "...");
+    if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.connecting_to") + join_target_ip + "...");
     if (join_timer_label) join_timer_label->set_text("0s");
     if (join_cancel_btn) join_cancel_btn->display_show();
     if (join_retry_btn) join_retry_btn->display_hide();
@@ -1587,7 +1606,7 @@ static void begin_private_search() {
         coopnet_start_time = std::chrono::steady_clock::now();
         net.coopnet_begin(COOPNET_SERVER, COOPNET_PORT);
         join_show_status();
-        if (join_status_label) join_status_label->set_text("Connecting to server...");
+        if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.connecting_server"));
         return;
     }
 
@@ -1599,7 +1618,7 @@ static void begin_private_search() {
 
     // Show searching state
     if (join_lobby_status_label) {
-        join_lobby_status_label->set_text("Searching...");
+        join_lobby_status_label->set_text(banjo::locale::tr("join.searching"));
         join_lobby_status_label->display_show();
     }
     join_show_lobby_list();
@@ -1628,8 +1647,8 @@ static void update_join_state() {
     }
     else if (state == static_cast<int>(JoinState::Failed)) {
         join_state.store(static_cast<int>(JoinState::Idle));
-        if (join_status_label) join_status_label->set_text("Connection failed");
-        if (join_timer_label) join_timer_label->set_text("Host not found or not responding.");
+        if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.failed"));
+        if (join_timer_label) join_timer_label->set_text(banjo::locale::tr("join.host_not_found"));
         if (join_cancel_btn) join_cancel_btn->display_hide();
         if (join_retry_btn) join_retry_btn->display_show();
     }
@@ -1698,8 +1717,8 @@ static void ensure_join_panel() {
     join_lobby_container->set_flex_direction(recompui::FlexDirection::Column);
     join_lobby_container->set_gap(banjo::ui::space::sm);
     join_lobby_container->set_width(100.0f, recompui::Unit::Percent);
-    join_lobby_container->set_min_height(100.0f);
-    join_lobby_container->set_max_height(400.0f);
+    join_lobby_container->set_min_height(360.0f);
+    join_lobby_container->set_max_height(560.0f);
     join_lobby_container->set_overflow_y(recompui::Overflow::Scroll);
 
     auto list_actions = make_action_row(context, join_lobby_list_view, banjo::locale::tr("common.refresh").c_str());
@@ -1778,7 +1797,7 @@ static void begin_coopnet_connect() {
     coopnet_state.store(static_cast<int>(CoopNetState::Connecting));
     coopnet_start_time = std::chrono::steady_clock::now();
 
-    if (join_status_label) join_status_label->set_text("Connecting to server...");
+    if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.connecting_server"));
     if (join_timer_label) join_timer_label->set_text("");
     if (join_cancel_btn) join_cancel_btn->display_show();
     if (join_retry_btn) join_retry_btn->display_hide();
@@ -1806,7 +1825,7 @@ static void begin_coopnet_host() {
 
     coopnet_state.store(static_cast<int>(CoopNetState::CreatingLobby));
 
-    bool ok = net.coopnet_host_lobby(pass, "");
+    bool ok = net.coopnet_host_lobby(pass, build_host_progress_description(selected_save_slot));
     if (ok) {
         coopnet_state.store(static_cast<int>(CoopNetState::Connected));
     } else {
@@ -1828,7 +1847,7 @@ static void begin_coopnet_join(uint64_t lobby_id) {
 
     coopnet_state.store(static_cast<int>(CoopNetState::JoiningLobby));
     coopnet_start_time = std::chrono::steady_clock::now(); // Reset timer for join timeout
-    if (join_status_label) join_status_label->set_text("Joining lobby...");
+    if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.joining_lobby"));
     join_show_status();
 
     bool ok = net.coopnet_join_lobby(lobby_id, pass);
@@ -1865,7 +1884,7 @@ static void update_coopnet_state() {
         auto elapsed = std::chrono::steady_clock::now() - coopnet_start_time;
         int secs = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         if (join_status_label) {
-            join_status_label->set_text("Connecting... " + std::to_string(secs) + "s");
+            join_status_label->set_text(banjo::locale::tr("join.connecting") + " " + std::to_string(secs) + "s");
         }
         if (secs > 10) {
             coopnet_state.store(static_cast<int>(CoopNetState::Failed));
@@ -1894,7 +1913,7 @@ static void update_coopnet_state() {
     }
     else if (state == static_cast<int>(CoopNetState::Failed)) {
         coopnet_state.store(static_cast<int>(CoopNetState::Idle));
-        if (join_status_label) join_status_label->set_text("Connection failed.");
+        if (join_status_label) join_status_label->set_text(banjo::locale::tr("join.failed"));
         if (join_cancel_btn) join_cancel_btn->display_hide();
         if (join_retry_btn) join_retry_btn->display_show();
         join_show_status();
@@ -1913,7 +1932,7 @@ static void populate_lobby_list_ui() {
     // Update the status label based on results
     if (join_lobby_status_label) {
         if (cached_lobby_list.empty()) {
-            join_lobby_status_label->set_text("No lobbies found.");
+            join_lobby_status_label->set_text(banjo::locale::tr("join.no_lobbies"));
             join_lobby_status_label->display_show();
         } else {
             join_lobby_status_label->display_hide();
@@ -1942,12 +1961,25 @@ static void populate_lobby_list_ui() {
         row->set_padding_left(banjo::ui::space::lg);
         row->set_padding_right(banjo::ui::space::lg);
 
-        std::string label = lobby.host_name;
-        if (label.empty()) label = "Lobby";
-        label += "  (" + std::to_string(lobby.player_count) + "/" + std::to_string(lobby.max_players) + ")";
+        // Left side: stack host name + progress description vertically.
+        auto info_col = context.create_element<recompui::Element>(row);
+        info_col->set_display(recompui::Display::Flex);
+        info_col->set_flex_direction(recompui::FlexDirection::Column);
+        info_col->set_align_items(recompui::AlignItems::FlexStart);
+        info_col->set_gap(banjo::ui::space::xs);
+        info_col->set_flex_grow(1.0f);
 
-        auto info_label = context.create_element<recompui::Label>(row, label, recompui::theme::Typography::Body);
-        info_label->set_flex_grow(1.0f);
+        std::string name_line = lobby.host_name;
+        if (name_line.empty()) name_line = "Lobby";
+        name_line += "  (" + std::to_string(lobby.player_count) + "/" + std::to_string(lobby.max_players) + ")";
+        context.create_element<recompui::Label>(info_col, name_line, recompui::theme::Typography::Body);
+
+        if (!lobby.description.empty()) {
+            auto desc_label = context.create_element<recompui::Label>(
+                info_col, lobby.description, recompui::theme::Typography::LabelSM
+            );
+            desc_label->set_color(recompui::theme::color::TextA50);
+        }
 
         uint64_t lid = lobby.lobby_id;
         auto join_btn = context.create_element<recompui::Button>(
@@ -2205,6 +2237,22 @@ int main(int argc, char** argv) {
     // calls can use tr() with the correct language when registering option
     // titles/descriptions with the config system.
     banjo::locale::init();
+
+    // Bridge RecompFrontend's i18n hook to our locale system. Library code
+    // calls recompui::tr("recompui.foo", "English") and we delegate the
+    // lookup to banjo::locale::tr(). If the key is unknown to us we return
+    // the English fallback so the UI never shows raw keys.
+    recompui::set_translation_fn([](std::string_view key, std::string_view fallback) -> std::string {
+        std::string k{key};
+        const std::string& looked_up = banjo::locale::tr(k.c_str());
+        // banjo::locale::tr returns the key itself when missing — detect that
+        // and prefer the English fallback the library passed.
+        if (looked_up == k) {
+            return std::string(fallback);
+        }
+        return looked_up;
+    });
+
     banjo::init_config();
 
     // Network mode is now set from the launcher UI (Host/Join buttons).
@@ -2228,17 +2276,9 @@ int main(int argc, char** argv) {
         update_join_state();
         update_coopnet_state();
         refresh_coopnet_indicator();
-        static bool language_restart_prompt_shown = false;
-        if (banjo::locale::refresh() && !language_restart_prompt_shown) {
-            language_restart_prompt_shown = true;
-            recompui::open_info_prompt(
-                banjo::locale::tr("settings.language_restart_title"),
-                banjo::locale::tr("settings.language_restart_body"),
-                banjo::locale::tr("settings.language_restart_btn"),
-                []() { return_to_launcher(); },
-                recompui::ButtonStyle::Primary
-            );
-        }
+        // Note: the language-change restart prompt is now triggered directly from
+        // the language option's Temporary change callback (see add_general_options
+        // in src/game/config.cpp), so there's no polling on locale::refresh() here.
         banjo::launcher_animation_update(menu);
     });
 
@@ -2297,6 +2337,12 @@ int main(int argc, char** argv) {
 
     // Register the .rtz texture pack file format with the previous content type as its only allowed content type.
     recomp::mods::register_mod_container_type("rtz", std::vector{ texture_pack_content_type_id }, false);
+
+    // Register the bundled translation packs (Spanish, French, German + their hard deps)
+    // and force-enable the one that matches the launcher locale. Must run before
+    // recomp::start() because that's where scan_mods() loads the registered bytes
+    // and applies the enable overrides.
+    banjo::embedded_mods::initialize(banjo::locale::get_startup_language());
 
     start_coopnet_probe();
 

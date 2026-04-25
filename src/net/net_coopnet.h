@@ -56,7 +56,8 @@ public:
     void update();
 
     // Lobby operations
-    bool create_lobby(const std::string& password, const std::string& description, uint16_t max_players);
+    bool create_lobby(const std::string& password, const std::string& description, uint16_t max_players,
+                      const std::string& host_name);
     bool join_lobby(uint64_t lobby_id, const std::string& password);
     bool leave_lobby();
     void request_lobby_list(const std::string& password = "");
