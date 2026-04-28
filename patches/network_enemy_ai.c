@@ -57,11 +57,21 @@ typedef struct {
 extern u32 recomp_net_is_connected(void);
 extern u32 recomp_net_get_remote_count(void);
 extern u32 recomp_net_get_remote_state(u32 player_id, RemoteState *out);
+extern u32 recomp_net_get_local_player_id(void);
+
+// Maximum number of player slots in a session (host + 3 joins).
+#define NET_MAX_PLAYERS 4
 
 // Vanilla BK helpers we still need to call.
 extern void _player_getPosition(f32 dst[3]);
 extern float gu_sqrtf(float val);
 extern enum map_e map_get(void);
+
+// Raw local-player coordinates. _player_getPosition is just
+// `ml_vec3f_copy(arg0, player_position)` — by reading the global directly we
+// avoid recursion when our patched _player_getPosition wants the unredirected
+// local position.
+extern f32 player_position[3];
 
 // ---- Dispatcher externs (for the func_803268B4 patch) ----
 // Most helpers and globals are already declared in functions.h / variables.h
@@ -95,20 +105,35 @@ static Actor *g_current_ai_actor = NULL;
 
 // === Closest-player helpers ===
 
+// Read raw local player position bypassing our own _player_getPosition patch.
+static inline void raw_local_player(f32 dst[3]) {
+    dst[0] = player_position[0];
+    dst[1] = player_position[1];
+    dst[2] = player_position[2];
+}
+
 // Minimum squared XZ distance from (x, z) to any player on the current map.
+//
+// IMPORTANT: recomp_net_get_remote_state(player_id, ...) takes a SLOT index
+// (0..NET_MAX_PLAYERS-1), not an index from 0..remote_count. The bridge
+// just calls get_remote_player(slot) and returns active=0 for empty slots
+// or for the local player. We must iterate all slots and skip self — using
+// 0..remote_count would only ever query slot 0, which is the host on every
+// host-side enemy update, so the loop would never observe the actual remote.
 static f32 min_player_xz_dist_sq(f32 x, f32 z) {
     f32 local[3];
-    _player_getPosition(local);
+    raw_local_player(local);
     f32 dx = x - local[0], dz = z - local[2];
     f32 min_sq = dx * dx + dz * dz;
 
     if (!recomp_net_is_connected()) return min_sq;
 
     u32 cur_map = (u32)map_get();
-    u32 n = recomp_net_get_remote_count();
+    u32 local_id = recomp_net_get_local_player_id();
     u32 i;
     RemoteState rs;
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < NET_MAX_PLAYERS; i++) {
+        if (i == local_id) continue;
         if (!recomp_net_get_remote_state(i, &rs)) continue;
         if (rs.map_id != cur_map) continue;
         dx = x - rs.x; dz = z - rs.z;
@@ -122,17 +147,18 @@ static f32 min_player_xz_dist_sq(f32 x, f32 z) {
 // on the current map. Always writes something valid — local player at
 // minimum. Remote players in other maps are ignored.
 static void find_closest_player_xyz(const f32 from[3], f32 out[3]) {
-    _player_getPosition(out);
+    raw_local_player(out);
     f32 dx = from[0] - out[0], dy = from[1] - out[1], dz = from[2] - out[2];
     f32 min_sq = dx * dx + dy * dy + dz * dz;
 
     if (!recomp_net_is_connected()) return;
 
     u32 cur_map = (u32)map_get();
-    u32 n = recomp_net_get_remote_count();
+    u32 local_id = recomp_net_get_local_player_id();
     u32 i;
     RemoteState rs;
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < NET_MAX_PLAYERS; i++) {
+        if (i == local_id) continue;
         if (!recomp_net_get_remote_state(i, &rs)) continue;
         if (rs.map_id != cur_map) continue;
         dx = from[0] - rs.x; dy = from[1] - rs.y; dz = from[2] - rs.z;
@@ -166,7 +192,7 @@ RECOMP_PATCH f32 core1_ce60_getPlayerDistance(f32 x, f32 z) {
 // HUD and other consumers continue to see the local player.
 
 RECOMP_PATCH void player_getPosition(f32 dst[3]) {
-    _player_getPosition(dst);
+    raw_local_player(dst);
     if (g_current_ai_actor == NULL) return;
     if (!recomp_net_is_connected()) return;
 
@@ -175,6 +201,64 @@ RECOMP_PATCH void player_getPosition(f32 dst[3]) {
     actor_pos[1] = g_current_ai_actor->position[1];
     actor_pos[2] = g_current_ai_actor->position[2];
     find_closest_player_xyz(actor_pos, dst);
+}
+
+// === Patched RAW player position getter ===
+//
+// Vanilla _player_getPosition is the underlying primitive
+// (ml_vec3f_copy(dst, player_position)). Many engine helpers
+// (subaddie_playerIsWithinSphere, func_8032970C, func_803297FC, func_803292E0,
+// func_80329354, func_80329384) call it directly, bypassing the wrapped
+// player_getPosition patch above. Without this redirect, enemy aggro/yaw/los
+// checks invoked from inside an enemy update see ONLY the local player and
+// never react to remote players.
+//
+// We gate the redirect on g_current_ai_actor — same scope as the wrapped
+// version — so consumers outside enemy updates (camera, HUD, dialog
+// framing, music cues, particle emitters) keep getting the actual local
+// player. Recursion is avoided by reading the player_position[] global
+// directly via raw_local_player().
+RECOMP_PATCH void _player_getPosition(f32 dst[3]) {
+    raw_local_player(dst);
+    if (g_current_ai_actor == NULL) return;
+    if (!recomp_net_is_connected()) return;
+
+    f32 actor_pos[3];
+    actor_pos[0] = g_current_ai_actor->position[0];
+    actor_pos[1] = g_current_ai_actor->position[1];
+    actor_pos[2] = g_current_ai_actor->position[2];
+    find_closest_player_xyz(actor_pos, dst);
+}
+
+// === Patched yaw-to-player ===
+//
+// Vanilla func_80329784 reads Banjo's character-model torso position via
+// func_8028E964 → func_8028E924 → baModel_80292284 — a chain that returns
+// the LOCAL player's animated joint position, NOT player_position[]. So our
+// _player_getPosition redirect doesn't affect this path. Many enemies
+// (Bigbutt, Clam, Conga via custom code, etc.) call this to set yaw_ideal
+// when chasing or facing the player; if it always returns the yaw to the
+// local player, an enemy will never face a remote-only player.
+//
+// Replicate the vanilla 2-arg atan logic but feed it the closest-player XZ
+// when in AI context. Outside AI context, fall through to the local-Banjo
+// model path so non-AI consumers (e.g. carry/throw helpers) are unaffected.
+extern f32 func_80257204(f32 ax, f32 az, f32 bx, f32 bz);
+extern void func_8028E964(f32 dst[3]);
+
+RECOMP_PATCH s32 func_80329784(Actor *this) {
+    f32 plyr[3];
+
+    if (g_current_ai_actor != NULL && recomp_net_is_connected()) {
+        f32 actor_pos[3];
+        actor_pos[0] = g_current_ai_actor->position[0];
+        actor_pos[1] = g_current_ai_actor->position[1];
+        actor_pos[2] = g_current_ai_actor->position[2];
+        find_closest_player_xyz(actor_pos, plyr);
+    } else {
+        func_8028E964(plyr);
+    }
+    return (s32)func_80257204(this->position[0], this->position[2], plyr[0], plyr[2]);
 }
 
 // === Patched actor-update dispatcher ===
@@ -234,15 +318,26 @@ RECOMP_PATCH void func_803268B4(void) {
                         if (anim_ctrl != NULL) {
                             actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
                         }
-                    } else if (!temp_s1 || (temp_s1 && func_803296D8(actor, temp_s1))) {
-                        if (marker->actorUpdateFunc != NULL) {
-                            if (is_enemy) g_current_ai_actor = actor;
-                            marker->actorUpdateFunc(actor);
-                            if (is_enemy) g_current_ai_actor = NULL;
-                            if (anim_ctrl != NULL) {
-                                actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
+                    } else {
+                        // Set g_current_ai_actor BEFORE the active-zone gate so
+                        // func_803296D8 → subaddie_playerIsWithinSphereAndActive
+                        // → _player_getPosition redirects to closest player. Without
+                        // this, an enemy whose actor_info->unk18 active radius gates
+                        // around the LOCAL player only would freeze its update when
+                        // the host is out of range — even if the remote is right
+                        // beside it. (Bigbutt: unk18 = 3200.)
+                        bool ai_scope = is_enemy;
+                        if (ai_scope) g_current_ai_actor = actor;
+                        bool gate_ok = !temp_s1 || (temp_s1 && func_803296D8(actor, temp_s1));
+                        if (gate_ok) {
+                            if (marker->actorUpdateFunc != NULL) {
+                                marker->actorUpdateFunc(actor);
+                                if (anim_ctrl != NULL) {
+                                    actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
+                                }
                             }
                         }
+                        if (ai_scope) g_current_ai_actor = NULL;
                     }
                     actor->unk124_7 = TRUE;
                     actor->unk138_28 = FALSE;

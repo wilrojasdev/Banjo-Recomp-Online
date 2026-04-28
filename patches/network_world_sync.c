@@ -14,6 +14,19 @@ void recomp_net_get_enemy_positions(void *buf, u32 *count);
 u32  recomp_net_should_send_full_sync(u8 *out_player_id);
 void recomp_net_send_world_state_full(void *data, u32 size, u32 target_player);
 u32  recomp_net_pop_full_state(void *out);
+u32  recomp_net_get_local_player_id(void);
+u32  recomp_net_get_remote_state(u32 player_id, void *out);
+
+#define NET_MAX_PLAYERS 4
+
+// Layout must match RemoteState in network_enemy_ai.c (256-byte upper bound — we
+// only read the first ~0x40). Fields beyond what we use are accessed by other
+// callers via the same bridge; sharing the layout here keeps it self-contained.
+typedef struct {
+    f32 x, y, z, yaw, pitch, scale;
+    u32 map_id;
+    u8  pad[0x40 - 0x1C];
+} OwnerRemoteState;
 
 extern enum map_e map_get(void);
 extern enum level_e level_get(void);
@@ -89,19 +102,210 @@ static bool is_killable_enemy(Actor *actor) {
     u32 mid = (u32)actor->marker->id;
     if (bkrecomp_net_is_nipper_marker(mid)) return FALSE;
     if (mid == MARKER_DB_BURIED_TREASURE) return FALSE;
+    // Bigbutt's "dieFunc" is actually its OW (hit-response) callback that
+    // transitions to state 0xd — not a death. Letting net_enemy_die_proxy
+    // overwrite it makes every Banjo hit broadcast a death event and despawn
+    // the bull instead of playing the OW/fall/get-up cycle. The hit response
+    // is replicated to peers via the synced actor->state in is_synced_special_actor.
+    if (mid == 0x3 || mid == 0x29e) return FALSE;
     if (df == (MarkerCollisionFunc)net_enemy_die_proxy) return TRUE;
     return TRUE;
 }
 
-// Bosses/special actors that don't have dieFunc (so is_killable_enemy returns
-// FALSE for them) but whose position+animation must still be replicated to
-// peers so all players see the same visual flow. Add new entries here when a
-// boss has its own scripted defeat path instead of a regular dieFunc.
+// Bosses/special actors whose update function is patched on non-owner to
+// skip the local state machine. The bulk-position sync then applies
+// actor->state and force-commits anim_id via _anctrl_start so visuals
+// match the host frame-perfect.
+//
+// A "special" actor here is independent of having a dieFunc. Some entries
+// (Conga) lack one entirely; others (Bigbutt) are killable AND state-synced.
+// Add a marker here only after wiring an update patch that recognises the
+// non-owner branch (see network_bigbutt_sync.c, network_conga_sync.c).
+//
+// 0x3   = Bigbutt (alive)
+// 0x29e = Bigbutt (fallen) — vanilla flips marker->id when state==0xe
 static bool is_synced_special_actor(Actor *actor) {
     if (!actor || !actor->marker) return FALSE;
     u32 mid = (u32)actor->marker->id;
     if (mid == MARKER_7_CONGA) return TRUE;
+    if (mid == 0x3 || mid == 0x29e) return TRUE;
     return FALSE;
+}
+
+// Some enemies flip marker->id at runtime to swap models / collision
+// (Bigbutt: 0x3 alive ↔ 0x29e fallen). The host packs whichever id the
+// actor currently holds, so the JOIN matcher must treat the pair as the
+// same entity to avoid losing sync the frame after the flip.
+static bool marker_id_matches(u16 actor_id, u16 packet_id) {
+    if (actor_id == packet_id) return TRUE;
+    if ((actor_id == 0x3   && packet_id == 0x29e) ||
+        (actor_id == 0x29e && packet_id == 0x3)) return TRUE;
+    return FALSE;
+}
+
+/* ============================================================
+ * Per-actor dynamic ownership (sm64-coop pattern)
+ * ============================================================
+ *
+ * Vanilla BK is single-player: the cube manager only loads cubes near
+ * the local player, the dispatcher gates updates on the local player
+ * sphere, and every aggro check reads the local player position. Our
+ * existing patches redirect those reads to "closest player", but they
+ * don't help when the host is far enough that BK's cube manager has
+ * already despawned the enemy on the host side — there is no actor to
+ * update at all. The remote standing next to that enemy sees nothing.
+ *
+ * The fix mirrors what sm64ex-coop does: each client locally owns the
+ * AI for the enemies that are closest to it. Each client iterates
+ * suBaddieActorArray and:
+ *   - For actors WHERE I am closest player → run the vanilla state
+ *     machine, broadcast position+state.
+ *   - For actors WHERE someone else is closest → skip state machine
+ *     (the existing non-owner pattern), apply received state.
+ *
+ * The decision is computed independently on every client from the
+ * union of player positions (local + recomp_net_get_remote_state).
+ * If everyone agrees on player positions (which they roughly do — the
+ * remote-state sync runs per frame), they agree on ownership. Brief
+ * hand-off overlaps when distances are very close are absorbed by
+ * hysteresis: once you own an actor, you keep ownership unless someone
+ * is closer by SWITCH_THRESHOLD units.
+ *
+ * This block exposes:
+ *   - bkrecomp_net_compute_actor_owner(actor)  — resolve owner id
+ *   - bkrecomp_net_am_i_actor_owner(actor)     — predicate for patches
+ */
+
+#define ACTOR_OWNER_HYSTERESIS_SQ  (200.0f * 200.0f)
+#define ACTOR_OWNER_NONE           0xFF
+#define MAX_ACTOR_OWNER_CACHE      128
+
+typedef struct {
+    u16 spawn_index;
+    u16 marker_id;
+    u8  owner_id;
+    u8  pad[3];
+} ActorOwnerCache;
+
+static ActorOwnerCache actor_owner_cache[MAX_ACTOR_OWNER_CACHE];
+static s32 actor_owner_cache_count = 0;
+static u32 actor_owner_cache_level = 0xFFFFFFFF;
+
+static void actor_owner_cache_reset_for_level(u32 level) {
+    if (level != actor_owner_cache_level) {
+        actor_owner_cache_count = 0;
+        actor_owner_cache_level = level;
+    }
+}
+
+static u8 actor_owner_cache_get(u16 spawn_index, u16 marker_id) {
+    s32 i;
+    for (i = 0; i < actor_owner_cache_count; i++) {
+        if (actor_owner_cache[i].spawn_index == spawn_index
+            && marker_id_matches(actor_owner_cache[i].marker_id, marker_id)) {
+            return actor_owner_cache[i].owner_id;
+        }
+    }
+    return ACTOR_OWNER_NONE;
+}
+
+static void actor_owner_cache_set(u16 spawn_index, u16 marker_id, u8 owner_id) {
+    s32 i;
+    for (i = 0; i < actor_owner_cache_count; i++) {
+        if (actor_owner_cache[i].spawn_index == spawn_index
+            && marker_id_matches(actor_owner_cache[i].marker_id, marker_id)) {
+            actor_owner_cache[i].owner_id = owner_id;
+            actor_owner_cache[i].marker_id = marker_id;  // keep current variant
+            return;
+        }
+    }
+    if (actor_owner_cache_count < MAX_ACTOR_OWNER_CACHE) {
+        actor_owner_cache[actor_owner_cache_count].spawn_index = spawn_index;
+        actor_owner_cache[actor_owner_cache_count].marker_id = marker_id;
+        actor_owner_cache[actor_owner_cache_count].owner_id = owner_id;
+        actor_owner_cache_count++;
+    }
+}
+
+// Squared XYZ distance from actor to a player slot. Returns very large value
+// when the slot is empty / on a different map / inactive — naturally losing
+// the closest-player race.
+static f32 player_slot_dist_sq(Actor *actor, u32 slot, u32 cur_map, u32 my_id) {
+    f32 dx, dy, dz;
+    if (slot == my_id) {
+        f32 me[3];
+        extern f32 player_position[3];
+        me[0] = player_position[0]; me[1] = player_position[1]; me[2] = player_position[2];
+        dx = actor->position[0] - me[0];
+        dy = actor->position[1] - me[1];
+        dz = actor->position[2] - me[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+    OwnerRemoteState rs;
+    if (!recomp_net_get_remote_state(slot, &rs)) return 1.0e20f;
+    if (rs.map_id != cur_map) return 1.0e20f;
+    dx = actor->position[0] - rs.x;
+    dy = actor->position[1] - rs.y;
+    dz = actor->position[2] - rs.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Decide who SHOULD own the given actor right now. Called every sync tick on
+// every client; with consistent player positions all clients converge to the
+// same answer. Hysteresis prevents thrashing when two players are nearly
+// equidistant — the current owner keeps ownership unless someone else is
+// closer by ACTOR_OWNER_HYSTERESIS_SQ.
+static u8 compute_actor_owner(Actor *actor) {
+    if (!recomp_net_is_connected()) return 0;
+
+    u32 cur_map = (u32)map_get();
+    u32 my_id = recomp_net_get_local_player_id();
+    u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+    u16 mid = (u16)actor->marker->id;
+
+    u8 cur = actor_owner_cache_get(si, mid);
+
+    f32 best_sq = 1.0e20f;
+    u8 best_id = ACTOR_OWNER_NONE;
+    u32 i;
+    for (i = 0; i < NET_MAX_PLAYERS; i++) {
+        f32 d = player_slot_dist_sq(actor, i, cur_map, my_id);
+        if (d < best_sq) {
+            best_sq = d;
+            best_id = (u8)i;
+        }
+    }
+
+    // No player observable → fall back to current owner if any, else host (0).
+    if (best_id == ACTOR_OWNER_NONE) {
+        return (cur != ACTOR_OWNER_NONE) ? cur : 0;
+    }
+
+    // Hysteresis: only switch if the new candidate is closer than the current
+    // owner by the threshold. Without this, two players within ~10 units of
+    // each other would flip ownership every frame as remote-state jitter
+    // shifts who's "closest".
+    if (cur != ACTOR_OWNER_NONE && cur != best_id) {
+        f32 cur_sq = player_slot_dist_sq(actor, (u32)cur, cur_map, my_id);
+        if (best_sq + ACTOR_OWNER_HYSTERESIS_SQ > cur_sq) {
+            return cur;
+        }
+    }
+
+    actor_owner_cache_set(si, mid, best_id);
+    return best_id;
+}
+
+// Predicate: am I the current owner of this actor? Exposed to other patches
+// (network_bigbutt_sync.c, network_conga_sync.c) to drive the non-owner
+// state-machine skip. Replaces the previous world-owner check, which gave a
+// single host the responsibility for every enemy regardless of who was
+// actually nearby.
+RECOMP_EXPORT u32 bkrecomp_net_am_i_actor_owner(Actor *actor) {
+    if (!recomp_net_is_connected()) return 1;  // single-player → always
+    if (!actor || !actor->marker) return 1;
+    u32 my_id = recomp_net_get_local_player_id();
+    return (u32)(compute_actor_owner(actor) == (u8)my_id);
 }
 
 // Combined filter for sync_enemy_positions — includes regular killable enemies
@@ -1710,152 +1914,133 @@ typedef struct {
 
 #define MAX_ENEMY_POS_ENTRIES 64
 
+// Find the receive-buffer entry matching this actor by (spawn_index, marker
+// alias). Returns NULL if the owning client hasn't broadcast it this tick.
+static EnemyPosEntry *find_recv_entry(EnemyPosEntry *recv_buf, u32 recv_count,
+                                       u16 actor_si, u16 actor_mid) {
+    u32 e;
+    for (e = 0; e < recv_count; e++) {
+        if (recv_buf[e].spawn_index != actor_si) continue;
+        if (!marker_id_matches(actor_mid, recv_buf[e].marker_id)) continue;
+        return &recv_buf[e];
+    }
+    return NULL;
+}
+
+// Per-actor dynamic ownership: each client iterates its locally loaded
+// actors, decides who SHOULD own each one (closest player, with hysteresis),
+// and either (a) packs+broadcasts when it's the owner, or (b) applies the
+// most recent broadcast from whoever the owner is.
+//
+// This replaces the previous host-only model. The host can be far enough
+// that BK's cube manager has despawned the enemy on its side; the join
+// next to that enemy now claims ownership and runs the state machine
+// locally. Its vanilla AI sees its own local Banjo as the closest player
+// (via the _player_getPosition patch already in network_enemy_ai.c) and
+// aggroes correctly.
 static void sync_enemy_positions(void) {
     if (!recomp_net_is_connected()) return;
     if (!suBaddieActorArray) return;
 
     u32 cur_map = (u32)map_get();
     u32 cur_level = (u32)level_get();
+    actor_owner_cache_reset_for_level(cur_level);
 
-    if (recomp_net_am_i_world_owner(cur_level)) {
-        // WORLD OWNER: collect enemy positions and send to network
-        EnemyPosEntry buf[MAX_ENEMY_POS_ENTRIES];
-        s32 count = 0;
-        s32 i;
+    u32 my_id = recomp_net_get_local_player_id();
 
-        for (i = 0; i < suBaddieActorArray->cnt && count < MAX_ENEMY_POS_ENTRIES; i++) {
-            Actor *actor = &suBaddieActorArray->data[i];
-            if (!actor->marker) continue;
-            if (!is_synced_actor(actor)) continue;
+    // Pull the latest interpolated broadcasts from every other client.
+    EnemyPosEntry recv_buf[MAX_ENEMY_POS_ENTRIES];
+    u32 recv_count = 0;
+    recomp_net_get_enemy_positions(recv_buf, &recv_count);
 
-            u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+    // Compose outgoing buffer for the actors I currently own.
+    EnemyPosEntry send_buf[MAX_ENEMY_POS_ENTRIES];
+    s32 send_count = 0;
 
-            // Install dieFunc proxy on owner too — sends death event immediately
-            // when enemy dies, instead of waiting for poll_enemy_deaths detection.
-            // AI is NOT suppressed on owner side. Special-case bosses without
-            // dieFunc (e.g. Conga) skip this naturally because of the null guard.
-            if (actor->marker->dieFunc && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
-                save_enemy_funcs(si, actor->marker->dieFunc,
-                                 actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
-                actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
-            }
+    s32 i;
+    for (i = 0; i < suBaddieActorArray->cnt && send_count < MAX_ENEMY_POS_ENTRIES; i++) {
+        Actor *actor = &suBaddieActorArray->data[i];
+        if (!actor->marker) continue;
+        if (!is_synced_actor(actor)) continue;
 
-            buf[count].spawn_index = si;
-            buf[count].marker_id = (u16)actor->marker->id;
-            buf[count].x = actor->position[0];
-            buf[count].y = actor->position[1];
-            buf[count].z = actor->position[2];
-            buf[count].yaw = actor->yaw;
+        u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+        u8 owner = compute_actor_owner(actor);
+        bool i_own = (owner == (u8)my_id);
+
+        // dieFunc proxy install (gated to is_killable_enemy as before).
+        // Both owner and non-owner sides install: owner reports kills it
+        // causes, non-owner reports kills its local Banjo causes.
+        if (is_killable_enemy(actor)
+            && actor->marker->dieFunc
+            && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
+            save_enemy_funcs(si, actor->marker->dieFunc,
+                             actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
+            actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
+        }
+
+        if (i_own) {
+            // OWNER: pack current authoritative state for broadcast.
+            send_buf[send_count].spawn_index = si;
+            send_buf[send_count].marker_id = (u16)actor->marker->id;
+            send_buf[send_count].x = actor->position[0];
+            send_buf[send_count].y = actor->position[1];
+            send_buf[send_count].z = actor->position[2];
+            send_buf[send_count].yaw = actor->yaw;
             if (actor->anctrl) {
-                buf[count].anim_id = (u16)anctrl_getIndex(actor->anctrl);
-                buf[count].anim_direction = (u8)(anctrl_isPlayedForwards(actor->anctrl) ? 1 : 0);
-                buf[count].anim_timer = anctrl_getAnimTimer(actor->anctrl);
+                send_buf[send_count].anim_id = (u16)anctrl_getIndex(actor->anctrl);
+                send_buf[send_count].anim_direction = (u8)(anctrl_isPlayedForwards(actor->anctrl) ? 1 : 0);
+                send_buf[send_count].anim_timer = anctrl_getAnimTimer(actor->anctrl);
             } else {
-                buf[count].anim_id = 0;
-                buf[count].anim_direction = 1;
-                buf[count].anim_timer = 0.0f;
+                send_buf[send_count].anim_id = 0;
+                send_buf[send_count].anim_direction = 1;
+                send_buf[send_count].anim_timer = 0.0f;
             }
-            /* Pack actor->state (6-bit bitfield) into the state byte. Used by
-             * special-case bosses on non-owner to adopt owner's state machine
-             * wholesale. Regular enemies tolerate the byte being read; their
-             * state machines just keep running locally. */
-            buf[count].state = (u8)(actor->state & 0x3F);
-            count++;
-        }
+            send_buf[send_count].state = (u8)(actor->state & 0x3F);
+            send_count++;
+        } else {
+            // NON-OWNER: apply received state for this actor (if any).
+            if (is_dying(si)) continue;
+            EnemyPosEntry *src = find_recv_entry(recv_buf, recv_count, si, (u16)actor->marker->id);
+            if (!src) continue;
 
-        if (count > 0) {
-            recomp_net_send_enemy_positions(buf, (u32)count, cur_map);
-        }
-    } else {
-        // JOIN: receive interpolated positions and apply to local actors
-        EnemyPosEntry buf[MAX_ENEMY_POS_ENTRIES];
-        u32 count = 0;
-        recomp_net_get_enemy_positions(buf, &count);
+            actor->position[0] = src->x;
+            actor->position[1] = src->y;
+            actor->position[2] = src->z;
+            actor->yaw = src->yaw;
 
-        if (count == 0) return;
-
-        s32 e;
-        for (e = 0; e < (s32)count; e++) {
-            u16 target_spawn = buf[e].spawn_index;
-            u16 target_marker = buf[e].marker_id;
-
-            // Skip dying enemies — let death animation play without override
-            if (is_dying(target_spawn)) continue;
-
-            // Find matching actor
-            s32 i;
-            for (i = 0; i < suBaddieActorArray->cnt; i++) {
-                Actor *actor = &suBaddieActorArray->data[i];
-                if (!actor->marker) continue;
-                if (actor->marker->id != target_marker) continue;
-
-                u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
-                if (si != target_spawn) continue;
-
-                // Apply host position
-                actor->position[0] = buf[e].x;
-                actor->position[1] = buf[e].y;
-                actor->position[2] = buf[e].z;
-                actor->yaw = buf[e].yaw;
-
-                // Full animation sync from host (ID + timer + direction every frame).
-                //
-                // CAREFUL: anctrl_setIndex() only stores the next-index in
-                // ctrl->index; the actually playing animation lives in
-                // ctrl->animation->index and is only swapped when anctrl_start()
-                // (or subaddie_set_state via __subaddie_set_state) is called.
-                //
-                // For "regular" enemies the local state machine on non-owner
-                // calls subaddie_set_state* every state transition, which commits
-                // the index. So setIndex alone is enough — the local commit
-                // happens organically.
-                //
-                // For special-case bosses (Conga) the local state machine is
-                // skipped on non-owner, so nothing commits. We must commit
-                // ourselves via anctrl_start when the synced index actually
-                // changes. Also refresh duration from the actor's animation
-                // table so timer→frame translation matches.
-                if (actor->anctrl && buf[e].anim_id != 0) {
-                    if (is_synced_special_actor(actor)) {
-                        enum asset_e cur_idx = anctrl_getIndex(actor->anctrl);
-                        if ((s32)cur_idx != (s32)buf[e].anim_id) {
-                            anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
-                            if (actor->unk18 && buf[e].state > 0) {
-                                anctrl_setDuration(actor->anctrl,
-                                                    actor->unk18[buf[e].state].duration);
-                            }
-                            _anctrl_start(actor->anctrl, "network_world_sync.c", __LINE__);
-                        }
-                    } else {
-                        anctrl_setIndex(actor->anctrl, (enum asset_e)buf[e].anim_id);
-                    }
-                    anctrl_setAnimTimer(actor->anctrl, buf[e].anim_timer);
-                    anctrl_setDirection(actor->anctrl, (s32)buf[e].anim_direction);
-                }
-
-                // Apply owner's actor->state for special-case bosses whose
-                // chConga_update / equivalent skips the local state machine
-                // entirely on non-owner. Skipped for regular enemies since
-                // their state machines run unmodified per-machine.
+            // Full animation sync from owner (anim_id + timer + direction).
+            // For special-case actors (Bigbutt/Conga/etc.) whose update
+            // function explicitly skips the state machine on non-owner, we
+            // must commit anim_id via _anctrl_start because nothing else
+            // calls subaddie_set_state* to do it. Regular enemies still run
+            // their own state machine locally and commit the index on the
+            // next transition.
+            if (actor->anctrl && src->anim_id != 0) {
                 if (is_synced_special_actor(actor)) {
-                    actor->state = (u32)buf[e].state;
+                    enum asset_e cur_idx = anctrl_getIndex(actor->anctrl);
+                    if ((s32)cur_idx != (s32)src->anim_id) {
+                        anctrl_setIndex(actor->anctrl, (enum asset_e)src->anim_id);
+                        if (actor->unk18 && src->state > 0) {
+                            anctrl_setDuration(actor->anctrl,
+                                                actor->unk18[src->state].duration);
+                        }
+                        _anctrl_start(actor->anctrl, "network_world_sync.c", __LINE__);
+                    }
+                } else {
+                    anctrl_setIndex(actor->anctrl, (enum asset_e)src->anim_id);
                 }
+                anctrl_setAnimTimer(actor->anctrl, src->anim_timer);
+                anctrl_setDirection(actor->anctrl, (s32)src->anim_direction);
+            }
 
-                // Install dieFunc proxy to track kills from non-owner side.
-                // AI is NOT suppressed — enemy processes damage and dies naturally.
-                // Position + animation are overridden from host data each frame.
-                if (actor->marker->dieFunc && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
-                    save_enemy_funcs(target_spawn, actor->marker->dieFunc,
-                                     actor->marker->collisionFunc, actor->marker->actorUpdateFunc);
-                    actor->marker->dieFunc = (MarkerCollisionFunc)net_enemy_die_proxy;
-                }
-
-                break;
+            if (is_synced_special_actor(actor)) {
+                actor->state = (u32)src->state;
             }
         }
+    }
 
-        // Dead enemies are handled via death events re-sent by host on join connect.
-        // process_enemy_event() despawns them individually — no aggressive bulk despawn needed.
+    if (send_count > 0) {
+        recomp_net_send_enemy_positions(send_buf, (u32)send_count, cur_map);
     }
 }
 

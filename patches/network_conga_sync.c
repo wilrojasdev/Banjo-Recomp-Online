@@ -13,6 +13,7 @@ u32  recomp_net_get_remote_state(u32 player_id, void *out);
 u32  recomp_net_get_remote_count(void);
 u32  recomp_net_get_local_player_id(void);
 u32  recomp_net_am_i_world_owner(u32 level_id);
+u32  bkrecomp_net_am_i_actor_owner(Actor *actor);
 void recomp_net_send_conga_orange(void *spawn_pos, void *velocity, u32 map_id);
 u32  recomp_net_pop_conga_orange(void *out);
 void recomp_net_send_flag_change(u32 flag_type, u32 flag_index, u32 value, u32 map_id);
@@ -597,8 +598,12 @@ RECOMP_PATCH void chConga_update(Actor *this) {
      * machine itself is skipped — the synced state already drives the
      * visual perfectly.
      * ============================================================ */
+    /* Per-actor dynamic ownership (sm64-coop pattern): the closest player
+     * runs Conga's state machine. When all peers are within Conga's
+     * activity sphere they all converge on the same owner via
+     * compute_actor_owner; the rest mirror the synced state. */
     is_non_owner = recomp_net_is_connected()
-                && !recomp_net_am_i_world_owner((u32)level_get());
+                && !bkrecomp_net_am_i_actor_owner(this);
 
     if (is_non_owner) {
         s32 cur_synced = (s32)this->state;
@@ -867,8 +872,12 @@ RECOMP_PATCH void __chConga_sendOrangeProjectile(ActorMarker *congaMarker) {
     u32 cur_map;
     u32 i;
 
-    /* Non-owner: bail — oranges come from network events */
-    if (recomp_net_is_connected() && !recomp_net_am_i_world_owner((u32)level_get())) {
+    /* Non-owner: bail — oranges come from network events. Use actor-owner
+     * (closest player to Conga) instead of world-owner so a non-host that
+     * is the closest player still drives orange spawns. The function is
+     * only reached from chConga_update, which is itself gated on actor
+     * ownership now. */
+    if (recomp_net_is_connected() && !bkrecomp_net_am_i_actor_owner(congaPtr)) {
         return;
     }
 
@@ -1001,7 +1010,12 @@ RECOMP_EXPORT void bkrecomp_net_process_conga_oranges(void) {
     CongaOrangeEvent evt;
 
     if (!recomp_net_is_connected()) return;
-    if (recomp_net_am_i_world_owner((u32)level_get())) return;
+    /* Skip processing the event on the peer that fired the spawn locally
+     * — they already spawned the orange via __chConga_sendOrangeProjectile.
+     * That peer is whoever currently owns Conga's AI (closest player),
+     * not necessarily the world owner. */
+    Actor *conga = actorArray_findActorFromMarkerId(MARKER_7_CONGA);
+    if (conga && bkrecomp_net_am_i_actor_owner(conga)) return;
 
     while (recomp_net_pop_conga_orange(&evt)) {
         s32 spawn_pos_s32[3];
