@@ -115,7 +115,6 @@ typedef struct {
     void *bone_save;           // Final bones for modelRender + skinning output
     void *bone_blend_temp;     // Scratch: animationFile_getBoneTransformList target
     u16 current_anim;
-    u16 bone_blend_base_anim;  // anim for which bone_blend_temp was last reset
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 ground_y;
@@ -292,7 +291,6 @@ static void ghost_ensure_init(u32 pid) {
     if (!gm->bones_world) return;
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
-    gm->bone_blend_base_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
     gm->ground_y = 0.0f;
@@ -582,6 +580,20 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         bool ghost_leaving_skid = (gm->prev_bs_state == BS_SKID && rs.bs_state != BS_SKID);
 
+        /* Reset the bone scratch buffer only when entering a new BS state from
+         * a looping walk/idle state. Walk/idle animations oscillate all arm
+         * bones; if we let them bleed into the next action (backflip, bpeck)
+         * the ghost shows "arms open" at action exit. States that share an
+         * animation file across internal phases (BFLIP HOLD→EXIT) stay within
+         * the same BS state, so this check correctly skips the reset there. */
+        bool prev_was_looping = (gm->prev_bs_state == BS_WALK
+            || gm->prev_bs_state == BS_4_WALK_FAST
+            || gm->prev_bs_state == BS_2_WALK_SLOW
+            || gm->prev_bs_state == BS_WALK_CREEP
+            || gm->prev_bs_state == BS_1_IDLE
+            || gm->prev_bs_state == BS_0_NONE);
+        bool should_reset_bones = (rs.bs_state != gm->prev_bs_state) && prev_was_looping;
+
         // === Update transformation model cache ===
         ghost_update_xform_model(gm, rs.transformation);
 
@@ -834,9 +846,8 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
              * keep bones purely from clip + timer until we have a matrix-only setup path. */
             void *anim_file = animBinCache_get(gm->current_anim);
             if (anim_file) {
-                if (gm->bone_blend_base_anim != gm->current_anim) {
+                if (should_reset_bones) {
                     boneTransformList_reset(gm->bone_blend_temp);
-                    gm->bone_blend_base_anim = gm->current_anim;
                 }
                 animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_blend_temp);
                 boneTransformList_interpolate(gm->bone_save, gm->bone_blend_temp,
