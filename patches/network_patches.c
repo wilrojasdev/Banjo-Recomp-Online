@@ -6,7 +6,7 @@
 
 extern AnimCtrl *baanim_getAnimCtrlPtr(void);
 extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
-extern f32 anctrl_getDuration(AnimCtrl *this);
+extern f32 anim_getDuration(Animation *this);
 extern f32 anctrl_getAnimTimer(AnimCtrl *this);
 extern enum asset_e anctrl_getIndex(AnimCtrl *this);
 extern enum anctrl_playback_e anctrl_getPlaybackType(AnimCtrl *this);
@@ -17,6 +17,12 @@ extern enum level_e level_get(void);
 extern s32 bs_getState(void);
 extern u32 player_getTransformation(void);
 extern f32 baphysics_get_horizontal_velocity(void);
+
+/* 1 = recomp_printf local-player SKID frame-by-frame lines. Pair with the
+ * same flag in network_remote_player.c so sender/receiver dumps line up. */
+#ifndef BKRECOMP_NET_GHOST_ANIM_LOG
+#define BKRECOMP_NET_GHOST_ANIM_LOG 1
+#endif
 
 // Kazooie visibility globals (from core2/code_16C60.c)
 extern u8 D_8037D235; // Kazooie feet
@@ -53,7 +59,7 @@ typedef struct {
     u16 animation_id;           // 0x1C
     u16 _pad1;                  // 0x1E
     f32 anim_timer;             // 0x20
-    f32 anim_duration;          // 0x24
+    f32 anim_duration;          // 0x24 — Animation.duration (blend 0..1), see net_sync
     u8  anim_playback_type;     // 0x28
     u8  health;                 // 0x29
     u8  health_total;           // 0x2A
@@ -103,7 +109,10 @@ static void net_sync_local_state(void) {
     AnimCtrl *ac = baanim_getAnimCtrlPtr();
     state.animation_id = (u16)anctrl_getIndex(ac);
     state.anim_timer = anctrl_getAnimTimer(ac);
-    state.anim_duration = anctrl_getDuration(ac);
+    /* Animation.duration = smooth-transition blend 0..1 (matches bone interpolate).
+     * NOT anctrl_getDuration (clip length in seconds) — ghosts need the blend
+     * factor or skid/walk cross-fades sample raw keys = stretched limbs. */
+    state.anim_duration = anim_getDuration(anctrl_getAnimPtr(ac));
     state.anim_playback_type = (u8)anctrl_getPlaybackType(ac);
 
     f32 sub_start = 0.0f, sub_end = 1.0f;
@@ -121,6 +130,26 @@ static void net_sync_local_state(void) {
 
     state.carry_kind = compute_local_carry_kind();
     state._pad3[0] = state._pad3[1] = state._pad3[2] = 0;
+
+#if BKRECOMP_NET_GHOST_ANIM_LOG
+    /* Frame-by-frame dump while local player is in SKID, plus the first
+     * frame after leaving SKID. Mirror of the receiver-side dump in
+     * network_remote_player.c so the two logs line up. */
+    {
+        static u8 s_prev_local_bs = 0;
+        bool leaving_skid = (s_prev_local_bs == BS_SKID && state.bs_state != BS_SKID);
+        if (state.bs_state == BS_SKID || leaving_skid) {
+            recomp_printf(
+                "[GhostAnim/SEND] bs=%u leave=%d anim=%u t=%.5f dur=%.5f pb=%u sub=[%.4f,%.4f] hvel=%.2f\n",
+                (unsigned)state.bs_state, (int)leaving_skid,
+                (unsigned)state.animation_id, state.anim_timer, state.anim_duration,
+                (unsigned)state.anim_playback_type,
+                state.anim_subrange_start, state.anim_subrange_end,
+                state.horizontal_velocity);
+        }
+        s_prev_local_bs = state.bs_state;
+    }
+#endif
 
     recomp_net_push_full_state(&state);
     // Push level_id separately (not in NetFullState to preserve struct layout)

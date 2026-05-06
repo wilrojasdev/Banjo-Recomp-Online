@@ -1790,6 +1790,13 @@ static void ensure_join_panel() {
 
 static void populate_lobby_list_ui();
 
+// Flush lobby list UI if CoopNet callback fired (may occur mid-state-machine).
+static void flush_lobby_list_if_dirty() {
+    if (lobby_list_dirty.exchange(false)) {
+        populate_lobby_list_ui();
+    }
+}
+
 static void begin_coopnet_connect() {
     bknet::set_coopnet_server(COOPNET_SERVER);
     bknet::set_coopnet_port(COOPNET_PORT);
@@ -1877,6 +1884,9 @@ static void update_coopnet_state() {
                 coopnet_state.store(static_cast<int>(CoopNetState::Idle));
                 join_show_menu();
             }
+            // begin_private_search may synchronously fill the list; flush before
+            // return so the first paint updates slot counts / rows.
+            flush_lobby_list_if_dirty();
             return;
         }
 
@@ -1920,10 +1930,7 @@ static void update_coopnet_state() {
     }
 
     // Deferred lobby list UI update (must happen in launcher context)
-    if (lobby_list_dirty.exchange(false)) {
-        populate_lobby_list_ui();
-    }
-
+    flush_lobby_list_if_dirty();
 }
 
 static void populate_lobby_list_ui() {
@@ -1939,10 +1946,9 @@ static void populate_lobby_list_ui() {
         }
     }
 
-    // Hide old lobby rows
-    for (auto* row : join_lobby_rows) {
-        row->display_hide();
-    }
+    // Remove previous rows so counts/host names refresh correctly (hiding alone
+    // left stale elements attached to the scroll container).
+    join_lobby_container->clear_children();
     join_lobby_rows.clear();
 
     // Create lobby entries
@@ -2019,6 +2025,7 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
     if (auto* host_opt = game_options_menu->get_start_game_option()) {
         host_opt->set_callback([]() {
             ensure_host_panel();
+            host_slots_dirty = true; // re-read save file (jiggies/notes) when opening Host
             show_panel(host_panel);
         });
     }

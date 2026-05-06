@@ -2,6 +2,7 @@
 #include "net_manager.h"
 #include "net_interpolation.h"
 
+#include "ultramodern/ultramodern.hpp"
 #include "recompui/recompui.h"
 #include "core/ui_context.h"
 #include "elements/ui_element.h"
@@ -204,6 +205,16 @@ bool nametag_ui_is_enabled() {
 
 void nametag_ui_update() {
     auto& net = NetworkManager::instance();
+
+    /* CoopNet host sets ConnectionState::Hosting before start_game(); net.is_connected()
+     * is true in the launcher. Creating/showing the nametag overlay here races with
+     * start_game() + mod load and can SIGBUS on macOS. Only run after the game exists. */
+    if (!ultramodern::is_game_started()) {
+        if (nametag_initialized && is_context_shown(nametag_context)) {
+            hide_context(nametag_context);
+        }
+        return;
+    }
 
     if (!net.is_connected() || !nametag_enabled) {
         if (nametag_initialized && is_context_shown(nametag_context)) {

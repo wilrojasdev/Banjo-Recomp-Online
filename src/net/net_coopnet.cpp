@@ -168,6 +168,11 @@ bool CoopNetTransport::join_lobby(uint64_t lobby_id, const std::string& password
 bool CoopNetTransport::leave_lobby() {
     if (current_lobby_id_ == 0) return false;
 
+    // Mark before calling coopnet_lobby_leave so on_lobby_left (which may
+    // fire synchronously on the same thread or async on the next update)
+    // can suppress the unexpected-disconnect callback.
+    voluntary_leave_ = true;
+
     CoopNetRc rc = coopnet_lobby_leave(current_lobby_id_);
     current_lobby_id_ = 0;
     is_host_ = false;
@@ -401,8 +406,12 @@ void CoopNetTransport::on_lobby_left(uint64_t lobby_id, uint64_t user_id) {
         for (auto& r : s_instance_->rtt_ms_) r.store(0, std::memory_order_relaxed);
         std::printf("[CoopNet] Left lobby %llu\n", (unsigned long long)lobby_id);
 
-        // If we didn't leave voluntarily, signal unexpected disconnect
-        if (s_instance_->signaling_disconnect_callback_) {
+        // If we didn't leave voluntarily, signal unexpected disconnect.
+        // The flag is set by leave_lobby() and cleared here so the next
+        // unexpected drop is reported correctly.
+        bool was_voluntary = s_instance_->voluntary_leave_;
+        s_instance_->voluntary_leave_ = false;
+        if (!was_voluntary && s_instance_->signaling_disconnect_callback_) {
             s_instance_->signaling_disconnect_callback_();
         }
     } else {
@@ -579,19 +588,11 @@ void CoopNetTransport::on_peer_connected(uint64_t peer_id) {
             s_instance_->connect_callback_(assigned_id);
         }
 
-        // Broadcast PlayerJoin to other peers
-        PlayerJoinPacket join_pkt{};
-        join_pkt.header.type = PacketType::PlayerJoin;
-        join_pkt.header.player_id = assigned_id;
-        join_pkt.header.sequence = 0;
-
-        for (uint8_t i = 1; i < MAX_PLAYERS; i++) {
-            uint64_t other_peer = s_instance_->player_peers_[i];
-            if (other_peer != INVALID_PEER && other_peer != peer_id) {
-                coopnet_send_to(other_peer,
-                    reinterpret_cast<const uint8_t*>(&join_pkt), sizeof(join_pkt));
-            }
-        }
+        // Do NOT send PlayerJoin from here: a zeroed player_name becomes "" and
+        // receivers map that to "Player", which can also overwrite a good name
+        // if it arrives after broadcast_local_name(). Notifying existing clients
+        // with a proper placeholder (and real names later) is handled in
+        // NetworkManager::coopnet_host_lobby connect_callback.
     } else {
         // Non-host client. The peer could be host, or another joiner in a
         // 3+ player lobby — libcoopnet establishes a full P2P mesh.

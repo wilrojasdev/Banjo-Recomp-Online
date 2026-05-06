@@ -23,7 +23,8 @@ constexpr uint8_t NUM_CHANNELS = 2;
 // v5: EnemyPositionEntry repurposes the remaining _pad byte as `state`
 // (actor->state cast to u8). Lets non-owner peers adopt the owner's state
 // machine wholesale for bosses (Conga) instead of running their own.
-constexpr uint32_t PROTOCOL_VERSION = 5;
+// v6: PlayerState.anim_duration is Animation.duration (blend 0..1), not anctrl clip length.
+constexpr uint32_t PROTOCOL_VERSION = 6;
 
 // Optional features negotiated in VersionCheck. Both peers' reported bitmaps
 // are ANDed; behaviour downgrades for features not common to both. This lets
@@ -31,8 +32,23 @@ constexpr uint32_t PROTOCOL_VERSION = 5;
 constexpr uint32_t FEATURE_FRAGMENT_NACK = 1u << 0;
 constexpr uint32_t FEATURE_DIRTY_DELTA   = 1u << 1;
 constexpr uint32_t FEATURE_BW_CAP        = 1u << 2;
+// Joiner echoes WorldStateFull receipt; host retries up to N times if no ack
+// arrives within ~12s. Without it, a silent fragment-reassembly failure leaves
+// the joiner stuck with no world state and the host eventually drops them by
+// idle timeout. Negotiated, so old peers fall back to fire-and-forget.
+constexpr uint32_t FEATURE_FULLSTATE_ACK = 1u << 3;
+// zlib-deflate wrapping for payloads > COMPRESSION_THRESHOLD. Negotiated, so
+// peers without the feature receive raw bytes. Reduces WorldStateFull (~600B)
+// and HostEeprom (2 KB) burst on join — typical compression ratio 3-4× on
+// our flag bitfields keeps the join packet single-fragment in most cases.
+constexpr uint32_t FEATURE_COMPRESSION = 1u << 4;
 constexpr uint32_t SUPPORTED_FEATURES =
-    FEATURE_FRAGMENT_NACK | FEATURE_DIRTY_DELTA | FEATURE_BW_CAP;
+    FEATURE_FRAGMENT_NACK | FEATURE_DIRTY_DELTA | FEATURE_BW_CAP |
+    FEATURE_FULLSTATE_ACK | FEATURE_COMPRESSION;
+
+// Don't bother compressing tiny packets — zlib adds ~6 bytes of overhead and
+// PlayerPosition/PlayerState are mostly floats which compress poorly anyway.
+constexpr size_t COMPRESSION_THRESHOLD = 256;
 
 enum class PacketType : uint8_t {
     // Connection (reliable)
@@ -66,12 +82,17 @@ enum class PacketType : uint8_t {
     CongaOrangeSpawn = 0x38,  // Conga orange projectile spawn (world owner → others)
     WorldStateFull   = 0x3F,
     HostEeprom       = 0x40,  // Host ships its full EEPROM (2 KB) to join on connect
+    WorldStateFullAck= 0x41,  // Joiner → host: confirms WorldStateFull was applied
 
     // Fragmented transfer (for payloads > ~1200 bytes): splits reliable packets
     // into sequenced chunks so a single lost chunk triggers only one small
     // retransmit instead of the entire bulk.
     FragmentChunk    = 0x50,
     FragmentNack     = 0x51, // Receiver → sender: bitmap of missing chunks
+
+    // Wrapper: original packet wrapped in zlib-deflate. Receiver inflates and
+    // re-dispatches the inner packet through the normal handler.
+    Compressed       = 0x52,
 };
 
 #pragma pack(push, 1)
@@ -386,6 +407,23 @@ struct WorldStateFullPacket {
 // seeded with this data. Saves on the client side stay ephemeral —
 // they never touch disk. See network_save_override.c on the MIPS side.
 constexpr size_t HOST_EEPROM_SIZE = 2048;
+
+// zlib wrapper. The outer header carries type=Compressed; payload is a
+// deflate stream of the original packet (header + body). Receiver inflates
+// up to `original_size` bytes and re-dispatches through handle_packet.
+// Wire layout: [CompressedPacketHeader][deflate bytes...]
+struct CompressedPacketHeader {
+    PacketHeader header;
+    uint32_t original_size;
+    uint32_t compressed_size;
+};
+
+// Joiner → host. Sent when the receiver enqueues a WorldStateFull packet so
+// the host knows the bulk transfer landed. Host gates resends on this ack.
+struct WorldStateFullAckPacket {
+    PacketHeader header;
+    uint32_t map_id; // echoed for correlation/debugging
+};
 
 struct HostEepromPacket {
     PacketHeader header;

@@ -138,6 +138,10 @@ private:
     bool signaling_connected_ = false;
     bool is_host_ = false;
     bool shutdown_pending_ = false;
+    // Set by leave_lobby() so on_lobby_left can distinguish a voluntary exit
+    // from being booted (host left, server kick). Without it, the unexpected-
+    // disconnect callback fired on every leave and triggered phantom reconnects.
+    bool voluntary_leave_ = false;
 
     // Lobby list accumulator
     std::vector<LobbyInfo> lobby_list_buffer_;

@@ -20,7 +20,7 @@
 // 0x1C    u16 animation_id         2
 // 0x1E    (pad)                    2
 // 0x20    f32 anim_timer           4
-// 0x24    f32 anim_duration        4
+// 0x24    f32 anim_duration        4  (Animation.duration: transition blend 0..1)
 // 0x28    u8  anim_playback_type   1
 // 0x29    u8  health               1
 // 0x2A    u8  health_total         1

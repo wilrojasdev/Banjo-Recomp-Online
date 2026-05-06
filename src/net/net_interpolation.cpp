@@ -4,6 +4,14 @@
 
 namespace bknet {
 
+// BS_SKID / bsturn: bsturn_end snaps yaw (~180°), pitch and roll to ideals instantly.
+// Interpolating yaw/pitch across snapshots leaves the ghost body tilt lerped while
+// animation keys already match the target snapshot — limbs look twisted/stretched.
+static constexpr uint8_t kBsSkid = 0x0C;
+// ASSET_E_ANIM_BSTURN — if BS_SKID is missing on a snapshot but clips change,
+// we still must not lerp yaw across a bsturn exit (walk→walk segment with ~180° yaw).
+static constexpr uint16_t kAnimBsturn = 0x000E;
+
 // --- RemotePlayerInterpolator ---
 
 void RemotePlayerInterpolator::push_snapshot(const PositionSnapshot& snap) {
@@ -102,13 +110,24 @@ InterpolatedState RemotePlayerInterpolator::interpolate(double current_time) con
             result.y = a->y + (b->y - a->y) * t;
             result.z = a->z + (b->z - a->z) * t;
 
-            // Interpolate yaw with shortest path
+            /* Yaw/pitch must stay coherent with the clip we draw (always snapshot b).
+             * Skid segment: snap (below). Also snap when clips change off BSTURN or when
+             * yaw jumps sharply — otherwise we blend facing while bones are already b. */
             float yaw_diff = b->yaw - a->yaw;
             if (yaw_diff > 180.0f) yaw_diff -= 360.0f;
             if (yaw_diff < -180.0f) yaw_diff += 360.0f;
-            result.yaw = a->yaw + yaw_diff * t;
-
-            result.pitch = a->pitch + (b->pitch - a->pitch) * t;
+            const bool skid_bs = (a->bs_state == kBsSkid || b->bs_state == kBsSkid);
+            const bool clip_changes = (a->animation_id != b->animation_id);
+            const bool bsturn_clip =
+                (a->animation_id == kAnimBsturn || b->animation_id == kAnimBsturn);
+            const bool snap_ori = skid_bs || (clip_changes && (bsturn_clip || std::fabs(yaw_diff) > 70.0f));
+            if (snap_ori) {
+                result.yaw = b->yaw;
+                result.pitch = b->pitch;
+            } else {
+                result.yaw = a->yaw + yaw_diff * t;
+                result.pitch = a->pitch + (b->pitch - a->pitch) * t;
+            }
             result.scale = a->scale + (b->scale - a->scale) * t;
 
             // Non-interpolated fields: use target snapshot

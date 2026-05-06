@@ -154,7 +154,12 @@ set_source_files_properties(${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c PROP
 
 # Build patches elf
 if(NOT DEFINED PATCHES_C_COMPILER)
-    set(PATCHES_C_COMPILER clang)
+    # Prefer Homebrew LLVM clang (supports MIPS flags); fall back to system clang
+    if(EXISTS /opt/homebrew/opt/llvm/bin/clang)
+        set(PATCHES_C_COMPILER /opt/homebrew/opt/llvm/bin/clang)
+    else()
+        set(PATCHES_C_COMPILER clang)
+    endif()
 endif()
 
 if(NOT DEFINED PATCHES_LD)
@@ -420,6 +425,14 @@ target_link_libraries(BanjoRecompiled PRIVATE
     enet
     coopnet
 )
+
+# zlib for compressed network packets (FEATURE_COMPRESSION). Linked directly
+# instead of via find_package(ZLIB) — the latter propagates an SDK include
+# path that conflicts with libc++ header resolution on macOS. zlib.h ships
+# with the system on macOS/Linux; on Windows we'd vendor it (unused for now).
+if(NOT WIN32)
+    target_link_libraries(BanjoRecompiled PRIVATE z)
+endif()
 
 # Embed all bundled mod files (.nrm code mods and .rtz texture packs) in the
 # "embedded_mods" directory. They get registered via

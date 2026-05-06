@@ -33,6 +33,7 @@ struct NetworkStats {
     uint64_t packets_dropped_stale_seq = 0;   // UDP reorder reject
     uint64_t packets_dropped_rate_limit = 0;  // chat / bandwidth cap
     uint64_t packets_dropped_unknown = 0;     // unknown PacketType
+    uint64_t packets_dropped_duplicate = 0;   // dedup ring caught a repeat
     uint64_t fragments_sent = 0;
     uint64_t fragments_completed = 0;
     uint64_t fragments_nacked = 0;            // NACK packets emitted
@@ -252,6 +253,16 @@ private:
     void send_chunked(uint8_t target_player, PacketType original_type,
                       const void* data, size_t size);
     void handle_fragment_chunk(uint8_t from_player_id, const FragmentChunkPacket& pkt);
+
+    // zlib wrap/unwrap. wrap_compressed_for_peer returns a compressed envelope
+    // when the peer negotiated FEATURE_COMPRESSION and `size` is worth
+    // compressing; otherwise returns an empty vector and the caller should
+    // send the original payload. handle_compressed_packet inflates the inner
+    // payload and re-dispatches it through handle_packet.
+    std::vector<uint8_t> wrap_compressed_for_peer(uint8_t target_player,
+                                                  const void* data, size_t size);
+    void handle_compressed_packet(uint8_t from_player_id,
+                                  const uint8_t* data, size_t size);
     void handle_fragment_nack(uint8_t from_player_id, const FragmentNackPacket& pkt);
 
     // Called from tick_network_health(): emit NACKs for incomplete reassembly
@@ -306,6 +317,18 @@ private:
     uint8_t sync_target_player_ = 0;
     std::deque<WorldStateFullPacket> full_state_queue_;
 
+    // Per-joiner ack tracking. Host stamps full_sync_sent_at_ when MIPS hands
+    // the packet to the wire and waits for a WorldStateFullAck. If FULLSTATE_ACK
+    // is negotiated and no ack arrives within FULL_SYNC_ACK_TIMEOUT, host re-arms
+    // pending_full_sync_ for that player up to MAX_FULL_SYNC_RETRIES times.
+    static constexpr double  FULL_SYNC_ACK_TIMEOUT = 12.0;
+    static constexpr uint8_t MAX_FULL_SYNC_RETRIES = 3;
+    std::array<double,  MAX_PLAYERS> full_sync_sent_at_{};   // 0.0 = no send pending ack
+    std::array<bool,    MAX_PLAYERS> full_sync_acked_{};
+    std::array<uint8_t, MAX_PLAYERS> full_sync_retries_{};
+    void handle_world_state_full_ack(uint8_t from_player_id, const WorldStateFullAckPacket& pkt);
+    void tick_full_sync_retry(double now);
+
     // Host EEPROM snapshot (SM64 Coop DX-style save override)
     std::atomic<bool> pending_host_eeprom_{false};
     uint8_t host_eeprom_target_player_ = 0;
@@ -341,9 +364,13 @@ private:
     };
     static constexpr uint8_t BROADCAST_TARGET = 0xFF;
     // Hard cap to prevent unbounded memory growth if CoopNet stalls. Unreliable
-    // packets older than this are dropped first; reliable are preserved up to
-    // twice the cap before we log and drop the oldest.
-    static constexpr size_t MAX_SEND_QUEUE = 256;
+    // packets older than this are dropped first; non-critical reliables next;
+    // critical reliables (handshake/save/world state) are protected and only
+    // ever dropped at twice the cap as a last resort.
+    static constexpr size_t MAX_SEND_QUEUE = 512;
+    // Returns true for packet types that MUST be delivered for the join/sync
+    // pipeline to complete. Inspected from the first byte of a queued payload.
+    static bool is_critical_reliable(uint8_t first_byte);
     mutable std::mutex send_queue_mutex_;
     std::deque<QueuedPacket> packet_send_queue_;
 
@@ -360,6 +387,22 @@ private:
     // Keyed by ((player_id << 8) | packet_type_low_byte). uint16_t store.
     std::unordered_map<uint16_t, uint16_t> last_seen_seq_;
 
+    // Universal duplicate-detection ring buffer (one per peer). Mirrors the
+    // sm64coopdx network_player rxSeqIds + rxPacketHash design. Catches
+    // duplicates the per-type freshness check misses: same payload arriving
+    // twice via the CoopNet mesh, ENet retransmit-after-NACK collisions,
+    // and seqId reuse after a peer slot recycles. Indexed by next_idx;
+    // wraps after RX_DEDUP_RING bytes.
+    static constexpr size_t RX_DEDUP_RING = 256;
+    struct RxDedup {
+        std::array<uint16_t, RX_DEDUP_RING> seq{};
+        std::array<uint32_t, RX_DEDUP_RING> hash{};
+        size_t next_idx = 0;
+    };
+    std::array<RxDedup, MAX_PLAYERS> rx_dedup_{};
+    bool is_duplicate_packet(uint8_t from_player_id, uint16_t seq,
+                             const uint8_t* data, size_t size);
+
     // Fragment reassembly buffer per (sender player_id, group_id).
     struct FragmentAssembly {
         uint16_t chunk_count = 0;
@@ -373,7 +416,11 @@ private:
         std::vector<bool> received_mask;
         std::vector<uint8_t> buffer;
     };
-    static constexpr uint8_t MAX_NACK_ATTEMPTS = 5;
+    // 15 attempts × ~1s throttle = ~15s of recovery before giving up. Combined
+    // with the joiner-side grace idle timeout (see tick_network_health) this
+    // covers WAN packet-loss bursts during the WorldStateFull/HostEeprom join
+    // burst without dropping the peer.
+    static constexpr uint8_t MAX_NACK_ATTEMPTS = 15;
     std::unordered_map<uint32_t, FragmentAssembly> fragment_assembly_;
 
     // Sender-side cache of chunks for potential retransmit. Key = group_id.
@@ -403,8 +450,16 @@ private:
     // Per-player inbound bandwidth tracker (1s window). Peers exceeding
     // MAX_INBOUND_BPS are dropped with CoopNetError::BandwidthExceeded (treated
     // as a peer-failed equivalent — this protects the host from buggy clients).
-    static constexpr uint32_t MAX_INBOUND_BPS = 256 * 1024; // 256 KB/s per peer
+    // Steady-state cap raised to 512 KB/s so normal gameplay (32 enemies @
+    // 30 Hz + voice + state deltas) doesn't graze the limit on busy maps.
+    // During the first JOIN_GRACE_SECONDS after a peer's first packet, the
+    // cap is multiplied by JOIN_GRACE_MULTIPLIER so the initial WorldStateFull
+    // + HostEeprom + bulk enemies burst can pass without tripping the kick.
+    static constexpr uint32_t MAX_INBOUND_BPS = 512 * 1024; // 512 KB/s steady
+    static constexpr double   JOIN_GRACE_SECONDS = 10.0;
+    static constexpr uint32_t JOIN_GRACE_MULTIPLIER = 4;    // 2 MB/s during burst
     std::array<uint32_t, MAX_PLAYERS> bytes_recv_window_{};
+    std::array<double,  MAX_PLAYERS> peer_first_seen_{};    // 0.0 = unset
     double last_bw_window_reset_ = 0.0;
 
     // Receive-side "last known state" for dirty_flags delta apply. When a
@@ -428,6 +483,16 @@ private:
     uint32_t reconnect_attempts_ = 0;
     std::string reconnect_server_;
     uint16_t reconnect_port_ = 0;
+    // Saved lobby coordinates so the joiner can re-enter the same lobby after
+    // signaling reconnects. 0 means "not a lobby joiner" (host or LAN).
+    uint64_t reconnect_lobby_id_ = 0;
+    std::string reconnect_lobby_password_;
+    bool reconnect_relobby_pending_ = false; // signaling came back, need to join
+
+    // Connecting-state watchdog: if we don't transition to Connected within
+    // CONNECTING_TIMEOUT seconds, drop to Disconnected with a visible error.
+    static constexpr double CONNECTING_TIMEOUT = 25.0;
+    double connecting_started_at_ = 0.0; // 0.0 = not in Connecting
 
     CoopNetTransport::TypedErrorCallback typed_error_callback_;
 };

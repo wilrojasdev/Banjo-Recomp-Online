@@ -2,8 +2,9 @@
 #include "functions.h"
 #include "enums.h"
 #include "core2/modelRender.h"
-#include "core2/anctrl.h"
 #include "core2/commonParticle.h"
+
+extern AnimMtxList *D_8038371C;
 
 extern s32 commonParticle_new(enum common_particle_e particle_id, s32 arg1);
 extern void commonParticle_add(s32 actorMarker, s32 arg1, s32 arg2);
@@ -30,6 +31,13 @@ extern s32 cur_drawn_model_transform_id;
 #define GHOST_TRANSFORM_ID_START  0x20000000
 #define GHOST_TRANSFORM_ID_STRIDE 0x100
 
+/* 1 = recomp_printf ghost SKID frame-by-frame lines. Rebuild patches after
+ * changing. Pair this with the same flag in network_patches.c so sender and
+ * receiver dumps line up. */
+#ifndef BKRECOMP_NET_GHOST_ANIM_LOG
+#define BKRECOMP_NET_GHOST_ANIM_LOG 1
+#endif
+
 // Must match NetFullState layout in network_patches.c and net_recomp_api.cpp
 typedef struct {
     f32 x, y, z, yaw, pitch, scale;
@@ -53,17 +61,16 @@ extern void func_8029A47C(s32 env_color[3]);
 extern void func_8033A280(f32);
 extern struct5Bs *D_80363780;
 extern void func_8033A450(struct5Bs *);
+extern void modelRender_setBoneTransformList(void *bone_transform_list);
 extern void baanim_80289F30(void);
 extern void func_8029DD6C(void);
-extern AnimCtrl *baanim_getAnimCtrlPtr(void);
-extern Animation *anctrl_getAnimPtr(AnimCtrl *this);
-extern void *animcache_getCurrentTransform(Animation *this);
 extern enum asset_e baModel_getModelId(void);
 extern void bkrecomp_setup_custom_skinning(ModelSkinningData* skinning_data, u32 model_id);
 
 extern void *animBinCache_get(enum asset_e asset_id);
 extern void animationFile_getBoneTransformList(void *anim_file, f32 progress, void *bone_list);
 extern void *boneTransformList_new(void);
+extern void boneTransformList_reset(void *bone_list);
 extern void boneTransformList_interpolate(void *result, void *start, void *end, f32 t);
 extern f32 time_getDelta(void);
 extern f32 mapModel_getFloorY(f32 pos[3]);
@@ -105,8 +112,10 @@ static void *s_carry_orange_model_bin = NULL;
 
 typedef struct {
     void *shadow_model;
-    void *bone_save;      // Buffer to save/restore local player's bones
+    void *bone_save;           // Final bones for modelRender + skinning output
+    void *bone_blend_temp;     // Scratch: animationFile_getBoneTransformList target
     u16 current_anim;
+    u16 bone_blend_base_anim;  // anim for which bone_blend_temp was last reset
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 ground_y;
@@ -126,6 +135,7 @@ typedef struct {
     void *xform_model_bin;        // Loaded model binary (NULL = use baModelBin)
     u8    cached_transformation;  // Which transformation is currently cached
     enum asset_e cached_model_id; // Asset ID of the cached model (for skinning)
+    s8 slide_dust_phase;            // BS_SLIDE dust side alternation (per peer, not static)
     /* Per-ghost world-space bone buffer. Set as the current bone-output
      * target via func_8033A450 right before this ghost's modelRender_draw
      * so the bones the renderer would otherwise write into the local
@@ -275,10 +285,14 @@ static void ghost_ensure_init(u32 pid) {
     gm->bone_save = boneTransformList_new();
     if (!gm->bone_save) return;
 
+    gm->bone_blend_temp = boneTransformList_new();
+    if (!gm->bone_blend_temp) return;
+
     gm->bones_world = func_8034A2C8();   /* world-space bone sink (own buffer) */
     if (!gm->bones_world) return;
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
+    gm->bone_blend_base_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
     gm->ground_y = 0.0f;
@@ -485,6 +499,15 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
     s32 i;
     for (i = 0; i < 0x2A; i++) saved_nodes[i] = func_8033A0F0(i);
 
+    /* baModel_draw already ran anim_update; animcache still holds this frame's
+     * local bone buffer — do NOT call baanim_80289F30 here (that ran before the
+     * shadow draw below would NULL modelRenderBoneTransformList via
+     * modelRender_reset, and a second anim_update double-advances local anims).
+     * Per-ghost: shadow modelRender_draw clears BoneTransformList global; we
+     * must modelRender_setBoneTransformList(bone_buffer) again before the body. */
+
+    AnimMtxList *saved_anim_mtx_list = D_8038371C;
+
     for (u32 pid = 0; pid < MAX_PLAYERS; pid++) {
         if (pid == local_id) continue;
 
@@ -557,6 +580,8 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
         GhostModel *gm = &ghost_models[pid];
         if (!gm->initialized) continue;
 
+        bool ghost_leaving_skid = (gm->prev_bs_state == BS_SKID && rs.bs_state != BS_SKID);
+
         // === Update transformation model cache ===
         ghost_update_xform_model(gm, rs.transformation);
 
@@ -626,16 +651,15 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
                     gm->bbuster_dust_done = TRUE;
                     gm->dust_cooldown = 15;
                 } else if (is_sliding) {
-                    static s32 slide_phase = 0;
                     f32 slide_pos[3] = {rs.x, rs.y + 20.0f, rs.z};
-                    slide_phase++;
-                    if (slide_phase >= 3) slide_phase = 0;
-                    if (slide_phase != 0) {
+                    gm->slide_dust_phase++;
+                    if (gm->slide_dust_phase >= 3) gm->slide_dust_phase = 0;
+                    if (gm->slide_dust_phase != 0) {
                         f32 side_offset[3];
                         f32 side_angle = mlNormalizeAngle(rs.yaw + 90.0f);
                         func_802589E4(side_offset, side_angle, randf() * 10.0f + 20.0f);
                         side_offset[1] = 0.0f;
-                        if (slide_phase == 1) {
+                        if (gm->slide_dust_phase == 1) {
                             slide_pos[0] -= side_offset[0];
                             slide_pos[2] -= side_offset[2];
                         } else {
@@ -755,21 +779,21 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             target_yaw = mlNormalizeAngle(target_yaw - 180.0f);
         }
 
-        // Yaw interpolation speed.
-        // Large yaw changes (>90°) are applied instantly — game-triggered flips
-        // (bsturn_end does yaw-=180°) that should not be visually interpolated.
+        /* Skid / bsturn_end: sender snaps yaw (often ~180°). smooth_yaw lag vs
+         * network yaw twists the mesh against animation roots → stretched limbs.
+         * Match old ghost path (animcache stomp era): stay locked to net yaw
+         * during skid and the first walk frame after leaving it. */
         f32 yaw_diff = target_yaw - gm->smooth_yaw;
         while (yaw_diff > 180.0f) yaw_diff -= 360.0f;
         while (yaw_diff < -180.0f) yaw_diff += 360.0f;
         bool large_yaw_change = (yaw_diff > 90.0f || yaw_diff < -90.0f);
 
-        f32 yaw_speed;
-        if (large_yaw_change) {
-            yaw_speed = 1.0f;
-        } else if (rs.bs_state == BS_SKID) {
-            yaw_speed = 0.7f;
+        if (rs.bs_state == BS_SKID || ghost_leaving_skid) {
+            gm->smooth_yaw = target_yaw;
+        } else if (large_yaw_change) {
+            gm->smooth_yaw = lerp_angle(gm->smooth_yaw, target_yaw, 1.0f);
         } else {
-            yaw_speed = 0.25f;
+            gm->smooth_yaw = lerp_angle(gm->smooth_yaw, target_yaw, 0.25f);
         }
 
         // Ground tracking
@@ -782,7 +806,6 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             || rs.bs_state == BS_20_LANDING);
         if (on_ground) gm->ground_y = rs.y;
 
-        gm->smooth_yaw = lerp_angle(gm->smooth_yaw, target_yaw, yaw_speed);
         f32 pos[3] = {rs.x, rs.y, rs.z};
         f32 rot[3] = {rs.pitch, gm->smooth_yaw, 0.0f};
         f32 ref[3] = {0.0f, 0.0f, 0.0f};
@@ -802,24 +825,43 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             modelRender_draw(gfx, mtx, sp, sr, shadow_scale, 0, gm->shadow_model);
         }
 
-        // DEBUG: ghost render with bones but WITHOUT func_8033A444 and node manipulation
-        baanim_80289F30();
-        func_8029DD6C();
-
         {
-            AnimCtrl *ac = baanim_getAnimCtrlPtr();
-            Animation *anim_ptr = anctrl_getAnimPtr(ac);
-            void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
-            if (bone_buffer) {
-                boneTransformList_interpolate(gm->bone_save, bone_buffer, bone_buffer, 0.0f);
-
-                void *anim_file = animBinCache_get(gm->current_anim);
-                if (anim_file) {
-                    animationFile_getBoneTransformList(anim_file, gm->ghost_timer, bone_buffer);
+            /* Same effective sampling as the old animcache-stomp ghost path (raw
+             * animationFile_getBoneTransformList into the active bone buffer).
+             * We cannot call baanim_80289F30 per ghost — anctrl_drawSetup runs
+             * anim_update and would advance the LOCAL player's clips N times.
+             * Network-sourced Animation.duration blending regressed skid visuals;
+             * keep bones purely from clip + timer until we have a matrix-only setup path. */
+            void *anim_file = animBinCache_get(gm->current_anim);
+            if (anim_file) {
+                if (gm->bone_blend_base_anim != gm->current_anim) {
+                    boneTransformList_reset(gm->bone_blend_temp);
+                    gm->bone_blend_base_anim = gm->current_anim;
                 }
-
-                func_8033A444((void*)0);  // DEBUG: test if this breaks jinjo
+                animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_blend_temp);
+                boneTransformList_interpolate(gm->bone_save, gm->bone_blend_temp,
+                    gm->bone_blend_temp, 0.0f);
             }
+
+#if BKRECOMP_NET_GHOST_ANIM_LOG
+            /* Frame-by-frame dump while the ghost is in SKID, plus the first
+             * frame after leaving SKID (ghost_leaving_skid). All wire fields
+             * applied to the ghost this frame so we can compare against the
+             * sender log line-by-line. */
+            if (rs.bs_state == BS_SKID || ghost_leaving_skid) {
+                recomp_printf(
+                    "[GhostAnim/RECV] pid=%u bs=%u leave=%d anim=%u t=%.5f dur=%.5f pb=%u sub=[%.4f,%.4f] hvel=%.2f\n",
+                    (unsigned)pid, (unsigned)rs.bs_state, (int)ghost_leaving_skid,
+                    (unsigned)rs.animation_id, rs.anim_timer, rs.anim_duration,
+                    (unsigned)rs.anim_playback_type,
+                    rs.anim_subrange_start, rs.anim_subrange_end,
+                    rs.horizontal_velocity);
+            }
+#endif
+
+            /* Shadow draw above called modelRender_reset → BoneTransformList NULL. */
+            modelRender_setBoneTransformList(gm->bone_save);
+            func_8033A444((void*)0);
         }
 
         {
@@ -879,16 +921,10 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
             }
         }
 
-        // Restore local bones
-        {
-            AnimCtrl *ac = baanim_getAnimCtrlPtr();
-            Animation *anim_ptr = anctrl_getAnimPtr(ac);
-            void *bone_buffer = animcache_getCurrentTransform(anim_ptr);
-            if (bone_buffer) {
-                boneTransformList_interpolate(bone_buffer, gm->bone_save, gm->bone_save, 0.0f);
-            }
-        }
     }
+
+    func_8033A450(D_80363780);
+    func_8033A444(saved_anim_mtx_list);
 
     // === Restore local player render state ===
     // Model nodes: exact snapshot restore
