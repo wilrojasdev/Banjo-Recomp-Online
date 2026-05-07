@@ -115,6 +115,7 @@ typedef struct {
     void *bone_save;           // Final bones for modelRender + skinning output
     void *bone_blend_temp;     // Scratch: animationFile_getBoneTransformList target
     u16 current_anim;
+    u16 bone_blend_base_anim;  // last anim for which bone_blend_temp was reset
     f32 smooth_yaw;
     f32 ghost_timer;
     f32 ground_y;
@@ -142,6 +143,15 @@ typedef struct {
      * (e.g. the orange) anchor to the ghost's body center *with*
      * animation bob, not just rs.position + fixed offset. */
     struct5Bs *bones_world;
+    /* Cross-fade state for multi-phase chained clips (BFLIP/BPECK/FALL).
+     * On anim change while in those states, we snapshot the prior rendered
+     * pose into bone_fade_from and lerp toward the freshly-sampled new
+     * clip over fade_duration seconds. Replaces the older "carry stale
+     * bones forward" hack which leaked unanimated bones across phase
+     * boundaries and produced the twisted poses these moves showed. */
+    void *bone_fade_from;
+    f32   fade_progress;
+    bool  fade_active;
 } GhostModel;
 
 extern struct5Bs *func_8034A2C8(void);
@@ -287,10 +297,14 @@ static void ghost_ensure_init(u32 pid) {
     gm->bone_blend_temp = boneTransformList_new();
     if (!gm->bone_blend_temp) return;
 
+    gm->bone_fade_from = boneTransformList_new();
+    if (!gm->bone_fade_from) return;
+
     gm->bones_world = func_8034A2C8();   /* world-space bone sink (own buffer) */
     if (!gm->bones_world) return;
 
     gm->current_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
+    gm->bone_blend_base_anim = ASSET_6F_ANIM_BSSTAND_IDLE;
     gm->smooth_yaw = 0.0f;
     gm->ghost_timer = 0.0f;
     gm->ground_y = 0.0f;
@@ -580,19 +594,25 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
 
         bool ghost_leaving_skid = (gm->prev_bs_state == BS_SKID && rs.bs_state != BS_SKID);
 
-        /* Reset the bone scratch buffer only when entering a new BS state from
-         * a looping walk/idle state. Walk/idle animations oscillate all arm
-         * bones; if we let them bleed into the next action (backflip, bpeck)
-         * the ghost shows "arms open" at action exit. States that share an
-         * animation file across internal phases (BFLIP HOLD→EXIT) stay within
-         * the same BS state, so this check correctly skips the reset there. */
-        bool prev_was_looping = (gm->prev_bs_state == BS_WALK
-            || gm->prev_bs_state == BS_4_WALK_FAST
-            || gm->prev_bs_state == BS_2_WALK_SLOW
-            || gm->prev_bs_state == BS_WALK_CREEP
-            || gm->prev_bs_state == BS_1_IDLE
-            || gm->prev_bs_state == BS_0_NONE);
-        bool should_reset_bones = (rs.bs_state != gm->prev_bs_state) && prev_was_looping;
+        /* States whose EXIT transition needs a bone crossfade. Two reasons
+         * a bs_state lands here:
+         *  (a) Multi-phase chained clips inside one bs_state (BFLIP enter→
+         *      hold→exit, BPECK peck→fall) where adjacent clips have very
+         *      different poses.
+         *  (b) States whose exit clip cross-fades into IDLE on the local
+         *      via Animation.duration; the wire-side snap-to-clip-b
+         *      otherwise compresses the visible exit (Z-crouch stand-up,
+         *      LAND→IDLE residual after FALL/BFLIP).
+         * BFLIP / BPECK / FALL: case (a). LANDING, CROUCH, BFLAP: case (b).
+         * BFLAP is the Kazooie-out double jump (A+A); the local cross-fades
+         * Kazooie back into the backpack on landing — without crossfade the
+         * ghost snaps her away in one frame. */
+        bool in_complex_move = (gm->prev_bs_state == BS_12_BFLIP
+            || gm->prev_bs_state == BS_11_BPECK
+            || gm->prev_bs_state == BS_2F_FALL
+            || gm->prev_bs_state == BS_20_LANDING
+            || gm->prev_bs_state == BS_CROUCH
+            || gm->prev_bs_state == BS_BFLAP);
 
         // === Update transformation model cache ===
         ghost_update_xform_model(gm, rs.transformation);
@@ -846,12 +866,47 @@ void bkrecomp_net_draw_ghosts(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
              * keep bones purely from clip + timer until we have a matrix-only setup path. */
             void *anim_file = animBinCache_get(gm->current_anim);
             if (anim_file) {
-                if (should_reset_bones) {
+                bool anim_changed = (gm->bone_blend_base_anim != gm->current_anim);
+                if (anim_changed) {
+                    /* On phase change inside BFLIP / BPECK / FALL, capture the
+                     * just-rendered bones as the fade-from pose. The crossfade
+                     * below blends into the new clip over fade_duration so
+                     * sub-50ms phase swaps don't pop. Outside these states we
+                     * keep the old hard-cut behaviour to limit blast radius. */
+                    if (in_complex_move && gm->bone_fade_from) {
+                        boneTransformList_interpolate(gm->bone_fade_from,
+                            gm->bone_save, gm->bone_save, 0.0f);
+                        gm->fade_progress = 0.0f;
+                        gm->fade_active = TRUE;
+                    }
+                    /* Reset always now — the crossfade carries continuity for
+                     * complex moves; non-complex moves keep their original
+                     * reset-then-sample path. */
                     boneTransformList_reset(gm->bone_blend_temp);
+                    gm->bone_blend_base_anim = gm->current_anim;
                 }
                 animationFile_getBoneTransformList(anim_file, gm->ghost_timer, gm->bone_blend_temp);
-                boneTransformList_interpolate(gm->bone_save, gm->bone_blend_temp,
-                    gm->bone_blend_temp, 0.0f);
+
+                if (gm->fade_active && gm->bone_fade_from) {
+                    /* ~150ms fade duration: covers ~3 snapshot intervals at
+                     * 20Hz send. Long enough to mask a missed intermediate
+                     * phase clip AND smear over short LAND clips whose
+                     * 20Hz-sampled timer otherwise looks like a mini-loop
+                     * before IDLE. Without this we'd need to interpolate
+                     * anim_timer on the C++ side (broader change). */
+                    f32 fade_duration = 0.15f;
+                    gm->fade_progress += time_getDelta() / fade_duration;
+                    if (gm->fade_progress >= 1.0f) {
+                        gm->fade_progress = 1.0f;
+                        gm->fade_active = FALSE;
+                    }
+                    boneTransformList_interpolate(gm->bone_save,
+                        gm->bone_fade_from, gm->bone_blend_temp,
+                        gm->fade_progress);
+                } else {
+                    boneTransformList_interpolate(gm->bone_save, gm->bone_blend_temp,
+                        gm->bone_blend_temp, 0.0f);
+                }
             }
 
 #if BKRECOMP_NET_GHOST_ANIM_LOG
