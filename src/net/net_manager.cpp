@@ -7,7 +7,11 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
-#include <zlib.h>
+/* miniz provides zlib-compatible names (compress2/uncompress/compressBound)
+ * by default. Vendored in N64ModernRuntime/thirdparty/miniz and linked
+ * PUBLIC by librecomp, so available everywhere — including Windows CI
+ * which has no system zlib in its toolchain include path. */
+#include <miniz.h>
 
 namespace bknet {
 

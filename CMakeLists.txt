@@ -426,13 +426,11 @@ target_link_libraries(BanjoRecompiled PRIVATE
     coopnet
 )
 
-# zlib for compressed network packets (FEATURE_COMPRESSION). Linked directly
-# instead of via find_package(ZLIB) — the latter propagates an SDK include
-# path that conflicts with libc++ header resolution on macOS. zlib.h ships
-# with the system on macOS/Linux; on Windows we'd vendor it (unused for now).
-if(NOT WIN32)
-    target_link_libraries(BanjoRecompiled PRIVATE z)
-endif()
+# Compressed network packets (FEATURE_COMPRESSION) use miniz instead of
+# system zlib. miniz is vendored in N64ModernRuntime/thirdparty/miniz and
+# linked PUBLIC by librecomp, so its zlib-compatible API (compress2,
+# uncompress, compressBound) is reachable transitively. Avoids the system
+# zlib dependency on macOS/Linux and the missing zlib on Windows CI.
 
 # Embed all bundled mod files (.nrm code mods and .rtz texture packs) in the
 # "embedded_mods" directory. They get registered via
