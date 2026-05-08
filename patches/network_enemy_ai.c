@@ -103,6 +103,13 @@ extern void func_802F2D8C(Struct64s *arg);
 // player relative to this actor.
 static Actor *g_current_ai_actor = NULL;
 
+// === Dispatcher debug trace ===
+// Set by network_world_sync.c whenever an enemy death is processed (either
+// locally killed or via incoming packet). The dispatcher prints per-actor
+// trace lines for the next N frames so we can spot if it hangs while
+// updating a dying/just-killed actor.
+RECOMP_EXPORT u32 g_dispatcher_trace_frames = 0;
+
 // === Closest-player helpers ===
 
 // Read raw local player position bypassing our own _player_getPosition patch.
@@ -295,6 +302,21 @@ RECOMP_PATCH void func_803268B4(void) {
         recomp_printf("[enemy_ai] dispatcher patch active\n");
     }
 
+    // Drain receiver-side deferred kills here — same frame phase as
+    // collision-triggered dieFunc (this dispatcher is invoked from
+    // func_80330FF4 → spawnQueue_func_802C39D4, the same callsite where
+    // BK's collision pipeline fires dieFunc).
+    extern void bkrecomp_net_process_deferred_kills(void);
+    bkrecomp_net_process_deferred_kills();
+
+    // Live check (instead of captured at entry) so the kill's own frame —
+    // where the counter is set mid-frame — is also traced.
+    bool dbg_trace = (g_dispatcher_trace_frames > 0);
+    if (dbg_trace) {
+        recomp_printf("[DISP] frame_remaining=%u arr_cnt=%d\n",
+            g_dispatcher_trace_frames, suBaddieActorArray ? suBaddieActorArray->cnt : -1);
+    }
+
     if (suBaddieActorArray != NULL) {
         sp54 = volatileFlag_get(VOLATILE_FLAG_65_CHEAT_ENTERED);
         for (temp_v1 = suBaddieActorArray->cnt - 1; temp_v1 >= 0; temp_v1--) {
@@ -303,6 +325,12 @@ RECOMP_PATCH void func_803268B4(void) {
             marker = actor->marker;
             anim_ctrl = actor->anctrl;
             temp_s1 = actor->actor_info->unk18;
+            if (dbg_trace) {
+                recomp_printf("[DISP] [%d] marker=0x%X state=0x%X despawn=%d updFn=%p dieFn=%p\n",
+                    temp_v1, (u32)marker->id, actor->state,
+                    actor->despawn_flag ? 1 : 0,
+                    marker->actorUpdateFunc, marker->dieFunc);
+            }
             if (marker->propPtr->unk8_4) {
                 if (sp54) {
                     if (actor->actor_info->unk20 && volatileFlag_get(actor->actor_info->unk20)) {
@@ -313,7 +341,9 @@ RECOMP_PATCH void func_803268B4(void) {
                     is_enemy = (marker->dieFunc != NULL);
                     if (marker->unk2C_2) {
                         if (is_enemy) g_current_ai_actor = actor;
+                        if (dbg_trace) recomp_printf("[DISP] [%d] -> upd2Fn\n", temp_v1);
                         marker->actorUpdate2Func(actor);
+                        if (dbg_trace) recomp_printf("[DISP] [%d] <- upd2Fn\n", temp_v1);
                         if (is_enemy) g_current_ai_actor = NULL;
                         if (anim_ctrl != NULL) {
                             actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
@@ -331,7 +361,10 @@ RECOMP_PATCH void func_803268B4(void) {
                         bool gate_ok = !temp_s1 || (temp_s1 && func_803296D8(actor, temp_s1));
                         if (gate_ok) {
                             if (marker->actorUpdateFunc != NULL) {
+                                if (dbg_trace) recomp_printf("[DISP] [%d] -> updFn (state=0x%X)\n",
+                                    temp_v1, actor->state);
                                 marker->actorUpdateFunc(actor);
+                                if (dbg_trace) recomp_printf("[DISP] [%d] <- updFn\n", temp_v1);
                                 if (anim_ctrl != NULL) {
                                     actor->sound_timer = anctrl_getAnimTimer(anim_ctrl);
                                 }
@@ -377,6 +410,7 @@ RECOMP_PATCH void func_803268B4(void) {
                     }
                 }
             }
+            if (dbg_trace) recomp_printf("[DISP] [%d] iter done\n", temp_v1);
         }
     }
     if (D_8036E56C != 0) {
@@ -384,5 +418,14 @@ RECOMP_PATCH void func_803268B4(void) {
     }
     if (D_8036E570 != NULL) {
         func_802F2D8C(D_8036E570);
+    }
+    if (dbg_trace) {
+        recomp_printf("[DISP] dispatcher exit\n");
+        if (g_dispatcher_trace_frames > 0) g_dispatcher_trace_frames--;
+    } else if (g_dispatcher_trace_frames > 0) {
+        // Counter was armed mid-frame after dispatcher's entry check; print
+        // a stub line so we know dispatcher ran without per-actor detail.
+        recomp_printf("[DISP] (post-arm partial) exit, will trace next frame\n");
+        g_dispatcher_trace_frames--;
     }
 }

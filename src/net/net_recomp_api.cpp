@@ -258,18 +258,24 @@ extern "C" void recomp_net_send_collectible(uint8_t* rdram, recomp_context* ctx)
         static_cast<uint8_t>(collected), map_id, static_cast<uint8_t>(level_id));
 }
 
-// Send enemy death: marker_type(r4), spawn_index(r5), map_id(r6), pos_ptr(r7)
+// Send enemy death: marker_type(r4), spawn_index(r5), map_id(r6), info_ptr(r7)
+// info struct (16 bytes):
+//   0x00: f32 x
+//   0x04: f32 y
+//   0x08: f32 z
+//   0x0C: u32 state  — actor->state captured AFTER dieFunc returned
 extern "C" void recomp_net_send_enemy_death(uint8_t* rdram, recomp_context* ctx) {
     u32 marker_type = static_cast<u32>(ctx->r4);
     u32 spawn_index = static_cast<u32>(ctx->r5);
     u32 map_id = static_cast<u32>(ctx->r6);
-    gpr pos_ptr = ctx->r7;
-    float px = read_f32(rdram, pos_ptr, 0x00);
-    float py = read_f32(rdram, pos_ptr, 0x04);
-    float pz = read_f32(rdram, pos_ptr, 0x08);
+    gpr info_ptr = ctx->r7;
+    float px = read_f32(rdram, info_ptr, 0x00);
+    float py = read_f32(rdram, info_ptr, 0x04);
+    float pz = read_f32(rdram, info_ptr, 0x08);
+    uint8_t state = static_cast<uint8_t>(MEM_W(0x0C, info_ptr) & 0xFF);
     bknet::NetworkManager::instance().send_enemy_death(
         static_cast<uint16_t>(marker_type), static_cast<uint16_t>(spawn_index),
-        map_id, px, py, pz);
+        map_id, px, py, pz, state);
 }
 
 // Send flag change: flag_type(r4), flag_index(r5), value(r6), map_id(r7)
@@ -543,6 +549,8 @@ extern "C" void recomp_net_pop_world_event(uint8_t* rdram, recomp_context* ctx) 
                 MEM_W(0x08, out_ptr) = evt.enemy.map_id;
                 MEM_BU(0x0C, out_ptr) = evt.enemy.alive;
                 MEM_BU(0x0D, out_ptr) = evt.enemy.health;
+                MEM_BU(0x0E, out_ptr) = evt.enemy.state;        // NEW: death state
+                // 0x0F is the existing _pad slot in EnemyEventData (unused).
                 write_f32(rdram, out_ptr, 0x10, evt.enemy.pos_x);
                 write_f32(rdram, out_ptr, 0x14, evt.enemy.pos_y);
                 write_f32(rdram, out_ptr, 0x18, evt.enemy.pos_z);
