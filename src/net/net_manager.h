@@ -188,6 +188,12 @@ public:
     struct PlayerInfo {
         std::string name;
         bool connected = false;
+        // True once we've emitted "X joined" in chat with this player's real
+        // (non-placeholder) display name. Used to defer the join announce
+        // until broadcast_local_name() arrives, so chat doesn't show
+        // "Jugador 2 joined" before the real name lands. Reset when the slot
+        // disconnects so a re-join re-announces.
+        bool announced = false;
     };
     void set_player_name(uint8_t player_id, const std::string& name);
     PlayerInfo get_player_info(uint8_t player_id) const;
