@@ -1841,6 +1841,13 @@ static void begin_coopnet_host() {
 }
 
 static void begin_coopnet_join(uint64_t lobby_id) {
+    // Apply the typed player name BEFORE joining: if the user edited the input
+    // after the lobby search (or never went through search at all on a re-entry
+    // path), config.player_name would otherwise still hold the previous value
+    // and the host would never see the real display name — only the localized
+    // placeholder ("Jugador 2", "Player 2", ...).
+    apply_join_player_name();
+
     auto& net = bknet::NetworkManager::instance();
     if (!net.is_coopnet_signaling_connected()) {
         coopnet_pending_action.store(static_cast<int>(CoopNetPendingAction::Join));
