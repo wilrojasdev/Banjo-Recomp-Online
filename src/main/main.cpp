@@ -155,7 +155,7 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 
 #include "../../lib/rt64/src/contrib/stb/stb_image.h"
 
-const std::string version_string = "1.6.0";
+const std::string version_string = "1.8.0";
 
 template<typename... Ts>
 void exit_error(const char* str, Ts ...args) {

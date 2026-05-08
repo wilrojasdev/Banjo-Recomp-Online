@@ -24,7 +24,12 @@ constexpr uint8_t NUM_CHANNELS = 2;
 // (actor->state cast to u8). Lets non-owner peers adopt the owner's state
 // machine wholesale for bosses (Conga) instead of running their own.
 // v6: PlayerState.anim_duration is Animation.duration (blend 0..1), not anctrl clip length.
-constexpr uint32_t PROTOCOL_VERSION = 6;
+// v7: WorldEnemyPacket carries actor->state captured AFTER the killer's
+// dieFunc runs. Receivers stop calling die() locally (which corrupted Banjo
+// state and froze the game thread) and instead apply the death state to
+// actor->state — the local update function runs the death animation
+// naturally. Mirrors sm64-coop-dx's oAction sync pattern.
+constexpr uint32_t PROTOCOL_VERSION = 7;
 
 // Optional features negotiated in VersionCheck. Both peers' reported bitmaps
 // are ANDed; behaviour downgrades for features not common to both. This lets
@@ -268,7 +273,11 @@ struct WorldEnemyPacket {
     uint32_t map_id;            // Which map the enemy is on
     uint8_t alive;              // 0=dead
     uint8_t health;
-    uint16_t _pad;
+    uint8_t state;              // actor->state captured AFTER killer's dieFunc
+                                // returned. 0 = no state info (legacy / resync /
+                                // poll-detected despawn) — receiver despawns
+                                // directly instead of replaying the animation.
+    uint8_t _pad;
     float pos_x, pos_y, pos_z;  // Enemy position at time of death
 };
 

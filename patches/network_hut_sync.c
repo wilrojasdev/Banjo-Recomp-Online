@@ -24,6 +24,11 @@ extern void bundle_setYaw(f32);
 // Hut smash counter (from bss, shared across all hut instances)
 extern s32 mmhut_smashCount;
 
+// Cross-client grublin tagging: registers the hut-spawn-index so the local
+// grublin spawned by this hut can be correlated with the remote client's
+// grublin via a shared logical id. See network_world_sync.c.
+extern void bkrecomp_net_register_hut_grublin(u32 hut_spawn_index, f32 x, f32 y, f32 z);
+
 // Flag type (must match net_packets.h FLAG_HUT_ACTION)
 #define NET_FLAG_HUT_ACTION 8
 
@@ -105,6 +110,14 @@ static bool try_apply_remote_event(Actor *this) {
                     *(s32 *)(&spawn_pos[0]),
                     *(s32 *)(&spawn_pos[1]),
                     *(s32 *)(&spawn_pos[2]));
+
+                // Same as local path: register the hut-spawned grublin so
+                // bulk sync / kill packets can correlate with the killer's
+                // copy via the shared logical id (= hut spawn_index).
+                if (hut_bundles[sc] == BUNDLE_2_MM_HUT_GRUBLIN) {
+                    bkrecomp_net_register_hut_grublin(my_spawn,
+                        spawn_pos[0], spawn_pos[1], spawn_pos[2]);
+                }
             } else {
                 jiggy_spawn(JIGGY_5_MM_HUTS, spawn_pos);
             }
@@ -179,6 +192,17 @@ RECOMP_PATCH void chhut_update(Actor *this) {
 
                 if (mmhut_smashCount < 5) {
                     __spawnQueue_add_4((GenFunction_4) spawnQueue_bundle_f32, D_803898D8[mmhut_smashCount], *(s32 *)(&diff_pos[0]), *(s32 *)(&diff_pos[1]), *(s32 *)(&diff_pos[2]));
+
+                    // Register the hut-spawned grublin so cross-client sync
+                    // can correlate our local grublin with the remote client's.
+                    // hut_spawn_index is deterministic (preplaced level data),
+                    // so both clients use it as a shared logical id.
+                    if (D_803898D8[mmhut_smashCount] == BUNDLE_2_MM_HUT_GRUBLIN
+                        && recomp_net_is_connected()) {
+                        u32 hut_spawn = bkrecomp_get_marker_spawn_index(this->marker);
+                        bkrecomp_net_register_hut_grublin(hut_spawn,
+                            diff_pos[0], diff_pos[1], diff_pos[2]);
+                    }
                 }
                 else {
                     jiggy_spawn(JIGGY_5_MM_HUTS, diff_pos);

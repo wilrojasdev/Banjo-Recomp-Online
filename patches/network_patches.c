@@ -165,12 +165,39 @@ extern void bkrecomp_net_process_world_events(void);
 extern void bkrecomp_net_process_conga_oranges(void);
 // Auto-load is handled directly in title_screen_patches.c via gameSelect_initAndUpdate patch
 
+// Frame-level checkpoint trace. Set by network_world_sync.c right after a
+// kill is processed; counts down each frame to print where in the per-frame
+// pipeline we are. If the freeze is between two checkpoints, the last one
+// printed pinpoints the offending step. Plain extern (no RECOMP_EXPORT)
+// because mixing exported data + exported function in the same TU
+// triggers a section-type conflict on this clang.
+u32 g_frame_trace_remaining = 0;
+
 // @recomp Export: called from ncCamera_update each game frame.
 RECOMP_EXPORT void bkrecomp_net_sync_frame(void) {
+    // Each checkpoint reads the counter live (instead of caching at entry)
+    // so the kill's own frame is also traced — process_enemy_event sets
+    // the counter mid-frame, and we want FRAME-C..F to fire AFTER it.
+    if (g_frame_trace_remaining > 0) {
+        recomp_printf("[FRAME-A] sync_frame enter, remaining=%u\n",
+            g_frame_trace_remaining);
+    }
+
     net_sync_local_state();
+    if (g_frame_trace_remaining > 0) recomp_printf("[FRAME-B] after net_sync_local_state\n");
 
     bkrecomp_net_process_world_events();
+    if (g_frame_trace_remaining > 0) recomp_printf("[FRAME-C] after process_world_events\n");
+
     bkrecomp_net_process_conga_oranges();
+    if (g_frame_trace_remaining > 0) recomp_printf("[FRAME-D] after process_conga_oranges\n");
+
     bkrecomp_net_manage_ghosts();
+    if (g_frame_trace_remaining > 0) recomp_printf("[FRAME-E] after manage_ghosts\n");
+
     recomp_on_net_frame_update();
+    if (g_frame_trace_remaining > 0) {
+        recomp_printf("[FRAME-F] sync_frame exit\n");
+        g_frame_trace_remaining--;  // decrement once per frame at the very end
+    }
 }

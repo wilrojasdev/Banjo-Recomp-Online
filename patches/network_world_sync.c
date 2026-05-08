@@ -4,7 +4,15 @@
 
 // Network bridge
 void recomp_net_send_collectible(u32 type, u32 id, u32 collected, u32 map_id, u32 level_id);
-void recomp_net_send_enemy_death(u32 marker_type, u32 spawn_index, u32 map_id, f32 *pos);
+// Death info packed for the bridge: pos[3] + state (matches the C++ side
+// reader in net_recomp_api.cpp — 16-byte aligned struct).
+typedef struct {
+    f32 pos_x;
+    f32 pos_y;
+    f32 pos_z;
+    u32 state;
+} EnemyDeathInfo;
+void recomp_net_send_enemy_death(u32 marker_type, u32 spawn_index, u32 map_id, EnemyDeathInfo *info);
 u32  recomp_net_pop_world_event(void *out);
 u32  recomp_net_is_connected(void);
 u32  recomp_net_is_host(void);
@@ -60,9 +68,107 @@ extern s32 anctrl_isPlayedForwards(AnimCtrl *this);
 extern void anctrl_setDirection(AnimCtrl *this, s32 dir);
 extern void anctrl_setDuration(AnimCtrl *this, f32 duration);
 extern void _anctrl_start(AnimCtrl *this, char *file, s32 line);
+// Animation playback type (ANIMCTRL_ONCE=1, ANIMCTRL_LOOP=2). Setting to ONCE
+// makes the clip play to the end and stop, which is the trigger many BK
+// enemy update functions use to call marker_despawn after death.
+#define ANIMCTRL_ONCE_VALUE 1
+// The header in lib/bk-decomp/include/core2/anctrl.h already declares this
+// with the enum type — pull the header in to share that declaration rather
+// than redeclaring locally with a clashing signature.
+#include "core2/anctrl.h"
 
 // Player marker (for triggering enemy death callbacks)
 extern ActorMarker *baMarker_get(void);
+
+// === Deferred-despawn guard ===
+extern void func_803283BC(void); // enable deferred despawn
+extern void func_803283D4(void); // flush deferred despawns
+extern u8 D_8036E574;             // deferred-mode flag
+extern u8 D_8036E578;             // deferred-despawn count
+
+// Forward declarations for the deferred-kill queue (defined later in file)
+static MarkerCollisionFunc get_saved_diefunc(u16 spawn_index);
+static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_marker);
+
+// Forward declarations for hut-grublin logical-id translation (defined
+// near sync_enemy_positions, used earlier by net_enemy_die_proxy and
+// process_enemy_event).
+#define HUT_GRUBLIN_LOGICAL_BIT 0x8000u
+static u16 grublin_local_to_logical(u16 marker_id, u16 spawn_index);
+static u16 grublin_logical_to_local_spawn(u16 logical_id);
+
+// === Deferred receiver-side kill queue ===
+//
+// Calling dieFunc from process_enemy_event (which runs late in the frame
+// inside ncCamera_update / sync_frame) freezes the game thread. Calling
+// the SAME dieFunc from collision (early in the frame inside func_80330FF4
+// / dispatcher / __baMarker_resolveCollision) works fine. Hypothesis: dieFunc
+// has a hard precondition on running in the dispatcher's frame phase —
+// possibly the marker-cleanup pipeline assumes the call happens before the
+// per-frame particle/audio passes.
+//
+// Workaround: queue the kill from process_enemy_event and have the patched
+// dispatcher (network_enemy_ai.c func_803268B4) run dieFunc at its entry —
+// SAME phase as collision-triggered dieFunc. One-frame delay vs collision
+// is fine; the particle/state/despawn pipeline runs in the right order.
+#define MAX_DEFERRED_KILLS 16
+typedef struct {
+    u16 marker_type;
+    u16 spawn_index;
+} DeferredKill;
+static DeferredKill deferred_kills[MAX_DEFERRED_KILLS];
+static s32 deferred_kill_count = 0;
+
+static void enqueue_deferred_kill(u16 marker_type, u16 spawn_index) {
+    if (deferred_kill_count >= MAX_DEFERRED_KILLS) return;
+    // dedup
+    s32 i;
+    for (i = 0; i < deferred_kill_count; i++) {
+        if (deferred_kills[i].marker_type == marker_type
+            && deferred_kills[i].spawn_index == spawn_index) return;
+    }
+    deferred_kills[deferred_kill_count].marker_type = marker_type;
+    deferred_kills[deferred_kill_count].spawn_index = spawn_index;
+    deferred_kill_count++;
+}
+
+// Called from the patched dispatcher (func_803268B4 entry). Drains the
+// queue and runs dieFunc on each pending kill in the dispatcher's frame
+// phase. Exported so network_enemy_ai.c can call it.
+RECOMP_EXPORT void bkrecomp_net_process_deferred_kills(void) {
+    if (deferred_kill_count == 0) return;
+    if (!suBaddieActorArray) {
+        deferred_kill_count = 0;
+        return;
+    }
+    s32 q;
+    for (q = 0; q < deferred_kill_count; q++) {
+        u16 mt = deferred_kills[q].marker_type;
+        u16 si = deferred_kills[q].spawn_index;
+        s32 i;
+        for (i = 0; i < suBaddieActorArray->cnt; i++) {
+            Actor *actor = &suBaddieActorArray->data[i];
+            if (!actor->marker) continue;
+            if (actor->marker->id != mt) continue;
+            u16 asi = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
+            if (asi != si) continue;
+
+            MarkerCollisionFunc die = actor->marker->dieFunc;
+            if (die == (MarkerCollisionFunc)net_enemy_die_proxy) {
+                die = get_saved_diefunc(si);
+            }
+            if (die) {
+                actor->marker->dieFunc = die;
+                recomp_printf("[KILL-DEFERRED] dispatch-phase die() marker=0x%X spawn=%d\n", mt, si);
+                die(actor->marker, baMarker_get());
+            } else {
+                marker_despawn(actor->marker);
+            }
+            break;
+        }
+    }
+    deferred_kill_count = 0;
+}
 extern void player_getPosition(f32 pos[3]);
 
 // Jiggy spawn (for jinjo completion)
@@ -434,8 +540,18 @@ static void remember_kill(u16 marker, u16 spawn, u32 map) {
 }
 
 // --- Dying enemies: stop position override so death animation can play ---
+//
+// dying_age[i] is incremented every frame. When it exceeds DYING_FORCE_DESPAWN_FRAMES,
+// the receiver force-despawns the actor. This safety net catches enemies whose
+// local death state machine doesn't despawn on its own (typically because the
+// dieFunc sets up internal timer fields that we never run on the receiver).
+// 120 frames @ 30fps ~= 4 seconds — long enough for any visible death anim,
+// short enough that a stuck corpse becomes a hint of "needs better sync"
+// rather than a permanent obstruction.
 #define MAX_DYING_ENEMIES 32
+#define DYING_FORCE_DESPAWN_FRAMES 120
 static u16 dying_spawns[MAX_DYING_ENEMIES];
+static u16 dying_age[MAX_DYING_ENEMIES];
 static s32 dying_count = 0;
 
 static bool is_dying(u16 spawn_index) {
@@ -449,7 +565,55 @@ static bool is_dying(u16 spawn_index) {
 static void mark_dying(u16 spawn_index) {
     if (dying_count < MAX_DYING_ENEMIES && !is_dying(spawn_index)) {
         dying_spawns[dying_count] = spawn_index;
+        dying_age[dying_count] = 0;
         dying_count++;
+    }
+}
+
+// Remove an entry from dying_spawns by index (compact via swap-with-last).
+static void dying_remove_at(s32 idx) {
+    if (idx < 0 || idx >= dying_count) return;
+    s32 last = dying_count - 1;
+    dying_spawns[idx] = dying_spawns[last];
+    dying_age[idx] = dying_age[last];
+    dying_count--;
+}
+
+// Per-frame sweep: age each dying entry. If an actor exceeds the safety
+// threshold AND is still alive in the array, force-despawn it. Entries
+// whose actor already despawned naturally are pruned silently.
+static void tick_dying_actors(void) {
+    if (!suBaddieActorArray) {
+        // Array is gone (level transition?) — clear state to avoid stale ages.
+        dying_count = 0;
+        return;
+    }
+    s32 i = 0;
+    while (i < dying_count) {
+        u16 si = dying_spawns[i];
+        // Find actor with this spawn_index
+        Actor *found = NULL;
+        s32 j;
+        for (j = 0; j < suBaddieActorArray->cnt; j++) {
+            Actor *a = &suBaddieActorArray->data[j];
+            if (!a->marker) continue;
+            u16 asi = (u16)bkrecomp_get_marker_spawn_index(a->marker);
+            if (asi == si) { found = a; break; }
+        }
+        if (!found) {
+            // Actor already gone — drop the dying entry silently.
+            dying_remove_at(i);
+            continue;
+        }
+        dying_age[i]++;
+        if (dying_age[i] >= DYING_FORCE_DESPAWN_FRAMES) {
+            recomp_printf("[KILL-RECV] force-despawn after %u frames stuck in dying (spawn=%d marker=0x%X state=0x%X)\n",
+                dying_age[i], si, (u32)found->marker->id, found->state);
+            marker_despawn(found->marker);
+            dying_remove_at(i);
+            continue;
+        }
+        i++;
     }
 }
 
@@ -525,7 +689,6 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
     // Bounds check on actrArrayIdx before accessing data array
     s32 arr_idx = self_marker->actrArrayIdx;
     if (arr_idx < 0 || arr_idx >= suBaddieActorArray->cnt) {
-        // Index out of range — just despawn safely
         marker_despawn(self_marker);
         return;
     }
@@ -539,7 +702,7 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
     pos[1] = actor->position[1];
     pos[2] = actor->position[2];
 
-    // Track this REAL kill (collision-confirmed, not distance culling)
+    // Track this REAL kill (collision-confirmed)
     if (killed_on_map_count < MAX_KILLED_ON_MAP) {
         s32 ki = killed_on_map_count;
         killed_on_map[ki].marker_type = marker_id;
@@ -551,23 +714,16 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
         killed_on_map_count = ki + 1;
     }
 
-    // Send kill event to all other players immediately (both owner and non-owner)
-    recomp_net_send_enemy_death((u32)marker_id, (u32)spawn_index, (u32)map_get(), pos);
-
-    // Stop position override so death animation plays
+    // Stop position override so death animation plays locally
     mark_dying(spawn_index);
 
-    // Restore ALL original functions so death animation state machine runs
-    ActorUpdateFunc upd = get_saved_updatefunc(spawn_index);
-    if (upd) {
-        self_marker->actorUpdateFunc = upd;
-    }
-    MarkerCollisionFunc coll = get_saved_collisionfunc(spawn_index);
-    if (coll) {
-        self_marker->collisionFunc = coll;
-    }
-
-    // Restore + call original dieFunc for natural death sequence
+    // Restore the original dieFunc and call it FIRST so the local state
+    // machine transitions to the death state. We then capture actor->state
+    // AFTER die() returns and ship that authoritative value to peers — they
+    // apply it to actor->state and let their own update functions play the
+    // death animation, sm64-coop-style. The receiver MUST NOT call die()
+    // itself (we tried; it corrupts Banjo's bs_state and freezes the game
+    // thread because the receiver's local Banjo wasn't the actual killer).
     MarkerCollisionFunc orig = get_saved_diefunc(spawn_index);
     if (orig) {
         self_marker->dieFunc = orig;
@@ -575,6 +731,42 @@ static void net_enemy_die_proxy(ActorMarker *self_marker, ActorMarker *other_mar
     } else {
         marker_despawn(self_marker);
     }
+
+    // Encode the receiver's routing decision into a single byte:
+    //   0    = poll-cleanup (no honeycomb).
+    //   0xFE = real kill, killer's dieFunc already set despawn_flag → the
+    //          receiver despawns immediately with honeycomb (no particles
+    //          replicated, see process_enemy_event).
+    //   0xFF = real kill, actor->state was 0 — decoded back to 0 on the
+    //          receiver before applying.
+    //   else = real kill, actor->state holds the death-state for this
+    //          enemy → receiver applies it and forces ANIMCTRL_ONCE so the
+    //          local update plays the death anim and despawns at clip end.
+    u32 raw_state = actor->state;
+    bool despawning = (actor->despawn_flag != 0);
+    u8 tx_state;
+    if (despawning) {
+        tx_state = 0xFE;
+    } else {
+        tx_state = (u8)(raw_state & 0xFF);
+        if (tx_state == 0) tx_state = 0xFF;
+    }
+    // Encode hut-grublin logical id in spawn_index high bit so receivers
+    // can correlate even though their local spawn_index differs.
+    u16 send_spawn = (u16)spawn_index;
+    u16 logical_id = grublin_local_to_logical(marker_id, (u16)spawn_index);
+    if (logical_id != 0xFFFF) {
+        send_spawn = (u16)(HUT_GRUBLIN_LOGICAL_BIT | logical_id);
+    }
+    recomp_printf("[KILL-SEND] marker=0x%X spawn=%d send_spawn=0x%X raw_state=0x%X despawn_flag=%d tx_state=0x%X\n",
+        marker_id, spawn_index, send_spawn, raw_state, despawning ? 1 : 0, tx_state);
+
+    EnemyDeathInfo info;
+    info.pos_x = pos[0];
+    info.pos_y = pos[1];
+    info.pos_z = pos[2];
+    info.state = (u32)tx_state;
+    recomp_net_send_enemy_death((u32)marker_id, (u32)send_spawn, (u32)map_get(), &info);
 }
 
 static TrackedEnemy prev_enemies[MAX_TRACKED_ENEMIES];
@@ -1386,10 +1578,19 @@ static void poll_enemy_deaths(void) {
                 }
             }
 
+            // Distance-culling cleanup (host-side): the actor is already
+            // gone from suBaddieActorArray, so we have no state to capture.
+            // Send state=0 — receivers detect "no death state" and despawn
+            // directly without trying to play an animation.
+            EnemyDeathInfo info;
+            info.pos_x = pos[0];
+            info.pos_y = pos[1];
+            info.pos_z = pos[2];
+            info.state = 0;
             recomp_net_send_enemy_death(
                 (u32)prev_enemies[p].marker_id,
                 (u32)prev_enemies[p].spawn_index,
-                cur_map, pos);
+                cur_map, &info);
         }
     }
 
@@ -1754,7 +1955,9 @@ typedef struct {
     u32 enemy_map_id;      // 0x08
     u8  enemy_alive;       // 0x0C
     u8  enemy_health;      // 0x0D
-    u8  _pad2[2];          // 0x0E-0x0F
+    u8  enemy_state;       // 0x0E — actor->state captured by killer after dieFunc;
+                           //        0 means "no state info" (legacy/resync path)
+    u8  _pad2;             // 0x0F
     f32 enemy_pos_x;       // 0x10
     f32 enemy_pos_y;       // 0x14
     f32 enemy_pos_z;       // 0x18
@@ -1764,6 +1967,10 @@ static void process_enemy_event(EnemyEventData *evt) {
     processing_remote = TRUE;
 
     u32 cur_map = (u32)map_get();
+
+    recomp_printf("[KILL-RECV] marker=0x%X spawn=%d evt_state=0x%X evt_map=%d cur_map=%d sender=%d\n",
+        evt->enemy_marker_type, evt->enemy_spawn_index, evt->enemy_state,
+        evt->enemy_map_id, cur_map, evt->sender_id);
 
     // Lazy level-change reset for non-owners (owner path already resets in
     // poll_enemy_deaths). Ensures recent_kills doesn't leak across levels.
@@ -1798,6 +2005,28 @@ static void process_enemy_event(EnemyEventData *evt) {
     u16 target_spawn = evt->enemy_spawn_index;
     bool is_resync = (evt->sender_id == 0xFF);
 
+    // Logical-id translation for hut-spawned grublins. The killer encodes
+    // its hut_spawn_index into the high bit; we look up our local
+    // spawn_index for the same hut so the actor-finding loop matches our
+    // independently-spawned grublin (different local spawn_index).
+    if (target_spawn & HUT_GRUBLIN_LOGICAL_BIT) {
+        u16 logical = (u16)(target_spawn & ~HUT_GRUBLIN_LOGICAL_BIT);
+        u16 local_si = grublin_logical_to_local_spawn(logical);
+        recomp_printf("[KILL-RECV] hut-grublin logical=%u → local_spawn=%u\n",
+            logical, local_si);
+        if (local_si == 0xFFFF) {
+            // We haven't tagged the local grublin yet (sync arrived before
+            // update_hut_grublin_matches bound our actor). Drop this packet;
+            // the killer's own poll cleanup will catch up with state=0
+            // shortly, or the next bulk-sync will re-state things.
+            recomp_printf("[KILL-RECV] not-yet-tagged hut grublin, ignoring\n");
+            processing_remote = FALSE;
+            return;
+        }
+        target_spawn = local_si;
+    }
+
+    bool actor_found = FALSE;
     if (suBaddieActorArray) {
         s32 i;
         for (i = 0; i < suBaddieActorArray->cnt; i++) {
@@ -1807,21 +2036,40 @@ static void process_enemy_event(EnemyEventData *evt) {
             u16 si = (u16)bkrecomp_get_marker_spawn_index(actor->marker);
             if (si != target_spawn) continue;
 
+            actor_found = TRUE;
+
             // Defensive dedup: if we've already processed a kill for this
             // (marker, spawn, map) as non-resync, downgrade to silent despawn
             // to prevent duplicate honeycomb drops (fixes #6).
             bool already_processed = is_recent_kill(target_marker, target_spawn, cur_map);
 
-            if (is_resync || already_processed) {
-                // Silent despawn — enemy was already killed, just remove on re-entry
+            recomp_printf("[KILL-RECV] matched actor[%d] state_before=0x%X resync=%d processed=%d\n",
+                i, actor->state, is_resync ? 1 : 0, already_processed ? 1 : 0);
+
+            if (is_resync) {
+                // Late-join resync: enemy was killed before we joined.
+                // Despawn directly so we don't render a ghost-alive enemy.
+                recomp_printf("[KILL-RECV] -> resync silent despawn\n");
                 marker_despawn(actor->marker);
-                if (already_processed && !is_resync) {
-                    recomp_printf("[ENEMY-EVT] dedup: silent despawn for marker=0x%X spawn=%d (already killed)\n",
-                        target_marker, target_spawn);
-                }
+            } else if (already_processed) {
+                // Duplicate packet for a kill we already enqueued — typically
+                // the poll-cleanup (state=0) chasing a real-time kill (0xFE)
+                // we already deferred. Force-despawning here would cut the
+                // local death animation mid-play. Leave it alone: the
+                // dispatcher-phase deferred die() is running the death
+                // sequence and the engine despawns naturally at clip end
+                // (safety net tick_dying_actors covers stuck cases).
+                recomp_printf("[KILL-RECV] -> ignore duplicate (anim in progress)\n");
             } else {
-                // Real-time kill: honeycomb + death animation
+                // EXPERIMENT (post-v1.6.0 audit): restore the v1.6.0 death
+                // path verbatim — call the original dieFunc on the receiver
+                // with baMarker_get() as other_marker. This was confirmed
+                // working in v1.6.0 by the user. The freeze observed in
+                // recent builds is suspected to come from the v1.7.0
+                // ghost-render AnimMtxList save/restore interaction with
+                // the particle pool, NOT from the dieFunc call itself.
                 remember_kill(target_marker, target_spawn, cur_map);
+
                 {
                     f32 drop_pos[3];
                     drop_pos[0] = actor->position[0];
@@ -1834,19 +2082,24 @@ static void process_enemy_event(EnemyEventData *evt) {
 
                 mark_dying(target_spawn);
 
-                MarkerCollisionFunc die = actor->marker->dieFunc;
-                if (die == (MarkerCollisionFunc)net_enemy_die_proxy) {
-                    die = get_saved_diefunc(target_spawn);
-                }
-                if (die) {
-                    actor->marker->dieFunc = die;
-                    die(actor->marker, baMarker_get());
-                } else {
-                    marker_despawn(actor->marker);
-                }
+                // EXPERIMENT: defer dieFunc to the dispatcher's frame phase.
+                // process_enemy_event runs late in the frame (inside
+                // sync_frame); collision-triggered dieFunc runs early
+                // (inside dispatcher / __baMarker_resolveCollision). The
+                // freeze appears to be timing-sensitive — running dieFunc
+                // out of phase corrupts something downstream that we
+                // haven't isolated. Enqueue here, drain at dispatcher entry.
+                recomp_printf("[KILL-RECV] -> enqueue deferred die for marker=0x%X spawn=%d\n",
+                    target_marker, target_spawn);
+                enqueue_deferred_kill(target_marker, target_spawn);
             }
             break;
         }
+    }
+    if (!actor_found) {
+        recomp_printf("[KILL-RECV] !! actor NOT FOUND for marker=0x%X spawn=%d (arr_cnt=%d)\n",
+            target_marker, target_spawn,
+            suBaddieActorArray ? suBaddieActorArray->cnt : -1);
     }
     // If world owner: remove from prev_enemies so poll doesn't re-detect,
     // and track the kill in killed_on_map so a future death/respawn of this
@@ -1914,15 +2167,180 @@ typedef struct {
 
 #define MAX_ENEMY_POS_ENTRIES 64
 
+// === Hut-spawned grublin tagging ===
+//
+// Bundle-spawned enemies (e.g. the grublin that emerges when smashing the
+// MM hut sequence) are spawned independently on each client via
+// bundle_spawn_f32 — so each client's grublin gets a different local
+// spawn_index from N64Recomp's per-marker counter. Bulk sync matches by
+// (spawn_index, marker_id), so the two grublins never get correlated and
+// each player sees their own.
+//
+// Fix: tag locally-spawned hut grublins with a logical id derived from the
+// hut's spawn_index (which IS deterministic across clients — huts are
+// preplaced level data). Both clients independently arrive at the same
+// logical id for "the grublin that hut N spawned". When bulk sync or kill
+// packets go out, encode the spawn_index field as `0x8000 | logical_id`.
+// Receivers see the high bit and look up the local actor that has the same
+// logical id. (HUT_GRUBLIN_LOGICAL_BIT is defined near the top of this file
+// as a forward declaration.)
+
+#define MAX_HUT_GRUBLIN_TAGS 8
+typedef struct {
+    bool used;
+    u16  hut_spawn_index;       // shared logical id
+    u16  local_spawn_index;     // 0xFFFF until matched to a local actor
+    f32  spawn_x, spawn_y, spawn_z; // expected spawn position (for matching)
+} HutGrublinTag;
+static HutGrublinTag hut_grublin_tags[MAX_HUT_GRUBLIN_TAGS];
+
+// Called from network_hut_sync.c on both local and remote-driven hut
+// destruction when the bundle drops a grublin. Both clients invoke this
+// with the same hut_spawn_index, so they share the logical id.
+RECOMP_EXPORT void bkrecomp_net_register_hut_grublin(u32 hut_spawn_index, f32 x, f32 y, f32 z) {
+    s32 i;
+    // Refresh existing tag for this hut (re-destroy / level re-entry edge case)
+    for (i = 0; i < MAX_HUT_GRUBLIN_TAGS; i++) {
+        if (hut_grublin_tags[i].used && hut_grublin_tags[i].hut_spawn_index == (u16)hut_spawn_index) {
+            hut_grublin_tags[i].local_spawn_index = 0xFFFF;
+            hut_grublin_tags[i].spawn_x = x;
+            hut_grublin_tags[i].spawn_y = y;
+            hut_grublin_tags[i].spawn_z = z;
+            recomp_printf("[HUT-TAG] refresh tag for hut=%u\n", hut_spawn_index);
+            return;
+        }
+    }
+    // Allocate new
+    for (i = 0; i < MAX_HUT_GRUBLIN_TAGS; i++) {
+        if (!hut_grublin_tags[i].used) {
+            hut_grublin_tags[i].used = TRUE;
+            hut_grublin_tags[i].hut_spawn_index = (u16)hut_spawn_index;
+            hut_grublin_tags[i].local_spawn_index = 0xFFFF;
+            hut_grublin_tags[i].spawn_x = x;
+            hut_grublin_tags[i].spawn_y = y;
+            hut_grublin_tags[i].spawn_z = z;
+            recomp_printf("[HUT-TAG] new tag hut=%u pos=(%.0f,%.0f,%.0f)\n",
+                hut_spawn_index, x, y, z);
+            return;
+        }
+    }
+    recomp_printf("[HUT-TAG] no slot for hut=%u\n", hut_spawn_index);
+}
+
+// Per-frame: bind unmatched tags to local grublins by spawn-position
+// proximity. The bundle drop position drifts very quickly via velocity, so
+// we use a generous 350-unit radius (matches the bundle's initial 250-unit
+// random offset). Already-matched tags are skipped, and an actor that's
+// already taken by another tag is also skipped to avoid mis-binding when
+// two huts drop grublins back-to-back.
+static void update_hut_grublin_matches(void) {
+    if (!suBaddieActorArray) return;
+    s32 t, i;
+    for (t = 0; t < MAX_HUT_GRUBLIN_TAGS; t++) {
+        if (!hut_grublin_tags[t].used) continue;
+        if (hut_grublin_tags[t].local_spawn_index != 0xFFFF) continue;
+
+        for (i = 0; i < suBaddieActorArray->cnt; i++) {
+            Actor *a = &suBaddieActorArray->data[i];
+            if (!a->marker) continue;
+            if (a->marker->id != MARKER_5_GRUBLIN) continue;
+
+            f32 dx = a->position[0] - hut_grublin_tags[t].spawn_x;
+            f32 dy = a->position[1] - hut_grublin_tags[t].spawn_y;
+            f32 dz = a->position[2] - hut_grublin_tags[t].spawn_z;
+            if (dx*dx + dy*dy + dz*dz > 350.0f*350.0f) continue;
+
+            u16 si = (u16)bkrecomp_get_marker_spawn_index(a->marker);
+
+            // Avoid double-binding: skip if another tag already owns it.
+            bool taken = FALSE;
+            s32 t2;
+            for (t2 = 0; t2 < MAX_HUT_GRUBLIN_TAGS; t2++) {
+                if (t2 == t) continue;
+                if (hut_grublin_tags[t2].used && hut_grublin_tags[t2].local_spawn_index == si) {
+                    taken = TRUE;
+                    break;
+                }
+            }
+            if (taken) continue;
+
+            hut_grublin_tags[t].local_spawn_index = si;
+            recomp_printf("[HUT-TAG] hut=%u → local grublin spawn=%u pos=(%.0f,%.0f,%.0f)\n",
+                hut_grublin_tags[t].hut_spawn_index, si,
+                a->position[0], a->position[1], a->position[2]);
+            break;
+        }
+    }
+    // Garbage-collect tags whose local actor no longer exists (despawned)
+    for (t = 0; t < MAX_HUT_GRUBLIN_TAGS; t++) {
+        if (!hut_grublin_tags[t].used) continue;
+        if (hut_grublin_tags[t].local_spawn_index == 0xFFFF) continue;
+        bool found = FALSE;
+        for (i = 0; i < suBaddieActorArray->cnt; i++) {
+            Actor *a = &suBaddieActorArray->data[i];
+            if (!a->marker) continue;
+            if (a->marker->id != MARKER_5_GRUBLIN) continue;
+            if ((u16)bkrecomp_get_marker_spawn_index(a->marker) ==
+                hut_grublin_tags[t].local_spawn_index) {
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            recomp_printf("[HUT-TAG] hut=%u local grublin gone, freeing tag\n",
+                hut_grublin_tags[t].hut_spawn_index);
+            hut_grublin_tags[t].used = FALSE;
+        }
+    }
+}
+
+// Translate local (marker_id, spawn_index) → logical id. Returns 0xFFFF if
+// not a tagged actor.
+static u16 grublin_local_to_logical(u16 marker_id, u16 spawn_index) {
+    if (marker_id != MARKER_5_GRUBLIN) return 0xFFFF;
+    s32 t;
+    for (t = 0; t < MAX_HUT_GRUBLIN_TAGS; t++) {
+        if (!hut_grublin_tags[t].used) continue;
+        if (hut_grublin_tags[t].local_spawn_index == spawn_index) {
+            return hut_grublin_tags[t].hut_spawn_index;
+        }
+    }
+    return 0xFFFF;
+}
+
+// Translate logical id → local (spawn_index). Returns 0xFFFF if not yet
+// matched (incoming sync arrived before we tagged the local grublin).
+static u16 grublin_logical_to_local_spawn(u16 logical_id) {
+    s32 t;
+    for (t = 0; t < MAX_HUT_GRUBLIN_TAGS; t++) {
+        if (!hut_grublin_tags[t].used) continue;
+        if (hut_grublin_tags[t].hut_spawn_index == logical_id) {
+            return hut_grublin_tags[t].local_spawn_index;
+        }
+    }
+    return 0xFFFF;
+}
+
 // Find the receive-buffer entry matching this actor by (spawn_index, marker
 // alias). Returns NULL if the owning client hasn't broadcast it this tick.
 static EnemyPosEntry *find_recv_entry(EnemyPosEntry *recv_buf, u32 recv_count,
                                        u16 actor_si, u16 actor_mid) {
     u32 e;
+    // Primary: exact spawn_index match (works for preplaced enemies).
     for (e = 0; e < recv_count; e++) {
         if (recv_buf[e].spawn_index != actor_si) continue;
         if (!marker_id_matches(actor_mid, recv_buf[e].marker_id)) continue;
         return &recv_buf[e];
+    }
+    // Fallback: hut-grublin logical-id match.
+    u16 logical = grublin_local_to_logical(actor_mid, actor_si);
+    if (logical != 0xFFFF) {
+        u16 encoded = (u16)(HUT_GRUBLIN_LOGICAL_BIT | logical);
+        for (e = 0; e < recv_count; e++) {
+            if (recv_buf[e].spawn_index != encoded) continue;
+            if (!marker_id_matches(actor_mid, recv_buf[e].marker_id)) continue;
+            return &recv_buf[e];
+        }
     }
     return NULL;
 }
@@ -1945,6 +2363,11 @@ static void sync_enemy_positions(void) {
     u32 cur_map = (u32)map_get();
     u32 cur_level = (u32)level_get();
     actor_owner_cache_reset_for_level(cur_level);
+
+    // Bind hut-spawned grublins (added via bkrecomp_net_register_hut_grublin)
+    // to the local actor that just appeared near the hut. Done before we
+    // pack/apply state so the logical-id translation is up to date.
+    update_hut_grublin_matches();
 
     u32 my_id = recomp_net_get_local_player_id();
 
@@ -1970,7 +2393,17 @@ static void sync_enemy_positions(void) {
         // dieFunc proxy install (gated to is_killable_enemy as before).
         // Both owner and non-owner sides install: owner reports kills it
         // causes, non-owner reports kills its local Banjo causes.
+        //
+        // CRITICAL: skip actors that are already dying. process_enemy_event
+        // restores the dieFunc to the original on the receiver and marks the
+        // actor as dying — if we reinstall the proxy here on the next frame,
+        // a downstream call to dieFunc from the local death state machine
+        // (some BK enemies finalize via dieFunc) bounces back through the
+        // proxy → re-broadcasts a kill → re-arms state → death animation
+        // loops forever. Leaving the original dieFunc in place during the
+        // dying window lets the death sequence finalize cleanly.
         if (is_killable_enemy(actor)
+            && !is_dying(si)
             && actor->marker->dieFunc
             && actor->marker->dieFunc != (MarkerCollisionFunc)net_enemy_die_proxy) {
             save_enemy_funcs(si, actor->marker->dieFunc,
@@ -1980,7 +2413,15 @@ static void sync_enemy_positions(void) {
 
         if (i_own) {
             // OWNER: pack current authoritative state for broadcast.
-            send_buf[send_count].spawn_index = si;
+            // Tagged hut-grublins ship their logical id (with high bit set)
+            // so peers can correlate even though their local spawn_index
+            // differs from ours.
+            u16 send_si = si;
+            u16 logical = grublin_local_to_logical((u16)actor->marker->id, si);
+            if (logical != 0xFFFF) {
+                send_si = (u16)(HUT_GRUBLIN_LOGICAL_BIT | logical);
+            }
+            send_buf[send_count].spawn_index = send_si;
             send_buf[send_count].marker_id = (u16)actor->marker->id;
             send_buf[send_count].x = actor->position[0];
             send_buf[send_count].y = actor->position[1];
@@ -1999,41 +2440,66 @@ static void sync_enemy_positions(void) {
             send_count++;
         } else {
             // NON-OWNER: apply received state for this actor (if any).
-            if (is_dying(si)) continue;
+            //
+            // is_dying skips POSITION application only — state/anim must
+            // continue to flow during the death sequence so the receiver's
+            // local update can advance the death animation in lock-step
+            // with the owner. Previously is_dying skipped everything, which
+            // froze the death anim partway through.
             EnemyPosEntry *src = find_recv_entry(recv_buf, recv_count, si, (u16)actor->marker->id);
             if (!src) continue;
 
-            actor->position[0] = src->x;
-            actor->position[1] = src->y;
-            actor->position[2] = src->z;
-            actor->yaw = src->yaw;
+            bool dying = is_dying(si);
+            if (!dying) {
+                actor->position[0] = src->x;
+                actor->position[1] = src->y;
+                actor->position[2] = src->z;
+                actor->yaw = src->yaw;
+            }
 
             // Full animation sync from owner (anim_id + timer + direction).
-            // For special-case actors (Bigbutt/Conga/etc.) whose update
-            // function explicitly skips the state machine on non-owner, we
-            // must commit anim_id via _anctrl_start because nothing else
-            // calls subaddie_set_state* to do it. Regular enemies still run
-            // their own state machine locally and commit the index on the
-            // next transition.
+            //
+            // When the owner reports a NEW anim_id we run the full
+            // setIndex + setDuration + _anctrl_start triple so the clip
+            // actually starts playing. Previously we did this only for
+            // hand-patched special actors (Conga/Bigbutt) and let regular
+            // enemies "commit on the next state transition", but that meant
+            // a death animation pushed by the owner never visibly played
+            // on the receiver — the local update advances the timer but
+            // never re-arms the clip when the index changes from outside.
+            //
+            // Force-starting on every index change is safe: if the owner is
+            // reporting the same anim from frame to frame, anim_changed is
+            // false and we just keep advancing the timer locally as before.
             if (actor->anctrl && src->anim_id != 0) {
-                if (is_synced_special_actor(actor)) {
-                    enum asset_e cur_idx = anctrl_getIndex(actor->anctrl);
-                    if ((s32)cur_idx != (s32)src->anim_id) {
-                        anctrl_setIndex(actor->anctrl, (enum asset_e)src->anim_id);
-                        if (actor->unk18 && src->state > 0) {
-                            anctrl_setDuration(actor->anctrl,
-                                                actor->unk18[src->state].duration);
-                        }
-                        _anctrl_start(actor->anctrl, "network_world_sync.c", __LINE__);
-                    }
-                } else {
+                enum asset_e cur_idx = anctrl_getIndex(actor->anctrl);
+                bool anim_changed = ((s32)cur_idx != (s32)src->anim_id);
+                if (anim_changed) {
                     anctrl_setIndex(actor->anctrl, (enum asset_e)src->anim_id);
+                    if (actor->unk18 && src->state > 0) {
+                        anctrl_setDuration(actor->anctrl,
+                                            actor->unk18[src->state].duration);
+                    }
+                    _anctrl_start(actor->anctrl, "network_world_sync.c", __LINE__);
                 }
                 anctrl_setAnimTimer(actor->anctrl, src->anim_timer);
                 anctrl_setDirection(actor->anctrl, (s32)src->anim_direction);
             }
 
+            // sm64-coop pattern: sync actor->state for ALL killable enemies,
+            // not just the hand-patched special bosses. The owner's state
+            // transitions (alive→DEATH, attack→DEATH, etc.) propagate so the
+            // receiver's local state machine plays the death animation
+            // without any of us having to call dieFunc. For special actors
+            // we keep the unconditional apply (their update skips the state
+            // machine on non-owner). For regular enemies we only OVERRIDE
+            // when the owner reports a non-zero state — guards against
+            // clobbering a legitimate local idle (state 0) with the owner's
+            // older idle and the resulting jitter on enemies whose state
+            // semantics aren't pure-authoritative.
             if (is_synced_special_actor(actor)) {
+                actor->state = (u32)src->state;
+            } else if (src->state != 0) {
                 actor->state = (u32)src->state;
             }
         }
@@ -2389,6 +2855,17 @@ RECOMP_EXPORT void bkrecomp_net_reset_poll_baselines(void) {
 
 // Called every frame
 RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
+    // Game-thread heartbeat. If the screen freezes but [HB] keeps printing,
+    // the game thread is alive and the freeze is in rendering/input. If [HB]
+    // stops, the game thread is dead and we narrow further (dispatcher,
+    // sync_enemy_positions, etc.).
+    static u32 hb_frame = 0;
+    hb_frame++;
+    if ((hb_frame & 0x1F) == 0) { // every 32 frames
+        recomp_printf("[HB] frame=%u map=%d connected=%d\n",
+            hb_frame, (s32)map_get(), recomp_net_is_connected() ? 1 : 0);
+    }
+
     if (!recomp_net_is_connected()) return;
 
     // EEPROM handshake must run every frame regardless of map state —
@@ -2481,6 +2958,7 @@ RECOMP_EXPORT void bkrecomp_net_process_world_events(void) {
     poll_collected_jinjos();
     poll_enemy_deaths();
     sync_enemy_positions();
+    tick_dying_actors();
 
     // TTC Leaky bucket egg-counter sync
     {

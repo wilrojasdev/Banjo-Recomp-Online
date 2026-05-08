@@ -24,9 +24,24 @@ extern "C" void recomp_puts(uint8_t* rdram, recomp_context* ctx) {
     PTR(char) cur_str = _arg<0, PTR(char)>(rdram, ctx);
     u32 length = _arg<1, u32>(rdram, ctx);
 
-    for (u32 i = 0; i < length; i++) {
-        fputc(MEM_B(i, (gpr)cur_str), stdout);
+    // Mirror to a file so debug traces survive any stdout-buffering or
+    // launch-method issues (Finder/`open` disconnects stdout, pipes
+    // block-buffer by default on macOS, etc.).
+    static FILE* mirror = nullptr;
+    if (!mirror) {
+        mirror = std::fopen("/tmp/bk64_stdout.log", "w");
+        if (mirror) {
+            std::fputs("=== bk64 stdout mirror opened ===\n", mirror);
+        }
     }
+
+    for (u32 i = 0; i < length; i++) {
+        char ch = (char)MEM_B(i, (gpr)cur_str);
+        std::fputc(ch, stdout);
+        if (mirror) std::fputc(ch, mirror);
+    }
+    std::fflush(stdout);
+    if (mirror) std::fflush(mirror);
 }
 
 extern "C" void recomp_exit(uint8_t* rdram, recomp_context* ctx) {

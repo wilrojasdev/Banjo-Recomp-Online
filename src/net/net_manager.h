@@ -101,7 +101,12 @@ public:
 
     // World state sync (Phase 3)
     void send_collectible(uint8_t type, uint16_t id, uint8_t collected, uint32_t map_id, uint8_t level_id);
-    void send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz);
+    // state = actor->state captured by the killer right after its dieFunc
+    // returned. Receivers apply this directly to actor->state so the local
+    // update function plays the death animation naturally (sm64-coop pattern).
+    // state=0 means "no death state info" — receiver should despawn directly.
+    void send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id,
+                          float px, float py, float pz, uint8_t state);
     void send_flag_change(uint8_t flag_type, uint16_t flag_index, uint8_t value, uint32_t map_id);
 
     // Enemy position sync (host-authoritative)

@@ -1355,7 +1355,7 @@ void NetworkManager::send_collectible(uint8_t type, uint16_t id, uint8_t collect
     enqueue_packet(&pkt, sizeof(pkt), CHANNEL_RELIABLE, true);
 }
 
-void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz) {
+void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index, uint32_t map_id, float px, float py, float pz, uint8_t state) {
     if (!is_connected()) return;
 
     // Record locally in centralized kill tracking
@@ -1379,6 +1379,7 @@ void NetworkManager::send_enemy_death(uint16_t marker_type, uint16_t spawn_index
     pkt.map_id = map_id;
     pkt.alive = 0;
     pkt.health = 0;
+    pkt.state = state;
     pkt.pos_x = px;
     pkt.pos_y = py;
     pkt.pos_z = pz;
