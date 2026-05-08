@@ -29,7 +29,7 @@ constexpr uint8_t NUM_CHANNELS = 2;
 // state and froze the game thread) and instead apply the death state to
 // actor->state — the local update function runs the death animation
 // naturally. Mirrors sm64-coop-dx's oAction sync pattern.
-constexpr uint32_t PROTOCOL_VERSION = 7;
+constexpr uint32_t PROTOCOL_VERSION = 8;
 
 // Optional features negotiated in VersionCheck. Both peers' reported bitmaps
 // are ANDed; behaviour downgrades for features not common to both. This lets
