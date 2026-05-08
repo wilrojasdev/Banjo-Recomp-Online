@@ -496,8 +496,19 @@ RECOMP_PATCH void __chjuju_spawnJiggy(s32 x, s32 y, s32 z, s32 yaw) {
 
 /* ============================================================
  * RECOMP_PATCH: __chlmonkey_updateBringOrange (Chimpy delivery)
- * In multiplayer, any player can deliver the orange to Chimpy
- * once FLAG_1 (orange collected) is set — no need to carry it.
+ *
+ * Coop rule: only the player who picked up the orange may deliver it.
+ * That property is enforced by the vanilla carry mechanic — only the
+ * picker carries the orange (bacarry_get_markerId() == orange) so only
+ * they can hit the throw branch below. We intentionally do NOT have a
+ * multiplayer "auto-deliver near Chimpy" fallback: a non-picker walking
+ * up to Chimpy must not be able to trigger delivery.
+ *
+ * The patch wrapping this function exists only so we can latch
+ * local_chimpy_delivered for the camera/dialog gate downstream. The
+ * delivery side-effects (FLAG_2, leave/jiggy sequence) follow the
+ * vanilla path (__chLevelCollectible_returnObj sets FLAG_2 via the
+ * patched mapSpecificFlags_set, which broadcasts to remote peers).
  * ============================================================ */
 extern void player_setCarryObjectPoseInHorizontalRadius(f32 *, f32, s32, Actor **);
 extern s32  bacarry_get_markerId(void);
@@ -519,22 +530,6 @@ RECOMP_PATCH void __chlmonkey_updateBringOrange(Actor **this_ptr) {
         local_chimpy_delivered = TRUE;
         timed_setStaticCameraToNode(1.2f, 0xF);
         func_80324E38(1.2f, 3);
-        return;
-    }
-
-    /* MULTIPLAYER: if orange was collected (by any player) and local player
-     * is near Chimpy, auto-deliver without needing to carry the orange. */
-    if (recomp_net_is_connected()
-        && mapSpecificFlags_get(MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED)
-        && !mapSpecificFlags_get(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED)
-        && !(*this_ptr)->has_met_before
-        && subaddie_playerIsWithinSphereAndActive(*this_ptr, 345)) {
-        func_8028FA34(0xc6, *this_ptr);
-        (*this_ptr)->has_met_before = TRUE;
-        local_chimpy_delivered = TRUE;
-        timed_setStaticCameraToNode(1.2f, 0xF);
-        func_80324E38(1.2f, 3);
-        mapSpecificFlags_set(MM_SPECIFIC_FLAG_2_ORANGE_HAS_BEEN_RETURNED, TRUE);
     }
 }
 

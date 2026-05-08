@@ -4,6 +4,9 @@
 
 extern Actor *actorArray_findActorFromMarkerId(s32 marker_id);
 extern void marker_despawn(ActorMarker *marker);
+extern s32  mapSpecificFlags_get(s32);
+extern void mapSpecificFlags_set(s32 i, s32 val);
+extern enum map_e map_get(void);
 
 /*
  * Shared inventory sync: eggs, red feathers, gold feathers.
@@ -12,6 +15,13 @@ extern void marker_despawn(ActorMarker *marker);
  * egg increments everyone's count; anyone firing one decrements everyone.
  * Mumbo tokens stay per-player (treated like jiggies — collected once
  * per session, persisted in the host EEPROM).
+ *
+ * The MM orange (ITEM_19_ORANGE) is intentionally NOT in this pool: only
+ * the player who actually picks it up is allowed to deliver it to Chimpy.
+ * Pickup is detected here (count diff > 0 on the local peer) and turned
+ * into a one-shot MM_SPECIFIC_FLAG_1 latch, which the patched
+ * mapSpecificFlags_set broadcasts; remote peers despawn their world copy
+ * via the existing FLAG_1 receive-side handler in network_flag_sync.c.
  *
  * Mechanism: polling-based diff sync. Each frame we read the local
  * D_80385F30[item] count for the three tracked items, compare to the
@@ -56,8 +66,7 @@ static s32 s_last_orange = -1;
 static bool is_shared_item(u32 item) {
     return item == ITEM_D_EGGS
         || item == ITEM_F_RED_FEATHER
-        || item == ITEM_10_GOLD_FEATHER
-        || item == ITEM_19_ORANGE;
+        || item == ITEM_10_GOLD_FEATHER;
 }
 
 // Called from network_flag_sync.c when a remote FLAG_SHARED_ITEM event arrives.
@@ -101,17 +110,6 @@ RECOMP_EXPORT void bkrecomp_net_shared_items_tick(void) {
             if (d != 0) {
                 item_adjustByDiffWithHud(it, d);
             }
-            /* Side effect: orange tree pickup. Vanilla never sets
-             * MM_SPECIFIC_FLAG_1, so the despawn-by-flag path in
-             * network_flag_sync.c never fires. Use the +diff event itself
-             * as the "someone collected it" trigger and despawn the
-             * world copy here. */
-            if (it == ITEM_19_ORANGE && d > 0) {
-                Actor *orange = actorArray_findActorFromMarkerId(MARKER_36_ORANGE_COLLECTIBLE);
-                if (orange && orange->marker) {
-                    marker_despawn(orange->marker);
-                }
-            }
         }
         s_pending_count = 0;
         s_last_eggs   = item_getCount(ITEM_D_EGGS);
@@ -138,5 +136,18 @@ RECOMP_EXPORT void bkrecomp_net_shared_items_tick(void) {
     send_diff_if_changed(ITEM_D_EGGS,          cur_eggs,   &s_last_eggs);
     send_diff_if_changed(ITEM_F_RED_FEATHER,   cur_red,    &s_last_red);
     send_diff_if_changed(ITEM_10_GOLD_FEATHER, cur_gold,   &s_last_gold);
-    send_diff_if_changed(ITEM_19_ORANGE,       cur_orange, &s_last_orange);
+
+    /* Orange is per-player (NOT in is_shared_item), but we still poll the
+     * local count to detect THIS peer picking it up. On a positive edge
+     * we latch MM_SPECIFIC_FLAG_1 — the patched mapSpecificFlags_set
+     * broadcasts the change, and remote peers despawn their world copy
+     * in the FLAG_1 handler in network_flag_sync.c. Only fire on MM
+     * (other levels can't have the orange, but be defensive against a
+     * stray count change). */
+    if (cur_orange > s_last_orange
+        && map_get() == MAP_2_MM_MUMBOS_MOUNTAIN
+        && !mapSpecificFlags_get(MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED)) {
+        mapSpecificFlags_set(MM_SPECIFIC_FLAG_1_ORANGE_HAS_BEEN_COLLECTED, TRUE);
+    }
+    s_last_orange = cur_orange;
 }
