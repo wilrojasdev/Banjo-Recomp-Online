@@ -112,6 +112,11 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #undef Always
 #endif
 
+#ifdef __ANDROID__
+#include "android_touch.h"
+#include "android_audio.h"
+#endif
+
 #include "recompui/recompui.h"
 #include "recompui/program_config.h"
 #include "recompui/renderer.h"
@@ -272,13 +277,17 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     bool choose_kazooie_icon = (rand() % 2 == 0);
     HICON new_icon = LoadIcon(GetModuleHandle(NULL), choose_kazooie_icon ? MAKEINTRESOURCE(APP_ICON_K) : MAKEINTRESOURCE(APP_ICON_B));
     SendMessage(wmInfo.info.win.window, WM_SETICON, ICON_SMALL2, (LPARAM)(new_icon));
-#elif defined(__linux__)
+#elif defined(__gnu_linux__)
     SetImageAsIcon("icons/app.png", window);
 #endif
 
 #if defined(_WIN32)
     return ultramodern::renderer::WindowHandle{ wmInfo.info.win.window, GetCurrentThreadId() };
-#elif defined(__linux__) || defined(__ANDROID__)
+#elif defined(__ANDROID__)
+    // Unreachable: int main() never runs on Android (NativeActivity entry is
+    // android_main → banjo_android::run_game). Guarded for compile only.
+    return nullptr;
+#elif defined(__linux__)
     return ultramodern::renderer::WindowHandle{ window };
 #elif defined(__APPLE__)
     SDL_MetalView view = SDL_Metal_CreateView(window);
@@ -2313,18 +2322,34 @@ int main(int argc, char** argv) {
         .update_gfx = update_gfx,
     };
 
+#ifdef __ANDROID__
+    // Android: route audio through Oboe (low-latency AAudio/OpenSL ES).
+    // The desktop SDL2 audio path isn't available on Android.
+    banjo_android::audio::start();
+    ultramodern::audio_callbacks_t audio_callbacks =
+        banjo_android::audio::make_audio_callbacks();
+#else
     ultramodern::audio_callbacks_t audio_callbacks{
         .queue_samples = queue_samples,
         .get_frames_remaining = get_frames_remaining,
         .set_frequency = set_frequency,
     };
+#endif
 
+#ifdef __ANDROID__
+    // Android: route input through the on-screen touch overlay. The recompinput
+    // tree (RecompFrontend) isn't cross-compiled for Android — touch events
+    // come from NativeActivity (wired in Phase 8) into banjo_android::touch.
+    ultramodern::input::callbacks_t input_callbacks =
+        banjo_android::touch::make_input_callbacks();
+#else
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
         .get_input = recompinput::profiles::get_n64_input,
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };
+#endif
 
     ultramodern::events::callbacks_t thread_callbacks{
         .vi_callback = recompinput::update_rumble,

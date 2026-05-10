@@ -185,6 +185,19 @@ T get_general_config_number_value(const std::string& option_id) {
     return static_cast<T>(std::get<double>(recompui::config::get_general_config().get_option_value(option_id)));
 }
 
+// On Android the recompui config tabs are never created (no UI launcher yet),
+// so any path that would call recompui::config::get_general_config() throws.
+// Phase 10 just needs sensible defaults so the game can render frames; the
+// settings UI plumbing comes later.
+#ifdef __ANDROID__
+banjo::NoteSavingMode banjo::get_note_saving_mode() { return banjo::NoteSavingMode::On; }
+banjo::CameraInvertMode banjo::get_camera_invert_mode() { return banjo::CameraInvertMode::InvertNone; }
+banjo::CameraInvertMode banjo::get_third_person_camera_mode() { return banjo::CameraInvertMode::InvertNone; }
+banjo::CameraInvertMode banjo::get_flying_and_swimming_invert_mode() { return banjo::CameraInvertMode::InvertNone; }
+banjo::CameraInvertMode banjo::get_first_person_invert_mode() { return banjo::CameraInvertMode::InvertNone; }
+banjo::AnalogCamMode banjo::get_analog_cam_mode() { return banjo::AnalogCamMode::Off; }
+uint32_t banjo::get_analog_cam_sensitivity() { return 50; }
+#else
 banjo::NoteSavingMode banjo::get_note_saving_mode() {
     return get_general_config_enum_value<banjo::NoteSavingMode>(banjo::configkeys::general::note_saving_mode);
 }
@@ -212,6 +225,7 @@ banjo::AnalogCamMode banjo::get_analog_cam_mode() {
 uint32_t banjo::get_analog_cam_sensitivity() {
     return get_general_config_number_value(banjo::configkeys::general::analog_camera_sensitivity);
 }
+#endif
 
 template <typename T = uint32_t>
 T get_graphics_config_enum_value(const std::string& option_id) {
@@ -232,7 +246,11 @@ T get_sound_config_number_value(const std::string& option_id) {
 }
 
 int banjo::get_bgm_volume() {
+#ifdef __ANDROID__
+    return 100;
+#else
     return get_sound_config_number_value<int>(banjo::configkeys::sound::bgm_volume);
+#endif
 }
 
 static void add_graphics_options(recomp::config::Config &config) {
@@ -340,19 +358,35 @@ static void set_control_names_and_descriptions() {
 }
 
 banjo::CutsceneAspectRatioMode banjo::get_cutscene_aspect_ratio_mode() {
+#ifdef __ANDROID__
+    return banjo::CutsceneAspectRatioMode::Clamp16x9;
+#else
     return get_graphics_config_enum_value<banjo::CutsceneAspectRatioMode>(banjo::configkeys::graphics::cutscene_aspect_ratio_mode);
+#endif
 }
 
 banjo::NetworkMode banjo::get_network_mode() {
+#ifdef __ANDROID__
+    return banjo::NetworkMode::Off;
+#else
     return get_general_config_enum_value<banjo::NetworkMode>(banjo::configkeys::network::mode);
+#endif
 }
 
 banjo::Language banjo::get_language() {
+#ifdef __ANDROID__
+    return banjo::Language::English;
+#else
     return get_general_config_enum_value<banjo::Language>(banjo::configkeys::general::language);
+#endif
 }
 
 uint32_t banjo::get_network_port() {
+#ifdef __ANDROID__
+    return 34197;
+#else
     return get_general_config_number_value<uint32_t>(banjo::configkeys::network::port);
+#endif
 }
 
 static void add_network_options(recomp::config::Config &config) {

@@ -44,7 +44,16 @@ if (WIN32)
 endif()
 
 set(RT64_STATIC TRUE)
-set(RT64_SDL_WINDOW_VULKAN TRUE)
+if (ANDROID)
+    # Android uses NativeActivity + ANativeWindow path; no SDL window/Vulkan.
+    set(RT64_SDL_WINDOW_VULKAN FALSE)
+    set(RT64_ANDROID_SPIKE ON CACHE BOOL "Skip host-only contrib (nfd, re-spirv) for Android" FORCE)
+    if (NOT SDL2_INCLUDE_DIRS)
+        set(SDL2_INCLUDE_DIRS "/opt/homebrew/include/SDL2" CACHE PATH "Header-only SDL2 for Android cross-compile")
+    endif()
+else()
+    set(RT64_SDL_WINDOW_VULKAN TRUE)
+endif()
 add_compile_definitions(HLSL_CPU)
 
 if (RECOMP_FLATPAK)
@@ -73,7 +82,32 @@ target_include_directories(coopnet PUBLIC ${COOPNET_DIR}/common ${COOPNET_DIR}/l
 target_compile_definitions(coopnet PRIVATE JUICE_STATIC $<$<PLATFORM_ID:Darwin>:OSX_BUILD=1>)
 target_compile_features(coopnet PRIVATE cxx_std_11)
 
-if (APPLE)
+if (ANDROID)
+    # No prebuilt libjuice for Android in lib/coopnet/lib/; build from source
+    # via FetchContent (mirrors the Windows path below).
+    FetchContent_Declare(libjuice
+        GIT_REPOSITORY https://github.com/paullouisageneau/libjuice.git
+        GIT_TAG v1.6.2
+    )
+    set(NO_TESTS ON CACHE BOOL "" FORCE)
+    set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+    set(NO_SERVER ON CACHE BOOL "" FORCE)
+    set(USE_NETTLE OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(libjuice)
+    target_link_libraries(coopnet PUBLIC LibJuice::LibJuiceStatic)
+
+    # Oboe: Google's low-latency audio library for Android (AAudio + OpenSL ES).
+    # Used by android_audio.cpp to drive ultramodern's audio callbacks. The
+    # default desktop SDL2 audio path isn't available on Android.
+    FetchContent_Declare(oboe
+        GIT_REPOSITORY https://github.com/google/oboe.git
+        GIT_TAG 1.9.3
+    )
+    set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    FetchContent_MakeAvailable(oboe)
+    set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
+elseif (APPLE)
     # Always use the fat (universal) dylib. Per-arch dylibs break
     # CMAKE_OSX_ARCHITECTURES="x86_64;arm64" universal builds — CMake
     # picks a single linker input per target, so the "other" arch hits
@@ -166,32 +200,42 @@ if(NOT DEFINED PATCHES_LD)
     set(PATCHES_LD ld.lld)
 endif()
 
-add_custom_target(PatchesBin
-    COMMAND ${CMAKE_COMMAND} -E env CC=${PATCHES_C_COMPILER} LD=${PATCHES_LD} make
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/patches
-    BYPRODUCTS ${CMAKE_SOURCE_DIR}/patches/patches.elf
-)
+if (NOT ANDROID)
+    add_custom_target(PatchesBin
+        COMMAND ${CMAKE_COMMAND} -E env CC=${PATCHES_C_COMPILER} LD=${PATCHES_LD} make
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/patches
+        BYPRODUCTS ${CMAKE_SOURCE_DIR}/patches/patches.elf
+    )
 
-# Generate patches_bin.c from patches.bin
-add_custom_command(OUTPUT ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c
-    COMMAND file_to_c ${CMAKE_SOURCE_DIR}/patches/patches.bin bk_patches_bin ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.h
-    DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.bin
-)
+    # Generate patches_bin.c from patches.bin
+    add_custom_command(OUTPUT ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c
+        COMMAND file_to_c ${CMAKE_SOURCE_DIR}/patches/patches.bin bk_patches_bin ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.h
+        DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.bin
+    )
 
-# Recompile patches elf into patches.c and patches.bin
-add_custom_command(OUTPUT
-                       ${CMAKE_SOURCE_DIR}/patches/patches.bin
-                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
-                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/recomp_overlays.inl
-                       ${CMAKE_SOURCE_DIR}/RecompiledPatches/funcs.h
-                   # TODO: Look into why modifying patches requires two builds to take
-                   COMMAND ./N64Recomp patches.toml
-                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                   DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.elf
-)
+    # Recompile patches elf into patches.c and patches.bin
+    add_custom_command(OUTPUT
+                           ${CMAKE_SOURCE_DIR}/patches/patches.bin
+                           ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c
+                           ${CMAKE_SOURCE_DIR}/RecompiledPatches/recomp_overlays.inl
+                           ${CMAKE_SOURCE_DIR}/RecompiledPatches/funcs.h
+                       # TODO: Look into why modifying patches requires two builds to take
+                       COMMAND ./N64Recomp patches.toml
+                       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                       DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.elf
+    )
+endif()
+# On Android, patches.elf / patches.bin / RecompiledPatches/*.c are reused from
+# a prior desktop build. Regenerating them requires running N64Recomp + the MIPS
+# patches Makefile, both of which are host-only build steps (Phase 5 deferred).
 
-# Main executable
-add_executable(BanjoRecompiled)
+# Main app: shared library on Android (loaded by NativeActivity / Java),
+# executable everywhere else.
+if (ANDROID)
+    add_library(BanjoRecompiled SHARED)
+else()
+    add_executable(BanjoRecompiled)
+endif()
 
 set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/launcher_animation.cpp
@@ -226,6 +270,28 @@ set (SOURCES
 
     ${CMAKE_SOURCE_DIR}/src/locale/locale.cpp
 )
+
+if (ANDROID)
+    # NDK ships android_native_app_glue.{c,h} as a source-only helper that
+    # provides ANativeActivity_onCreate() (the entry point the OS looks up
+    # in the .so via the AndroidManifest meta-data) and a polling event
+    # loop wrapper. Compile it into the .so directly; the linker would
+    # otherwise dead-strip ANativeActivity_onCreate, so force-include it.
+    set(NATIVE_APP_GLUE_DIR "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
+    list(APPEND SOURCES
+        ${CMAKE_SOURCE_DIR}/src/main/android_touch.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_audio.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_main.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_render_context.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_run_game.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_nfd_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_respv_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_recompui_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_recompinput_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_stubs.cpp
+        ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
+    )
+endif()
 
 target_include_directories(BanjoRecompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -340,7 +406,60 @@ if (APPLE)
     include(${CMAKE_SOURCE_DIR}/.github/macos/apple_bundle.cmake)
 endif()
 
-if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+if (ANDROID)
+    # main.cpp does `#include <SDL2/SDL.h>`, so we need the parent of the
+    # SDL2/ directory on the include path too.
+    get_filename_component(_SDL2_PARENT_DIR ${SDL2_INCLUDE_DIRS} DIRECTORY)
+    target_include_directories(BanjoRecompiled PRIVATE
+        ${SDL2_INCLUDE_DIRS}
+        ${_SDL2_PARENT_DIR}
+        # Header-only deps from RecompFrontend that the main app references but
+        # whose .cpp implementations are pulled in transitively (or stubbed for
+        # Phase 5 — wired for real in Phase 6/7).
+        ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/lib/GamepadMotionHelpers
+        ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompinput/include
+        ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/include
+    )
+
+    set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+    set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+    find_package(Threads REQUIRED)
+
+    # Android system libs: log for __android_log_print, android for ANativeWindow,
+    # vulkan for Plume's Vulkan backend, dl for dlopen (mod hot-loading).
+    # No X11, no Freetype, no SDL2 link — runtime SDL2 will be wired in Phase 8
+    # (APK + SDLActivity Java side) only if needed.
+    target_link_libraries(BanjoRecompiled PRIVATE
+        ${CMAKE_DL_LIBS} Threads::Threads
+        log android vulkan
+    )
+
+    # Phase 8 finding: Bionic's dlopen() rejects .so files with non-weak UND
+    # symbols even when the linker accepted them via --unresolved-symbols.
+    # Solution: src/main/android_stubs.cpp aliases every UND symbol to
+    # android_unimplemented_stub(), which logs+aborts when called. Calling
+    # it means the boot flow hit a desktop-only path (recompui launcher,
+    # SDL2 init, etc.) — Phase 9+ replaces those flows with NativeActivity
+    # equivalents. Without this, the Activity launches but the .so won't load.
+    #
+    # -u ANativeActivity_onCreate forces the linker to keep the symbol that
+    # native_app_glue defines; without it -Wl,--gc-sections strips it and
+    # the OS can't find the entry point declared in AndroidManifest.
+    #
+    # --unresolved-symbols=ignore-all overrides the NDK default --no-undefined
+    # so dependencies with leftover desktop-only refs (rt64's SDL2 imgui shim,
+    # re-spirv contrib, etc.) link as UND symbols rather than failing the link.
+    # Bionic's dlopen would normally reject those at load time — that's what
+    # android_stubs.cpp's alias-to-abort table is for: every UND that survives
+    # link gets a definition before runtime so dlopen succeeds.
+    target_link_options(BanjoRecompiled PRIVATE
+        "-u" "ANativeActivity_onCreate"
+        "-Wl,--unresolved-symbols=ignore-all"
+    )
+
+    # native_app_glue lives in NDK sources, not on any default include path.
+    target_include_directories(BanjoRecompiled PRIVATE ${NATIVE_APP_GLUE_DIR})
+elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
     find_package(SDL2 REQUIRED)
     find_package(X11 REQUIRED)
 
@@ -387,44 +506,65 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_0")
 set (DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_0")
 set (DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
 
-if (${WIN32})
+# DXC and spirv-cross run on the build host, not the target. Use CMAKE_HOST_*
+# so cross-compiles (e.g. macOS arm64 host targeting Android arm64) pick the
+# right binary.
+if (CMAKE_HOST_WIN32)
     set (DXC "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
-    add_compile_definitions(NOMINMAX)
-else()
-    if (APPLE)
-        # Apple's binary is universal, so it'll work on both x86_64 and arm64
-        set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/arm64/dxc-macos")
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-            set(SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/spirv-cross/lib/x64" "${PROJECT_SOURCE_DIR}/lib/rt64//src/contrib/spirv-cross/bin/x64/spirv-cross")
-        else()
-            set(SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/spirv-cross/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64//src/contrib/spirv-cross/bin/x64/spirv-cross")
-        endif()
+elseif (CMAKE_HOST_APPLE)
+    # Apple's binary is universal, so it'll work on both x86_64 and arm64
+    set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/arm64/dxc-macos")
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/spirv-cross/lib/x64" "${PROJECT_SOURCE_DIR}/lib/rt64//src/contrib/spirv-cross/bin/x64/spirv-cross")
     else()
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-            set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
-        else()
-            set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/arm64/dxc-linux")
-        endif()
+        set(SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/spirv-cross/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64//src/contrib/spirv-cross/bin/x64/spirv-cross")
     endif()
+else()
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
+    else()
+        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/arm64/dxc-linux")
+    endif()
+endif()
+if (WIN32)
+    add_compile_definitions(NOMINMAX)
 endif()
 
 set(RECOMP_FRONTEND_N64MODERNRUNTIME_PATH ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
 set(RECOMP_FRONTEND_RT64_PATH ${CMAKE_SOURCE_DIR}/lib/rt64)
 
-add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
+if (NOT ANDROID)
+    # RecompFrontend pulls in RmlUi + Freetype + a SDL2-based UI shell.
+    # Android doesn't need any of that — the launcher and touch overlay are
+    # built natively in Phase 6 / 7.
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
+endif()
 
-target_link_libraries(BanjoRecompiled PRIVATE
-    PatchesLib
-    RecompiledFuncs
-    recompui
-    recompinput
-    librecomp
-    ultramodern
-    rt64
-    nfd
-    enet
-    coopnet
-)
+if (ANDROID)
+    target_link_libraries(BanjoRecompiled PRIVATE
+        PatchesLib
+        RecompiledFuncs
+        librecomp
+        ultramodern
+        rt64
+        enet
+        coopnet
+        oboe
+    )
+else()
+    target_link_libraries(BanjoRecompiled PRIVATE
+        PatchesLib
+        RecompiledFuncs
+        recompui
+        recompinput
+        librecomp
+        ultramodern
+        rt64
+        nfd
+        enet
+        coopnet
+    )
+endif()
 
 # Compressed network packets (FEATURE_COMPRESSION) use miniz instead of
 # system zlib. miniz is vendored in N64ModernRuntime/thirdparty/miniz and
