@@ -81,3 +81,8 @@ platform/android/build/
 platform/android/app/.cxx/
 platform/android/app/build/
 platform/android/local.properties
+
+# Vulkan validation layer .so (24 MB) — bring-up debug only. Download from
+# https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases and
+# place at platform/android/app/src/main/jniLibs/arm64-v8a/.
+platform/android/app/src/main/jniLibs/

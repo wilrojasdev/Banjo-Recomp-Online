@@ -285,7 +285,6 @@ if (ANDROID)
         ${CMAKE_SOURCE_DIR}/src/main/android_render_context.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_run_game.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_nfd_stubs.cpp
-        ${CMAKE_SOURCE_DIR}/src/main/android_respv_stubs.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_recompui_stubs.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_recompinput_stubs.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_stubs.cpp
