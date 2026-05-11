@@ -23,14 +23,41 @@
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
 
-// Captured in JNI_OnLoad at .so load time so any thread can attach later.
+// NativeActivity loads our .so via dlopen, NOT System.loadLibrary, so the
+// JNI_OnLoad hook never fires and we can't capture the JavaVM that way.
+// Instead, android_main.cpp calls banjo_android_set_jvm() once the
+// android_app struct is wired up — it has app->activity->vm.
+//
+// Separately, FindClass from a native-thread JNIEnv doesn't see app classes
+// (it uses the system classloader). The Java side calls nativeInit() right
+// after loadLibrary in MainActivity's static initializer; we use that
+// JNIEnv (which DOES have the app classloader) to cache a global ref to
+// MainActivity and the methodID for nativeNotifyFirstFrame. Background
+// threads can then invoke the cached method without doing FindClass.
 namespace {
 JavaVM* g_jvm = nullptr;
+jclass g_main_activity_class = nullptr;
+jmethodID g_notify_first_frame_method = nullptr;
 }
 
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
+extern "C" __attribute__((visibility("default")))
+void banjo_android_set_jvm(JavaVM* vm) {
     g_jvm = vm;
-    return JNI_VERSION_1_6;
+    __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
+        "banjo_android_set_jvm: vm=%p", (void*)vm);
+}
+
+// Called from MainActivity's static initializer (Java thread, app classloader
+// reachable). Stash a global ref to the class + the methodID for later.
+extern "C" JNIEXPORT void JNICALL
+Java_com_banjorecomp_online_MainActivity_nativeInit(JNIEnv* env, jclass clazz) {
+    if (env == nullptr) return;
+    g_main_activity_class = static_cast<jclass>(env->NewGlobalRef(clazz));
+    g_notify_first_frame_method =
+        env->GetStaticMethodID(clazz, "nativeNotifyFirstFrame", "()V");
+    __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
+        "nativeInit: class=%p method=%p", (void*)g_main_activity_class,
+        (void*)g_notify_first_frame_method);
 }
 
 #define LOG_TAG "BK64-Render"
@@ -52,33 +79,36 @@ std::atomic<std::chrono::steady_clock::time_point> g_last_log{std::chrono::stead
 // the first VI present succeeds, so the Java loading splash can dismiss
 // itself instead of relying solely on the 45-second timeout.
 void notify_first_frame_to_java() {
-    if (g_jvm == nullptr) return;
+    if (g_jvm == nullptr || g_main_activity_class == nullptr || g_notify_first_frame_method == nullptr) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+            "notify_first_frame: missing jvm/class/method (jvm=%p cls=%p mid=%p)",
+            (void*)g_jvm, (void*)g_main_activity_class,
+            (void*)g_notify_first_frame_method);
+        return;
+    }
 
     JavaVM* vm = g_jvm;
     JNIEnv* env = nullptr;
     bool attached = false;
-    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+    jint getEnvResult = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (getEnvResult == JNI_EDETACHED) {
         if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
             __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
                 "notify_first_frame: AttachCurrentThread failed");
             return;
         }
         attached = true;
+    } else if (getEnvResult != JNI_OK) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+            "notify_first_frame: GetEnv returned %d", (int)getEnvResult);
+        return;
     }
-    if (env == nullptr) return;
 
-    jclass cls = env->FindClass("com/banjorecomp/online/MainActivity");
-    if (cls != nullptr) {
-        jmethodID mid = env->GetStaticMethodID(cls, "nativeNotifyFirstFrame", "()V");
-        if (mid != nullptr) {
-            env->CallStaticVoidMethod(cls, mid);
-            __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
-                "notify_first_frame: signalled MainActivity");
-        }
-        env->DeleteLocalRef(cls);
-    }
+    env->CallStaticVoidMethod(g_main_activity_class, g_notify_first_frame_method);
+    __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
+        "notify_first_frame: signalled MainActivity");
+
     if (env->ExceptionCheck()) env->ExceptionClear();
-
     if (attached) vm->DetachCurrentThread();
 }
 
@@ -206,6 +236,19 @@ public:
             app = nullptr;
             return;
         }
+
+        // Block here until the ubershader pipelines BK64's intro needs are
+        // ready (idx=0 and idx=3, pinned to thread 0 by RasterShaderUber's
+        // constructor). recomp::start blocks on this setup() returning, so
+        // pausing inside it stalls the game loop AND the audio scheduler
+        // until rendering can actually keep up. Without this, the splash
+        // hides 15 s of game time the user can hear but not see.
+        if (app->rasterShaderCache && app->rasterShaderCache->shaderUber) {
+            LOGI("AndroidRenderContext: waiting on ubershader pipelines 0+3");
+            app->rasterShaderCache->shaderUber->waitForPipelineCreation();
+            LOGI("AndroidRenderContext: ubershader pipelines 0+3 ready");
+        }
+
         LOGI("AndroidRenderContext: ready");
     }
 

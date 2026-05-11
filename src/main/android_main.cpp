@@ -14,6 +14,7 @@
 #include <android_native_app_glue.h>
 #include <android/log.h>
 #include <android/window.h>
+#include <jni.h>
 
 #include <atomic>
 #include <thread>
@@ -108,12 +109,21 @@ void handle_cmd(struct android_app* app, int32_t cmd) {
 
 }  // anonymous namespace
 
+extern "C" void banjo_android_set_jvm(JavaVM* vm);
+
 extern "C" void android_main(struct android_app* app) {
     LOGI("BK64-Online native entry — android_main()");
 
     g_app = app;
     app->onAppCmd = handle_cmd;
     app->onInputEvent = handle_input;
+
+    // NativeActivity loads our .so via dlopen, so JNI_OnLoad never fires.
+    // Hand the render context the JavaVM directly so it can attach a
+    // background thread later for the first-frame Java callback.
+    if (app->activity != nullptr) {
+        banjo_android_set_jvm(app->activity->vm);
+    }
 
     // Start the audio output stream early so it's ready when the game
     // produces samples. Safe to call before the window exists.

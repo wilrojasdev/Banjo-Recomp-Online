@@ -52,8 +52,11 @@ public class MainActivity extends NativeActivity {
     // Loading splash on top of NativeActivity's surface while the Mali driver
     // compiles RT64's ubershader pipelines (~22 s on the A24). Dismissed when
     // native code calls nativeNotifyFirstFrame() or — as a safety net — after
-    // LOADING_TIMEOUT_MS.
+    // LOADING_TIMEOUT_MS. The START / A buttons are deferred until after
+    // dismiss so they only appear with the actual game.
     private View mLoadingView = null;
+    private boolean mGameButtonsInstalled = false;
+    private android.os.IBinder mGameToken = null;
     private final Handler mUiHandler = new Handler(Looper.getMainLooper());
     private static final long LOADING_TIMEOUT_MS = 45_000;
 
@@ -63,10 +66,19 @@ public class MainActivity extends NativeActivity {
         // harmless (subsequent loads are no-ops) and guarantees the JNI
         // symbol is resolvable before any onTouch fires.
         System.loadLibrary("BanjoRecompiled");
+        // Give the native side a JNIEnv that has the app classloader so it
+        // can cache a global ref to this class + the notifyFirstFrame method
+        // ID. Without this, FindClass from the workload/audio threads fails
+        // (system classloader doesn't see com.banjorecomp.online.*) and the
+        // first-frame splash dismiss never fires.
+        nativeInit();
     }
 
     /** Set or clear an N64 button bit in the global touch state. */
     private static native void nativeSetButton(int mask, boolean pressed);
+
+    /** Cache class+method on the native side for first-frame callback. */
+    private static native void nativeInit();
 
     /**
      * Called by native code from android_run_game.cpp once the first VI frame
@@ -109,11 +121,11 @@ public class MainActivity extends NativeActivity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus && !mOverlayInstalled) {
             mOverlayInstalled = true;
-            android.os.IBinder token = getWindow().getDecorView().getWindowToken();
-            Log.i(TAG, "onWindowFocusChanged(true) — token=" + token);
-            installLoadingOverlay(token);
-            installStartWindowOverlay(token);
-            installAWindowOverlay(token);
+            mGameToken = getWindow().getDecorView().getWindowToken();
+            Log.i(TAG, "onWindowFocusChanged(true) — token=" + mGameToken);
+            installLoadingOverlay(mGameToken);
+            // START / A buttons are installed in dismissLoadingOverlay()
+            // once the first real game frame is on screen.
         }
     }
 
@@ -329,13 +341,22 @@ public class MainActivity extends NativeActivity {
     }
 
     private void dismissLoadingOverlay() {
-        if (mLoadingView == null) return;
-        try {
-            getWindowManager().removeView(mLoadingView);
-            Log.i(TAG, "loading overlay dismissed");
-        } catch (Throwable t) {
-            Log.w(TAG, "loading overlay removeView failed: " + t);
+        if (mLoadingView != null) {
+            try {
+                getWindowManager().removeView(mLoadingView);
+                Log.i(TAG, "loading overlay dismissed");
+            } catch (Throwable t) {
+                Log.w(TAG, "loading overlay removeView failed: " + t);
+            }
+            mLoadingView = null;
         }
-        mLoadingView = null;
+        // Defer-installing the game controls until the splash is actually
+        // going away — keeps them off-screen during the boot wait so they
+        // only appear with the real first frame.
+        if (!mGameButtonsInstalled && mGameToken != null) {
+            mGameButtonsInstalled = true;
+            installStartWindowOverlay(mGameToken);
+            installAWindowOverlay(mGameToken);
+        }
     }
 }
