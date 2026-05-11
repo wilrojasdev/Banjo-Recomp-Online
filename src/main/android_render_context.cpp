@@ -220,13 +220,10 @@ public:
     }
 
     float get_resolution_scale() const override {
-        constexpr int ReferenceHeight = 240;
-        if (!app) return 1.0f;
-        if (app->userConfig.resolution == RT64::UserConfiguration::Resolution::WindowIntegerScale &&
-            app->sharedQueueResources->swapChainHeight > 0) {
-            return std::max(float((app->sharedQueueResources->swapChainHeight + ReferenceHeight - 1) / ReferenceHeight), 1.0f);
-        }
-        return 1.0f;
+        // Mali Valhall G57 on the A24 can't sustain 60 fps at the 1080p
+        // WindowIntegerScale (5×) the desktop path picks. Cap at 2× until
+        // we have a perf-driven setting or a faster device.
+        return 2.0f;
     }
 
 private:
