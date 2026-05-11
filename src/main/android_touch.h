@@ -39,6 +39,13 @@ ultramodern::input::callbacks_t make_input_callbacks();
 // Pressed buttons are drawn brighter; the analog stick draws a ring + thumb.
 void render_overlay();
 
+// Phase 9 smoke test: directly toggle one or more N64 button bits in the
+// global state, bypassing the touch hit-tester. Used by the Java overlay
+// (MainActivity.java) so a UI-rendered Button can press a controller button
+// without going through process_motion_event. `mask` matches the BTN_* bits
+// declared inside android_touch.cpp (e.g. 0x1000 for START).
+void debug_set_button(uint16_t mask, bool pressed);
+
 }  // namespace banjo_android::touch
 
 #endif  // __ANDROID__

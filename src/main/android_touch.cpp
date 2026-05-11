@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <jni.h>
 #include <mutex>
 
 #include "imgui/imgui.h"
@@ -335,6 +336,33 @@ namespace recompinput {
             return player_index == 0;
         }
     }
+}
+
+namespace banjo_android::touch {
+
+// Phase 9 smoke test path. The Java overlay (MainActivity.java) calls this
+// via JNI to OR/AND a button bit into g_btn_state without needing a touch
+// hit-test. Used to validate the input → recomp pipeline independently of
+// the Vulkan render (the white-frame bug means the imgui overlay isn't
+// visible right now).
+void debug_set_button(uint16_t mask, bool pressed) {
+    std::lock_guard lock{g_mutex};
+    if (pressed) {
+        g_btn_state |= mask;
+    } else {
+        g_btn_state &= ~mask;
+    }
+}
+
+}  // namespace banjo_android::touch
+
+// JNI bridge for MainActivity.java's `private static native void
+// nativeSetButton(int mask, boolean pressed)`. Symbol name follows the
+// JNI mangling rules for class `com.banjorecomp.online.MainActivity`.
+extern "C" JNIEXPORT void JNICALL
+Java_com_banjorecomp_online_MainActivity_nativeSetButton(
+    JNIEnv* /*env*/, jclass /*clazz*/, jint mask, jboolean pressed) {
+    banjo_android::touch::debug_set_button(static_cast<uint16_t>(mask), pressed == JNI_TRUE);
 }
 
 #endif  // __ANDROID__

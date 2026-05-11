@@ -22,14 +22,28 @@ android {
             cmake {
                 // Pass through every option needed by the Android cross-compile
                 // path of our root CMakeLists.txt (Phases 1-7 patches).
-                arguments += listOf(
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    "-DANDROID_PLATFORM=android-28",
-                    "-DANDROID_STL=c++_shared",
-                    // Oboe's old cmake_minimum_required(3.4) needs this on
-                    // CMake 4.x. Harmless on older versions.
-                    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-                )
+                arguments += buildList {
+                    addAll(
+                        listOf(
+                            "-DCMAKE_BUILD_TYPE=Release",
+                            "-DANDROID_PLATFORM=android-28",
+                            "-DANDROID_STL=c++_shared",
+                            // Oboe's old cmake_minimum_required(3.4) needs this on
+                            // CMake 4.x. Harmless on older versions.
+                            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+                        )
+                    )
+                    // RasterPS Vulkan/Mali diagnostics (matches lib/rt64 CMake cache).
+                    // Example: ./gradlew :app:assembleDebug -Prt64DiagRasterPs=1
+                    val diag = project.findProperty("rt64DiagRasterPs")?.toString()
+                    if (!diag.isNullOrBlank()) {
+                        add("-DRT64_DIAG_RASTER_PS_MODE=$diag")
+                    }
+                    val diagVi = project.findProperty("rt64DiagVi")?.toString()
+                    if (!diagVi.isNullOrBlank()) {
+                        add("-DRT64_DIAG_VI_MODE=$diagVi")
+                    }
+                }
                 // Build only the .so we actually want shipped.
                 targets += "BanjoRecompiled"
             }
