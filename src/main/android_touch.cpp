@@ -20,6 +20,12 @@
 
 #include "imgui/imgui.h"
 
+// SDL shim event types — pushing synthetic mouse events here makes the
+// recompui launcher see touches as clicks. The shim is header-only on
+// non-Android builds, so this include is a no-op outside __ANDROID__.
+#include "SDL.h"
+#include "recompui/recompui.h"
+
 namespace banjo_android::touch {
 
 // N64 controller button bits (PR/os_cont.h).
@@ -141,6 +147,31 @@ static void apply_pointer(int32_t pointer_id, float x_norm, float y_norm, bool a
     }
 }
 
+// Push a synthetic SDL mouse event into recompui's UI event queue. RmlUi's
+// hit-testing reads from there (try_deque_event). The desktop path goes
+// SDL_PollEvent → recompinput::handle_events → recompui::queue_event;
+// nothing on Android drives that loop, so we shortcut directly into
+// queue_event with the synthesized event.
+static void push_ui_mouse_event(Uint32 type, Sint32 px, Sint32 py, bool pressed) {
+    SDL_Event ev{};
+    if (type == SDL_MOUSEMOTION) {
+        ev.motion.type = SDL_MOUSEMOTION;
+        ev.motion.state = pressed ? SDL_PRESSED : 0;
+        ev.motion.x = px;
+        ev.motion.y = py;
+        ev.motion.xrel = 0;
+        ev.motion.yrel = 0;
+    } else {
+        ev.button.type = type;
+        ev.button.button = SDL_BUTTON_LEFT;
+        ev.button.state = pressed ? SDL_PRESSED : SDL_RELEASED;
+        ev.button.clicks = 1;
+        ev.button.x = px;
+        ev.button.y = py;
+    }
+    recompui::queue_event(ev);
+}
+
 int32_t process_motion_event(AInputEvent* event) {
     if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) {
         return 0;
@@ -150,6 +181,18 @@ int32_t process_motion_event(AInputEvent* event) {
     int32_t action_masked = action & AMOTION_EVENT_ACTION_MASK;
     int32_t pointer_index = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
         >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+
+    // Raw pixel coords for the primary pointer (index 0). Used to feed
+    // SDL_MOUSE* into the shim regardless of which N64 button (or none) is
+    // also being toggled. Only pointer 0 maps to mouse — multi-touch goes
+    // to the N64 input state only.
+    Sint32 mouse_px = 0;
+    Sint32 mouse_py = 0;
+    int32_t pcount = AMotionEvent_getPointerCount(event);
+    if (pcount > 0) {
+        mouse_px = static_cast<Sint32>(AMotionEvent_getX(event, 0));
+        mouse_py = static_cast<Sint32>(AMotionEvent_getY(event, 0));
+    }
 
     std::lock_guard lock{g_mutex};
     float w = static_cast<float>(g_viewport_w);
@@ -166,6 +209,10 @@ int32_t process_motion_event(AInputEvent* event) {
         float x, y;
         pointer_norm(pointer_index, x, y);
         apply_pointer(AMotionEvent_getPointerId(event, pointer_index), x, y, true);
+        if (pointer_index == 0) {
+            push_ui_mouse_event(SDL_MOUSEMOTION,     mouse_px, mouse_py, /*pressed=*/true);
+            push_ui_mouse_event(SDL_MOUSEBUTTONDOWN, mouse_px, mouse_py, /*pressed=*/true);
+        }
         return 1;
     }
     case AMOTION_EVENT_ACTION_UP:
@@ -173,6 +220,9 @@ int32_t process_motion_event(AInputEvent* event) {
         float x, y;
         pointer_norm(pointer_index, x, y);
         apply_pointer(AMotionEvent_getPointerId(event, pointer_index), x, y, false);
+        if (pointer_index == 0) {
+            push_ui_mouse_event(SDL_MOUSEBUTTONUP, mouse_px, mouse_py, /*pressed=*/false);
+        }
         return 1;
     }
     case AMOTION_EVENT_ACTION_MOVE: {
@@ -184,6 +234,7 @@ int32_t process_motion_event(AInputEvent* event) {
             pointer_norm(i, x, y);
             apply_pointer(AMotionEvent_getPointerId(event, i), x, y, true);
         }
+        push_ui_mouse_event(SDL_MOUSEMOTION, mouse_px, mouse_py, /*pressed=*/true);
         return 1;
     }
     case AMOTION_EVENT_ACTION_CANCEL: {
@@ -197,6 +248,7 @@ int32_t process_motion_event(AInputEvent* event) {
         g_stick.active_pointer_id = -1;
         g_stick_x = 0.0f;
         g_stick_y = 0.0f;
+        push_ui_mouse_event(SDL_MOUSEBUTTONUP, mouse_px, mouse_py, /*pressed=*/false);
         return 1;
     }
     default:
@@ -312,31 +364,11 @@ void render_overlay() {
 
 }  // namespace banjo_android::touch
 
-// ---------------------------------------------------------------------------
-// recompinput stubs.
-//
-// The recompinput .cpp tree (lib/RecompFrontend/recompinput/src/) isn't
-// cross-compiled for Android (skipped along with RecompFrontend in Phase 5).
-// main.cpp still references three recompinput symbols at desktop-only call
-// sites. Stub them so the .so links cleanly. The Android input flow goes
-// through banjo_android::touch::make_input_callbacks() instead, registered
-// as the ultramodern::input::callbacks_t.
-
-namespace recompinput {
-    void handle_events() {
-        // SDL event polling happens only in the desktop build.
-    }
-    namespace players {
-        bool is_single_player_mode() {
-            // Android port is single-player-on-device by design (multiplayer
-            // is the network ghost layer, not couch co-op).
-            return true;
-        }
-        bool get_player_is_assigned(int player_index, bool /*temp_player*/) {
-            return player_index == 0;
-        }
-    }
-}
+// Phase 5 follow-up: recompinput::handle_events / players::is_single_player_mode
+// / players::get_player_is_assigned used to be stubbed here because the
+// real recompinput translation units weren't cross-compiled. They are now
+// (RecompFrontend was opened up for Android in CMakeLists.txt), so the real
+// implementations win; the stubs would be duplicate symbols.
 
 namespace banjo_android::touch {
 

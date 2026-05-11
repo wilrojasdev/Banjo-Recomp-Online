@@ -285,8 +285,10 @@ if (ANDROID)
         ${CMAKE_SOURCE_DIR}/src/main/android_render_context.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_run_game.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_nfd_stubs.cpp
-        ${CMAKE_SOURCE_DIR}/src/main/android_recompui_stubs.cpp
-        ${CMAKE_SOURCE_DIR}/src/main/android_recompinput_stubs.cpp
+        # Phase 5 (this branch): recompui/recompinput now build natively on
+        # Android, so the stub TUs are dropped from the source list. Source
+        # files themselves are retained on disk for reference but are no
+        # longer compiled in.
         ${CMAKE_SOURCE_DIR}/src/main/android_stubs.cpp
         ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
     )
@@ -532,17 +534,17 @@ endif()
 set(RECOMP_FRONTEND_N64MODERNRUNTIME_PATH ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
 set(RECOMP_FRONTEND_RT64_PATH ${CMAKE_SOURCE_DIR}/lib/rt64)
 
-if (NOT ANDROID)
-    # RecompFrontend pulls in RmlUi + Freetype + a SDL2-based UI shell.
-    # Android doesn't need any of that — the launcher and touch overlay are
-    # built natively in Phase 6 / 7.
-    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
-endif()
+# Phase 5: build the full RecompFrontend (RmlUi + Freetype via FetchContent +
+# lunasvg + SDL-shimmed input) on Android too so the launcher can render
+# natively. The SDL surface is satisfied by recompinput/include/sdl_shim.
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
 
 if (ANDROID)
     target_link_libraries(BanjoRecompiled PRIVATE
         PatchesLib
         RecompiledFuncs
+        recompui
+        recompinput
         librecomp
         ultramodern
         rt64

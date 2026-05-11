@@ -38,6 +38,8 @@ namespace {
 JavaVM* g_jvm = nullptr;
 jclass g_main_activity_class = nullptr;
 jmethodID g_notify_first_frame_method = nullptr;
+jmethodID g_notify_game_started_method = nullptr;
+jmethodID g_notify_return_to_launcher_method = nullptr;
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -45,6 +47,23 @@ void banjo_android_set_jvm(JavaVM* vm) {
     g_jvm = vm;
     __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
         "banjo_android_set_jvm: vm=%p", (void*)vm);
+}
+
+// Trampolines for the launcher: Start-Game → show touch buttons,
+// return-to-launcher → hide them. Forward-declared here so the JNI helpers
+// (defined further down) can be referenced from anywhere in the codebase
+// without dragging in <jni.h>.
+namespace { bool call_main_activity_method(const char*, jmethodID); }
+
+extern "C" __attribute__((visibility("default")))
+void banjo_android_notify_game_started() {
+    call_main_activity_method("notify_game_started", g_notify_game_started_method);
+}
+
+extern "C" __attribute__((visibility("default")))
+void banjo_android_notify_return_to_launcher() {
+    call_main_activity_method("notify_return_to_launcher",
+                              g_notify_return_to_launcher_method);
 }
 
 // Called from MainActivity's static initializer (Java thread, app classloader
@@ -55,9 +74,17 @@ Java_com_banjorecomp_online_MainActivity_nativeInit(JNIEnv* env, jclass clazz) {
     g_main_activity_class = static_cast<jclass>(env->NewGlobalRef(clazz));
     g_notify_first_frame_method =
         env->GetStaticMethodID(clazz, "nativeNotifyFirstFrame", "()V");
+    g_notify_game_started_method =
+        env->GetStaticMethodID(clazz, "nativeNotifyGameStarted", "()V");
+    g_notify_return_to_launcher_method =
+        env->GetStaticMethodID(clazz, "nativeNotifyReturnToLauncher", "()V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
     __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
-        "nativeInit: class=%p method=%p", (void*)g_main_activity_class,
-        (void*)g_notify_first_frame_method);
+        "nativeInit: class=%p firstFrame=%p gameStarted=%p returnToLauncher=%p",
+        (void*)g_main_activity_class,
+        (void*)g_notify_first_frame_method,
+        (void*)g_notify_game_started_method,
+        (void*)g_notify_return_to_launcher_method);
 }
 
 #define LOG_TAG "BK64-Render"
@@ -75,16 +102,14 @@ std::atomic<uint64_t> g_dummy_count{0};
 std::atomic<uint64_t> g_screen_update_count{0};
 std::atomic<std::chrono::steady_clock::time_point> g_last_log{std::chrono::steady_clock::now()};
 
-// One-shot JNI ping to MainActivity.nativeNotifyFirstFrame() right after
-// the first VI present succeeds, so the Java loading splash can dismiss
-// itself instead of relying solely on the 45-second timeout.
-void notify_first_frame_to_java() {
-    if (g_jvm == nullptr || g_main_activity_class == nullptr || g_notify_first_frame_method == nullptr) {
+// Call a static void()V method on MainActivity from any thread, attaching
+// the current thread to the JVM if needed. Returns true on dispatch.
+bool call_main_activity_method(const char* tag, jmethodID method) {
+    if (g_jvm == nullptr || g_main_activity_class == nullptr || method == nullptr) {
         __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
-            "notify_first_frame: missing jvm/class/method (jvm=%p cls=%p mid=%p)",
-            (void*)g_jvm, (void*)g_main_activity_class,
-            (void*)g_notify_first_frame_method);
-        return;
+            "%s: missing jvm/class/method (jvm=%p cls=%p mid=%p)",
+            tag, (void*)g_jvm, (void*)g_main_activity_class, (void*)method);
+        return false;
     }
 
     JavaVM* vm = g_jvm;
@@ -94,22 +119,30 @@ void notify_first_frame_to_java() {
     if (getEnvResult == JNI_EDETACHED) {
         if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
             __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
-                "notify_first_frame: AttachCurrentThread failed");
-            return;
+                "%s: AttachCurrentThread failed", tag);
+            return false;
         }
         attached = true;
     } else if (getEnvResult != JNI_OK) {
         __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
-            "notify_first_frame: GetEnv returned %d", (int)getEnvResult);
-        return;
+            "%s: GetEnv returned %d", tag, (int)getEnvResult);
+        return false;
     }
 
-    env->CallStaticVoidMethod(g_main_activity_class, g_notify_first_frame_method);
+    env->CallStaticVoidMethod(g_main_activity_class, method);
     __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
-        "notify_first_frame: signalled MainActivity");
+        "%s: signalled MainActivity", tag);
 
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (attached) vm->DetachCurrentThread();
+    return true;
+}
+
+// One-shot JNI ping to MainActivity.nativeNotifyFirstFrame() right after
+// the first VI present succeeds, so the Java loading splash can dismiss
+// itself instead of relying solely on the 45-second timeout.
+void notify_first_frame_to_java() {
+    call_main_activity_method("notify_first_frame", g_notify_first_frame_method);
 }
 
 void heartbeat(const char* who) {

@@ -10,6 +10,7 @@
 
 #ifdef __ANDROID__
 
+#include <android/asset_manager.h>
 #include <android/native_window.h>
 
 namespace banjo_android {
@@ -19,6 +20,7 @@ namespace banjo_android {
 struct AppPaths {
     const char* internal_data_path;  // /data/data/<pkg>/files (writable)
     const char* external_data_path;  // /storage/emulated/0/Android/data/<pkg>/files (writable, user-visible)
+    AAssetManager* asset_manager;    // APK assets/ — extracted on first boot for recompui fonts/SVGs
 };
 
 void run_game(ANativeWindow* window, AppPaths paths);

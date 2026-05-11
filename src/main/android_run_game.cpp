@@ -39,6 +39,36 @@
 #include "android_touch.h"
 #include "android_render_context.h"
 
+// recompui — launcher / UI state on the same code path as desktop. The render
+// context is now provided by recompui::renderer::create_render_context which
+// installs the UI's draw hooks into RT64.
+#include "recompui/recompui.h"
+#include "recompui/renderer.h"
+#include "recompui/program_config.h"
+#include "banjo_config.h"
+#include "banjo_launcher.h"  // banjo::launcher_animation_{setup,update}
+#include "file.h"  // recompui::file::set_program_path_override
+
+// banjo::init_config builds all config tabs the launcher renders.
+namespace banjo {
+    void init_config();
+    namespace locale {
+        void init();
+    }
+}
+
+// JNI trampolines exposed by android_render_context.cpp. Forward-declared
+// here so we can poke MainActivity from the launcher's Start Game callback
+// without dragging <jni.h> in.
+extern "C" void banjo_android_notify_game_started();
+extern "C" void banjo_android_notify_return_to_launcher();
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>  // setenv
+#include <fstream>
+#include <unistd.h>  // chdir
+
 // Object-extension init lives in src/game/recomp_extension_api.cpp.
 // Forward-declared here to avoid pulling in the full recomputil header tree.
 namespace recomputil {
@@ -117,32 +147,153 @@ ANativeWindow* g_window = nullptr;
 // every frame in the update_gfx callback.
 std::atomic<bool> g_game_started{false};
 
+// Copy the contents of one APK asset directory to `dest_dir`. AAssetDir
+// only lists regular files — subdirectories must be opened by name, so the
+// caller passes the subdir list explicitly. Skips files that already exist
+// at the destination with the same byte size (APK assets are immutable per
+// install, so a size match means a previous boot already extracted them).
+void extract_asset_dir(AAssetManager* am,
+                       const std::string& asset_subdir,
+                       const std::filesystem::path& dest_dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dest_dir, ec);
+    if (ec) {
+        LOGE("create_directories(%s) failed: %s", dest_dir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    AAssetDir* dir = AAssetManager_openDir(am, asset_subdir.c_str());
+    if (dir == nullptr) {
+        LOGW("openDir failed for asset subdir '%s'", asset_subdir.c_str());
+        return;
+    }
+
+    int extracted = 0;
+    int skipped = 0;
+    for (const char* name; (name = AAssetDir_getNextFileName(dir)) != nullptr; ) {
+        std::string asset_path = asset_subdir.empty()
+            ? std::string{name}
+            : asset_subdir + "/" + name;
+        std::filesystem::path out_path = dest_dir / name;
+
+        AAsset* asset = AAssetManager_open(am, asset_path.c_str(), AASSET_MODE_BUFFER);
+        if (asset == nullptr) {
+            LOGW("AAssetManager_open failed for '%s'", asset_path.c_str());
+            continue;
+        }
+
+        off_t asset_size = AAsset_getLength(asset);
+        if (std::filesystem::exists(out_path, ec)) {
+            uintmax_t existing = std::filesystem::file_size(out_path, ec);
+            if (!ec && existing == static_cast<uintmax_t>(asset_size)) {
+                AAsset_close(asset);
+                ++skipped;
+                continue;
+            }
+        }
+
+        const void* buf = AAsset_getBuffer(asset);
+        if (buf != nullptr && asset_size > 0) {
+            std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(buf), asset_size);
+            ++extracted;
+            LOGI("extract: %s -> %s (%lld bytes)",
+                 asset_path.c_str(), out_path.c_str(),
+                 static_cast<long long>(asset_size));
+        }
+        AAsset_close(asset);
+    }
+
+    LOGI("extract_asset_dir(%s): extracted=%d skipped=%d",
+         asset_subdir.empty() ? "<root>" : asset_subdir.c_str(),
+         extracted, skipped);
+
+    AAssetDir_close(dir);
+}
+
+void extract_apk_assets(AAssetManager* am, const std::filesystem::path& dest_root) {
+    if (am == nullptr) {
+        LOGE("extract_apk_assets: AAssetManager is null — APK assets unreachable");
+        return;
+    }
+    // gradle's sourceSets points the APK assets root directly at the repo's
+    // assets/ directory, so files live at the APK's asset root (e.g.
+    // `Suplexmentary Comic NC.ttf`, not `assets/Suplexmentary…`). Mirror the
+    // subdir layout into internal storage with `assets/` prepended on disk
+    // so recompui's get_asset_path (which prepends `assets/`) finds them.
+    // AAssetManager has no recursive listing API; update this list when
+    // new subdirs land under assets/.
+    extract_asset_dir(am, "",            dest_root / "assets");
+    extract_asset_dir(am, "icons",       dest_root / "assets" / "icons");
+    extract_asset_dir(am, "promptfont",  dest_root / "assets" / "promptfont");
+    LOGI("extract_apk_assets: extracted under %s/assets", dest_root.c_str());
+}
+
 ultramodern::renderer::WindowHandle android_create_window(ultramodern::gfx_callbacks_t::gfx_data_t) {
     LOGI("android_create_window -> %p", g_window);
     return g_window;
 }
 
-// Phase 10: auto-start the first supported game on the first gfx update.
-// vi_thread_func now null-guards update_vi(), so it's safe to flip
-// is_game_started before the game thread publishes a VI mode — the early
-// ticks just no-op until osViSetMode lands.
+// Phase 10 used to auto-start the first supported game on the first gfx
+// update. With recompui now driving the launcher on Android, the launcher's
+// "start game" button is the trigger instead — leave update_gfx as a no-op
+// so we never bypass the user's ROM selection.
 void android_update_gfx(void*) {
-    bool expected = false;
-    if (!g_game_started.compare_exchange_strong(expected, true)) {
-        return;
-    }
-    if (supported_games.empty()) {
-        LOGE("android_update_gfx: no supported games registered");
-        return;
-    }
-    const auto& game = supported_games.front();
-    LOGI("android_update_gfx: starting game id='%s'",
-         reinterpret_cast<const char*>(game.game_id.c_str()));
-    recomp::start_game(game.game_id, {});
+    // intentionally empty: recompui's launcher menu calls recomp::start_game
+    // via the same path desktop uses.
 }
 
 void android_message_box(const char* msg) {
     LOGE("[message_box] %s", msg);
+}
+
+// Android-side launcher init. Mirrors the bits of desktop's on_launcher_init
+// (src/main/main.cpp:2025) that are not bknet-specific:
+//   - Initialize the game_options_menu with the BK GameEntry.
+//   - Add the default options (Start Game / Controls / Settings / Mods / Exit).
+//   - Override Start Game's callback so it pings MainActivity to show the
+//     touch overlay BEFORE recomp::start_game returns control to the game thread.
+//   - Run banjo::launcher_animation_setup so the sky-blue background + animated
+//     Banjo/Kazooie/Jiggy/Cloud SVGs are visible (it's the only thing that
+//     touches background_container + the wrapper for the SVG art).
+void android_on_launcher_init(recompui::LauncherMenu* menu) {
+    if (supported_games.empty()) {
+        LOGE("on_launcher_init: supported_games is empty — abort");
+        return;
+    }
+    const auto& g = supported_games[0];
+
+    auto* options = menu->init_game_options_menu(
+        g.game_id, g.mod_game_id, g.display_name, g.thumbnail_bytes,
+        recompui::GameOptionsMenuLayout::Center);
+    recompui::update_game_mod_id(g.mod_game_id);
+    options->add_default_options();
+
+    // Replace the Start Game callback. We mirror the body of the default in
+    // ui_launcher.cpp:457 (the no-rom branch is unreachable here — Android
+    // currently has no ROM picker) but inject the notify before the call so
+    // MainActivity mounts START/A in time for the first frame.
+    if (auto* start_opt = options->get_start_game_option()) {
+        start_opt->set_callback([game_id = g.game_id,
+                                 mod_game_id = g.mod_game_id,
+                                 display_name = g.display_name,
+                                 thumbnail_bytes = g.thumbnail_bytes]() {
+            recompui::update_game_mod_id(mod_game_id);
+            if (recomp::mods::game_mode_count(mod_game_id, /*include_disabled=*/false) > 0) {
+                recompui::get_launcher_menu()->show_game_mode_menu(
+                    game_id, display_name, thumbnail_bytes);
+            } else {
+                LOGI("Start Game pressed -> notify Java + recomp::start_game");
+                banjo_android_notify_game_started();
+                recomp::start_game(game_id, {});
+                recompui::hide_all_contexts();
+            }
+        });
+    } else {
+        LOGW("on_launcher_init: no start_game_option to override");
+    }
+
+    banjo::launcher_animation_setup(menu);
 }
 
 }  // namespace
@@ -152,6 +303,65 @@ namespace banjo_android {
 void run_game(ANativeWindow* window, AppPaths paths) {
     LOGI("run_game: entered with window=%p internal=%s", window, paths.internal_data_path);
     g_window = window;
+
+    // Extract the APK assets/ tree into internal storage on first boot so
+    // that RmlUi (FreeType + SVG plugin) can fopen() font + icon paths the
+    // recompui code constructs via recompui::file::get_asset_path. Done
+    // before any UIState construction; idempotent across reboots.
+    std::filesystem::path internal_root = paths.internal_data_path
+        ? std::filesystem::path{paths.internal_data_path}
+        : std::filesystem::path{};
+    if (!internal_root.empty()) {
+        extract_apk_assets(paths.asset_manager, internal_root);
+        recompui::file::set_program_path_override(internal_root);
+
+        // RT64's UserPaths::detectDataPath uses the __linux__ branch on
+        // Android (we're a Linux-flavored toolchain) and builds
+        // `$HOME/.rt64`. The default $HOME on Android is `/data` which the
+        // app sandbox cannot write to, so the constructor aborts with
+        // `Permission denied ["/data/.rt64"]`. Pointing HOME at internal
+        // storage moves the dir under our writable sandbox without forking
+        // RT64.
+        setenv("HOME", paths.internal_data_path, /*overwrite=*/1);
+
+        // RmlUi's default FileInterface uses fopen() and only joins paths
+        // against a document source URL — when the SVG element is created
+        // programmatically (as launcher_animation does for Banjo.svg /
+        // Kazooie.svg / Cloud*.svg etc.) the resolved path is just the bare
+        // filename. On Windows the binary runs from a directory that has the
+        // assets next to it; on Android cwd defaults to "/" so fopen fails
+        // silently and the launcher renders without any background art.
+        // chdir to the extracted assets dir so relative loads resolve.
+        std::filesystem::path assets_dir = internal_root / "assets";
+        if (chdir(assets_dir.c_str()) == 0) {
+            LOGI("chdir(%s) ok — relative SVG/RCSS loads will resolve", assets_dir.c_str());
+        } else {
+            LOGE("chdir(%s) FAILED errno=%d — launcher SVGs will not load",
+                 assets_dir.c_str(), errno);
+        }
+
+        // Smoke test: probe a couple of launcher SVGs by fopen + RmlUi's
+        // get_asset_path. Helps tell apart "asset never extracted" from
+        // "extracted but path resolution wrong" in logcat.
+        for (const char* probe : { "Banjo.svg", "Kazooie.svg", "Logo.svg",
+                                   "Suplexmentary Comic NC.ttf" }) {
+            FILE* f = std::fopen(probe, "rb");
+            if (f != nullptr) {
+                std::fseek(f, 0, SEEK_END);
+                long sz = std::ftell(f);
+                std::fclose(f);
+                LOGI("asset probe (cwd): '%s' -> ok (%ld bytes)", probe, sz);
+            } else {
+                LOGW("asset probe (cwd): '%s' -> MISSING (errno=%d)", probe, errno);
+            }
+            auto abs_probe = recompui::file::get_asset_path(probe);
+            LOGI("asset probe (get_asset_path): '%s' -> '%s' exists=%d",
+                 probe, abs_probe.c_str(),
+                 std::filesystem::exists(abs_probe) ? 1 : 0);
+        }
+    } else {
+        LOGE("internal_data_path is empty — recompui assets will not be found");
+    }
 
     recomp::Version project_version{1, 6, 0};
 
@@ -234,8 +444,40 @@ void run_game(ANativeWindow* window, AppPaths paths) {
     // Hashmap / hashset / slotmap exports that patches use.
     recomputil::register_data_api_exports();
 
+    // Program identity — recompui's LauncherMenu reads it for the window
+    // title bar / about screen, and recompui::file::get_app_folder_path
+    // appends program_id when deriving the per-user config dir.
+    recompui::programconfig::set_program_name(banjo::program_name);
+    recompui::programconfig::set_program_id(banjo::program_id);
+
+    // Register the recompui exports the patches expect (mod menu helpers,
+    // texture pack hooks, etc.). Mirrors main.cpp's call site.
+    recompui::register_ui_exports();
+
+    // Launcher fonts. Names must match files under <assets>/ — the APK
+    // extractor above populates internal_root/assets/ with the same layout
+    // as the desktop build's assets/ directory.
+    recompui::register_primary_font("Suplexmentary Comic NC.ttf", "Suplexmentary Comic NC");
+    recompui::register_extra_font("InterVariable.ttf");
+
     banjo::register_bk_overlays();
     banjo::register_bk_patches();
+
+    // Locale + config: build the option tabs the launcher reads. Locale must
+    // come first because init_config's add_*_options() use tr() with the
+    // current language when registering option titles.
+    banjo::locale::init();
+    banjo::init_config();
+
+    // Wire the launcher: without this Android falls back to recompui's
+    // default callback (which only adds the default options) and the
+    // launcher renders against a black background. Our callback also paints
+    // the sky-blue bg + animated SVGs via banjo::launcher_animation_setup,
+    // and overrides Start Game to mount the touch overlay.
+    recompui::register_launcher_init_callback(android_on_launcher_init);
+    recompui::register_launcher_update_callback([](recompui::LauncherMenu* menu) {
+        banjo::launcher_animation_update(menu);
+    });
 
     // Patches register object extensions in their core1_init path. Without
     // this, type_contexts is empty and recomp_register_object_extension_*
@@ -252,7 +494,14 @@ void run_game(ANativeWindow* window, AppPaths paths) {
         .create_render_context = [](uint8_t* rdram,
                                     ultramodern::renderer::WindowHandle window_handle,
                                     bool developer_mode) {
-            return banjo_android::renderer::create_render_context(rdram, window_handle, developer_mode);
+            // recompui's render context installs the UI's init/draw/deinit
+            // hooks into RT64 so the launcher composites on top of the N64
+            // framebuffer (or fills the whole window when no game is running
+            // yet). Same call site as desktop main.cpp.
+            return recompui::renderer::create_render_context(
+                rdram, window_handle,
+                ultramodern::renderer::PresentationMode::PresentEarly,
+                developer_mode);
         },
     };
 
@@ -277,7 +526,10 @@ void run_game(ANativeWindow* window, AppPaths paths) {
     };
 
     ultramodern::error_handling::callbacks_t error_handling_callbacks{
-        .message_box = android_message_box,
+        // recompui::message_box wraps SDL_ShowSimpleMessageBox; on Android
+        // our shim logs to logcat. Use that path so launcher and game share
+        // the same error reporting surface.
+        .message_box = recompui::message_box,
     };
 
     ultramodern::threads::callbacks_t threads_callbacks{

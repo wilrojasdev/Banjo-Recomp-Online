@@ -52,10 +52,12 @@ public class MainActivity extends NativeActivity {
     // Loading splash on top of NativeActivity's surface while the Mali driver
     // compiles RT64's ubershader pipelines (~22 s on the A24). Dismissed when
     // native code calls nativeNotifyFirstFrame() or — as a safety net — after
-    // LOADING_TIMEOUT_MS. The START / A buttons are deferred until after
-    // dismiss so they only appear with the actual game.
+    // LOADING_TIMEOUT_MS. The START / A buttons are not installed until the
+    // launcher fires "Start Game" → native → nativeNotifyGameStarted(), so the
+    // RmlUi launcher menu has the full screen.
     private View mLoadingView = null;
-    private boolean mGameButtonsInstalled = false;
+    private View mStartButtonView = null;
+    private View mAButtonView = null;
     private android.os.IBinder mGameToken = null;
     private final Handler mUiHandler = new Handler(Looper.getMainLooper());
     private static final long LOADING_TIMEOUT_MS = 45_000;
@@ -95,6 +97,32 @@ public class MainActivity extends NativeActivity {
         }
     }
 
+    /**
+     * Called by native code when the user clicks "Start Game" in the RmlUi
+     * launcher (and the recomp game thread is actually starting). Shows the
+     * START / A touch buttons so the player can drive the N64 controller.
+     */
+    @SuppressWarnings("unused") // Called via JNI.
+    public static void nativeNotifyGameStarted() {
+        final MainActivity inst = sInstance;
+        if (inst != null) {
+            inst.mUiHandler.post(inst::showGameControls);
+        }
+    }
+
+    /**
+     * Called by native code when the user returns from the game to the
+     * launcher. Removes the START / A buttons so they don't cover the
+     * launcher's menu text.
+     */
+    @SuppressWarnings("unused") // Called via JNI.
+    public static void nativeNotifyReturnToLauncher() {
+        final MainActivity inst = sInstance;
+        if (inst != null) {
+            inst.mUiHandler.post(inst::hideGameControls);
+        }
+    }
+
     private static MainActivity sInstance = null;
 
     @Override
@@ -131,8 +159,9 @@ public class MainActivity extends NativeActivity {
 
     /**
      * Install a Button as a separate TYPE_APPLICATION_PANEL window on top of
-     * the NativeActivity's SurfaceView. Called from onWindowFocusChanged(true)
-     * so the decorView window token is guaranteed to be non-null.
+     * the NativeActivity's SurfaceView. Called from showGameControls() once
+     * the launcher hands off to the game; the decorView window token is
+     * captured at onWindowFocusChanged(true) and reused.
      */
     private void installStartWindowOverlay(android.os.IBinder token) {
         Button btn = buildStartButton();
@@ -150,6 +179,7 @@ public class MainActivity extends NativeActivity {
 
         try {
             getWindowManager().addView(btn, lp);
+            mStartButtonView = btn;
             Log.i(TAG, "WindowManager.addView OK token=" + token);
         } catch (Throwable t) {
             Log.e(TAG, "WindowManager.addView FAILED: " + t, t);
@@ -161,6 +191,7 @@ public class MainActivity extends NativeActivity {
                     Gravity.TOP | Gravity.CENTER_HORIZONTAL);
             flp.topMargin = 60;
             addContentView(btn, flp);
+            mStartButtonView = btn;
             Log.i(TAG, "fallback addContentView installed");
         }
     }
@@ -223,6 +254,7 @@ public class MainActivity extends NativeActivity {
 
         try {
             getWindowManager().addView(btn, lp);
+            mAButtonView = btn;
             Log.i(TAG, "WindowManager.addView A OK token=" + token);
         } catch (Throwable t) {
             Log.e(TAG, "WindowManager.addView A FAILED: " + t, t);
@@ -232,6 +264,7 @@ public class MainActivity extends NativeActivity {
             flp.rightMargin = 80;
             flp.bottomMargin = 120;
             addContentView(btn, flp);
+            mAButtonView = btn;
             Log.i(TAG, "fallback addContentView A installed");
         }
     }
@@ -350,13 +383,50 @@ public class MainActivity extends NativeActivity {
             }
             mLoadingView = null;
         }
-        // Defer-installing the game controls until the splash is actually
-        // going away — keeps them off-screen during the boot wait so they
-        // only appear with the real first frame.
-        if (!mGameButtonsInstalled && mGameToken != null) {
-            mGameButtonsInstalled = true;
+        // Touch buttons are NOT installed here anymore — the launcher (RmlUi)
+        // owns the full screen now. showGameControls() is called from native
+        // once the user clicks "Start Game" so the buttons only appear with
+        // the running game.
+    }
+
+    /**
+     * Install the START / A overlay buttons on the UI thread. Idempotent:
+     * called by nativeNotifyGameStarted() when transitioning launcher → game.
+     */
+    private void showGameControls() {
+        if (mGameToken == null) {
+            Log.w(TAG, "showGameControls: no window token yet, skipping");
+            return;
+        }
+        if (mStartButtonView == null) {
             installStartWindowOverlay(mGameToken);
+        }
+        if (mAButtonView == null) {
             installAWindowOverlay(mGameToken);
+        }
+    }
+
+    /**
+     * Remove the START / A overlay buttons on the UI thread. Idempotent:
+     * called by nativeNotifyReturnToLauncher() when the game exits to the
+     * launcher.
+     */
+    private void hideGameControls() {
+        if (mStartButtonView != null) {
+            try {
+                getWindowManager().removeView(mStartButtonView);
+            } catch (Throwable t) {
+                Log.w(TAG, "removeView START failed: " + t);
+            }
+            mStartButtonView = null;
+        }
+        if (mAButtonView != null) {
+            try {
+                getWindowManager().removeView(mAButtonView);
+            } catch (Throwable t) {
+                Log.w(TAG, "removeView A failed: " + t);
+            }
+            mAButtonView = null;
         }
     }
 }

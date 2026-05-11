@@ -275,41 +275,41 @@ static void set_control_defaults() {
     // Left shoulder -> C Down | Backwards eggs / zoom out
     set_default_mapping_for_controller(
         GameInput::C_DOWN,
-        { 
-            InputField::controller_analog(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY, true),
-            InputField::controller_digital(SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_LEFTSHOULDER)
+        {
+            InputField::controller_analog(GamepadAxis::RightY, true),
+            InputField::controller_digital(GamepadButton::LeftShoulder)
         }
     );
 
     // Right shoulder -> C Up | Forwards eggs / first person
     set_default_mapping_for_controller(
         GameInput::C_UP,
-        { 
-            InputField::controller_analog(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY, false),
-            InputField::controller_digital(SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)
+        {
+            InputField::controller_analog(GamepadAxis::RightY, false),
+            InputField::controller_digital(GamepadButton::RightShoulder)
         }
     );
 
     // North button -> C Left | Talon trot / camera left
     set_default_mapping_for_controller(
         GameInput::C_LEFT,
-        { 
-            InputField::controller_analog(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX, false),
-            InputField::controller_digital(SDL_CONTROLLER_BUTTON_NORTH)
+        {
+            InputField::controller_analog(GamepadAxis::RightX, false),
+            InputField::controller_digital(GamepadButton::North)
         }
     );
 
     // East button -> C Right | Wonderwing / camera right
     set_default_mapping_for_controller(
         GameInput::C_RIGHT,
-        { 
-            InputField::controller_analog(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX, true),
-            InputField::controller_digital(SDL_CONTROLLER_BUTTON_EAST)
+        {
+            InputField::controller_analog(GamepadAxis::RightX, true),
+            InputField::controller_digital(GamepadButton::East)
         }
     );
 
     // R3 -> L | Unused in BK but can be used in mods
-    set_default_mapping_for_controller(GameInput::L, { InputField::controller_digital(SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSTICK) });
+    set_default_mapping_for_controller(GameInput::L, { InputField::controller_digital(GamepadButton::RightStick) });
 }
 
 static void set_control_names_and_descriptions() {

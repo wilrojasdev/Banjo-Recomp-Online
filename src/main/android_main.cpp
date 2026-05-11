@@ -55,6 +55,7 @@ void maybe_spawn_game_thread() {
     banjo_android::AppPaths paths{
         .internal_data_path = g_app->activity->internalDataPath,
         .external_data_path = g_app->activity->externalDataPath,
+        .asset_manager      = g_app->activity->assetManager,
     };
     g_game_thread = std::thread([w = g_native_window, paths]() {
         banjo_android::run_game(w, paths);

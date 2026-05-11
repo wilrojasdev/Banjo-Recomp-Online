@@ -78,6 +78,14 @@ android {
         }
     }
 
+    // The recompui launcher needs the same fonts/SVGs/RCSS that the desktop
+    // build ships next to the binary in `assets/`. Point the APK's assets/
+    // packaging at the repo's assets directory directly so we don't have to
+    // maintain a duplicate copy. On first boot android_run_game extracts the
+    // tree from the APK into internalDataPath and calls
+    // recompui::file::set_program_path_override on it.
+    sourceSets["main"].assets.srcDirs("../../../assets")
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
