@@ -24,6 +24,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -31,6 +32,9 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 public class MainActivity extends NativeActivity {
@@ -45,6 +49,14 @@ public class MainActivity extends NativeActivity {
     // multiple times during the activity lifetime).
     private boolean mOverlayInstalled = false;
 
+    // Loading splash on top of NativeActivity's surface while the Mali driver
+    // compiles RT64's ubershader pipelines (~22 s on the A24). Dismissed when
+    // native code calls nativeNotifyFirstFrame() or — as a safety net — after
+    // LOADING_TIMEOUT_MS.
+    private View mLoadingView = null;
+    private final Handler mUiHandler = new Handler(Looper.getMainLooper());
+    private static final long LOADING_TIMEOUT_MS = 45_000;
+
     static {
         // The native library is also loaded by NativeActivity via the
         // android.app.lib_name meta-data, but loading it here as well is
@@ -56,20 +68,40 @@ public class MainActivity extends NativeActivity {
     /** Set or clear an N64 button bit in the global touch state. */
     private static native void nativeSetButton(int mask, boolean pressed);
 
+    /**
+     * Called by native code from android_run_game.cpp once the first VI frame
+     * has been presented. Runs on a non-UI thread, so the implementation
+     * forwards to the UI handler before touching views.
+     */
+    @SuppressWarnings("unused") // Called via JNI.
+    public static void nativeNotifyFirstFrame() {
+        // Static so JNI lookup is simple; resolves to the live MainActivity via
+        // sInstance set in onCreate.
+        final MainActivity inst = sInstance;
+        if (inst != null) {
+            inst.mUiHandler.post(inst::dismissLoadingOverlay);
+        }
+    }
+
+    private static MainActivity sInstance = null;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "MainActivity onCreate");
-
-        // Sanity check #1: a Toast is guaranteed to render in its own window
-        // above the activity's surface. If even this doesn't appear visually,
-        // either the activity isn't actually foreground or the screencap
-        // isn't capturing overlay layers.
-        Toast.makeText(this, "BK64 toast smoke test", Toast.LENGTH_LONG).show();
+        sInstance = this;
 
         // NOTE: we do NOT attempt the WindowManager overlay here.
         // getDecorView().getWindowToken() is null until the window has been
         // attached, which only happens after onResume → onWindowFocusChanged.
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (sInstance == this) {
+            sInstance = null;
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -79,6 +111,7 @@ public class MainActivity extends NativeActivity {
             mOverlayInstalled = true;
             android.os.IBinder token = getWindow().getDecorView().getWindowToken();
             Log.i(TAG, "onWindowFocusChanged(true) — token=" + token);
+            installLoadingOverlay(token);
             installStartWindowOverlay(token);
             installAWindowOverlay(token);
         }
@@ -225,5 +258,84 @@ public class MainActivity extends NativeActivity {
             }
         });
         return btn;
+    }
+
+    /**
+     * Install a full-screen opaque loading splash above the NativeActivity
+     * surface. The first 20+ s after launch are pipeline compilation; the
+     * surface shows nothing useful, so we cover it with a "Cargando..."
+     * panel until native signals first-frame readiness (or the timeout
+     * fires as a safety net).
+     */
+    private void installLoadingOverlay(android.os.IBinder token) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setBackgroundColor(Color.BLACK);
+
+        TextView title = new TextView(this);
+        title.setText("Banjo-Kazooie Online");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f);
+        title.setGravity(Gravity.CENTER);
+
+        TextView subtitle = new TextView(this);
+        subtitle.setText("Compilando shaders…");
+        subtitle.setTextColor(Color.argb(255, 200, 200, 200));
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
+        subtitle.setGravity(Gravity.CENTER);
+
+        ProgressBar bar = new ProgressBar(this);
+        bar.setIndeterminate(true);
+
+        TextView hint = new TextView(this);
+        hint.setText("Primera carga en este dispositivo, ~20 s.\nLas próximas serán más rápidas (caché del driver).");
+        hint.setTextColor(Color.argb(255, 150, 150, 150));
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        hint.setGravity(Gravity.CENTER);
+
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        gap.topMargin = 48;
+
+        root.addView(title);
+        root.addView(subtitle, gap);
+        root.addView(bar, gap);
+        root.addView(hint, gap);
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.OPAQUE);
+        lp.token = token;
+
+        try {
+            getWindowManager().addView(root, lp);
+            mLoadingView = root;
+            Log.i(TAG, "loading overlay installed");
+        } catch (Throwable t) {
+            Log.e(TAG, "loading overlay addView FAILED: " + t, t);
+            mLoadingView = null;
+        }
+
+        // Safety net: dismiss after a hard timeout in case native never sends
+        // the first-frame notification (e.g. crash, hang, race).
+        mUiHandler.postDelayed(this::dismissLoadingOverlay, LOADING_TIMEOUT_MS);
+    }
+
+    private void dismissLoadingOverlay() {
+        if (mLoadingView == null) return;
+        try {
+            getWindowManager().removeView(mLoadingView);
+            Log.i(TAG, "loading overlay dismissed");
+        } catch (Throwable t) {
+            Log.w(TAG, "loading overlay removeView failed: " + t);
+        }
+        mLoadingView = null;
     }
 }

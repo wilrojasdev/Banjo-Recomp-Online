@@ -16,11 +16,22 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <jni.h>
 
 #include "hle/rt64_application.h"
 #include "librecomp/game.hpp"
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
+
+// Captured in JNI_OnLoad at .so load time so any thread can attach later.
+namespace {
+JavaVM* g_jvm = nullptr;
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
 
 #define LOG_TAG "BK64-Render"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -36,6 +47,40 @@ std::atomic<uint64_t> g_dl_count{0};
 std::atomic<uint64_t> g_dummy_count{0};
 std::atomic<uint64_t> g_screen_update_count{0};
 std::atomic<std::chrono::steady_clock::time_point> g_last_log{std::chrono::steady_clock::now()};
+
+// One-shot JNI ping to MainActivity.nativeNotifyFirstFrame() right after
+// the first VI present succeeds, so the Java loading splash can dismiss
+// itself instead of relying solely on the 45-second timeout.
+void notify_first_frame_to_java() {
+    if (g_jvm == nullptr) return;
+
+    JavaVM* vm = g_jvm;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+                "notify_first_frame: AttachCurrentThread failed");
+            return;
+        }
+        attached = true;
+    }
+    if (env == nullptr) return;
+
+    jclass cls = env->FindClass("com/banjorecomp/online/MainActivity");
+    if (cls != nullptr) {
+        jmethodID mid = env->GetStaticMethodID(cls, "nativeNotifyFirstFrame", "()V");
+        if (mid != nullptr) {
+            env->CallStaticVoidMethod(cls, mid);
+            __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
+                "notify_first_frame: signalled MainActivity");
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    if (attached) vm->DetachCurrentThread();
+}
 
 void heartbeat(const char* who) {
     auto now = std::chrono::steady_clock::now();
@@ -203,7 +248,10 @@ public:
 
     void update_screen() override {
         if (!app) return;
-        g_screen_update_count.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t prev = g_screen_update_count.fetch_add(1, std::memory_order_relaxed);
+        if (prev == 0) {
+            notify_first_frame_to_java();
+        }
         heartbeat("update_screen");
         app->updateScreen();
     }
