@@ -33,8 +33,11 @@ android {
                             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
                             // Mali Valhall G57 routes SV_TARGET1 to the color
                             // attachment when dualSrcBlend is off — strip the
-                            // second output from the ubershader.
-                            "-DRT64_NO_DUAL_SOURCE_DYNAMIC_PS=ON"
+                            // second output from both ubershader AND spec-constant
+                            // variants. Spec-constant lets us back off the
+                            // force-ubershader hack and run 10-50× faster.
+                            "-DRT64_NO_DUAL_SOURCE_DYNAMIC_PS=ON",
+                            "-DRT64_NO_DUAL_SOURCE_SPEC_CONST_PS=ON"
                         )
                     )
                     // RasterPS Vulkan/Mali diagnostics (matches lib/rt64 CMake cache).
