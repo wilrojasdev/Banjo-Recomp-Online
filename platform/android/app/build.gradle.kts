@@ -30,7 +30,11 @@ android {
                             "-DANDROID_STL=c++_shared",
                             // Oboe's old cmake_minimum_required(3.4) needs this on
                             // CMake 4.x. Harmless on older versions.
-                            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+                            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+                            // Mali Valhall G57 routes SV_TARGET1 to the color
+                            // attachment when dualSrcBlend is off — strip the
+                            // second output from the ubershader.
+                            "-DRT64_NO_DUAL_SOURCE_DYNAMIC_PS=ON"
                         )
                     )
                     // RasterPS Vulkan/Mali diagnostics (matches lib/rt64 CMake cache).
