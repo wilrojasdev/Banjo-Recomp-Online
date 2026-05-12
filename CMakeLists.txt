@@ -49,7 +49,21 @@ if (ANDROID)
     set(RT64_SDL_WINDOW_VULKAN FALSE)
     set(RT64_ANDROID_SPIKE ON CACHE BOOL "Skip host-only contrib (nfd, re-spirv) for Android" FORCE)
     if (NOT SDL2_INCLUDE_DIRS)
-        set(SDL2_INCLUDE_DIRS "/opt/homebrew/include/SDL2" CACHE PATH "Header-only SDL2 for Android cross-compile")
+        # Default depends on the host. macOS dev (Homebrew) prefers /opt/homebrew;
+        # other hosts use the SDL2 headers vendored under
+        # lib/rt64/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/include
+        # (already in the rt64 submodule for the Windows desktop build).
+        # Override with -DSDL2_INCLUDE_DIRS=... if a different tree is needed.
+        #
+        # The bundled SDL_config.h is Windows-only and drags <windows.h>
+        # into the Android cross-compile via SDL_syswm.h. rt64/CMakeLists.txt
+        # works around that by prepending lib/rt64/src/contrib/sdl2_shim/include
+        # to the global include path; nothing extra to do here.
+        if (CMAKE_HOST_APPLE AND EXISTS "/opt/homebrew/include/SDL2")
+            set(SDL2_INCLUDE_DIRS "/opt/homebrew/include/SDL2" CACHE PATH "Header-only SDL2 for Android cross-compile")
+        else()
+            set(SDL2_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/include" CACHE PATH "Header-only SDL2 for Android cross-compile")
+        endif()
     endif()
 else()
     set(RT64_SDL_WINDOW_VULKAN TRUE)
@@ -408,18 +422,32 @@ if (APPLE)
 endif()
 
 if (ANDROID)
-    # main.cpp does `#include <SDL2/SDL.h>`, so we need the parent of the
-    # SDL2/ directory on the include path too.
-    get_filename_component(_SDL2_PARENT_DIR ${SDL2_INCLUDE_DIRS} DIRECTORY)
+    # main.cpp / net_chat.cpp / net_nametag_ui.cpp include bare "SDL.h" on
+    # __ANDROID__ (same as on _WIN32), so SDL2_INCLUDE_DIRS already points at
+    # the directory containing SDL.h directly — no SDL2/-parent indirection
+    # needed. (Earlier revisions used <SDL2/SDL.h> on non-Win hosts; that
+    # required exposing the parent of /SDL2/ on the include path. The Android
+    # branch was patched to drop the prefix so the same fix works on Windows
+    # and on Linux hosts without a Homebrew-style SDL2 install.)
     target_include_directories(BanjoRecompiled PRIVATE
         ${SDL2_INCLUDE_DIRS}
-        ${_SDL2_PARENT_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/sdl2_shim/include
         # Header-only deps from RecompFrontend that the main app references but
         # whose .cpp implementations are pulled in transitively (or stubbed for
         # Phase 5 — wired for real in Phase 6/7).
         ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/lib/GamepadMotionHelpers
         ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompinput/include
         ${CMAKE_SOURCE_DIR}/lib/RecompFrontend/recompui/include
+    )
+
+    # Force-include the SDL_config dispatcher for BanjoRecompiled's own TUs.
+    # rt64's CMakeLists adds the same flag for the rt64 library, but the main
+    # app target is defined in this (root) file and inherits neither the
+    # add_compile_options() nor the include_directories(BEFORE) from rt64's
+    # subdirectory scope. See lib/rt64/src/contrib/sdl2_shim/include/SDL_config.h
+    # for the rationale (local-include-rule defeats just putting the shim on -I).
+    target_compile_options(BanjoRecompiled PRIVATE
+        "-include" "${CMAKE_SOURCE_DIR}/lib/rt64/src/contrib/sdl2_shim/include/SDL_config.h"
     )
 
     set(CMAKE_THREAD_PREFER_PTHREAD TRUE)

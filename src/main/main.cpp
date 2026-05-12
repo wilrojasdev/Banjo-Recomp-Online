@@ -98,8 +98,12 @@ extern "C" void osEepromLongWrite(uint8_t* rdram, recomp_context* ctx) {
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
 #define SDL_MAIN_HANDLED
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
+// On Windows and on the Android cross-compile the SDL2 include dir already
+// points at the SDL2 headers root (mupen64plus-win32-deps/SDL2-2.26.3/include
+// for Android), so SDL.h is reached directly without the SDL2/ prefix.
 #include "SDL.h"
+#include "SDL_syswm.h"
 #else
 #include "SDL2/SDL.h"
 #include "SDL2/SDL_syswm.h"

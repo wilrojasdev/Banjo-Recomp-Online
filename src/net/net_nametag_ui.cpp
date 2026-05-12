@@ -9,7 +9,7 @@
 #include "elements/ui_label.h"
 #include "elements/ui_types.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 #include "SDL.h"
 #else
 #include "SDL2/SDL.h"
