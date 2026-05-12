@@ -81,6 +81,45 @@ namespace recomputil {
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// recomp_printf and most patch-side printf calls write to stdout. On a vanilla
+// Android NDK app stdout/stderr are wired to /dev/null, so the entire patch
+// diagnostic surface is invisible. Pipe both descriptors into a logcat-pumping
+// thread so every recomp_printf / fprintf reaches `adb logcat -s BK64-Recomp`.
+static void start_stdio_to_logcat_pump() {
+    static std::atomic<bool> s_started{false};
+    bool expected = false;
+    if (!s_started.compare_exchange_strong(expected, true)) return;
+
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        LOGW("stdio pump: pipe() failed errno=%d — recomp_printf will go to /dev/null", errno);
+        return;
+    }
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    close(fds[1]);
+
+    std::thread([read_fd = fds[0]]() {
+        char buf[512];
+        std::string line;
+        while (true) {
+            ssize_t n = read(read_fd, buf, sizeof(buf) - 1);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            line.append(buf, n);
+            size_t pos;
+            while ((pos = line.find('\n')) != std::string::npos) {
+                std::string out = line.substr(0, pos);
+                __android_log_print(ANDROID_LOG_INFO, "BK64-Recomp", "%s", out.c_str());
+                line.erase(0, pos + 1);
+            }
+        }
+    }).detach();
+}
+
 // --- Symbols owned by main.cpp ---
 extern std::vector<recomp::GameEntry> supported_games;
 extern RspUcodeFunc* get_rsp_microcode(const OSTask* task);
@@ -302,6 +341,7 @@ void android_on_launcher_init(recompui::LauncherMenu* menu) {
 namespace banjo_android {
 
 void run_game(ANativeWindow* window, AppPaths paths) {
+    start_stdio_to_logcat_pump();
     LOGI("run_game: entered with window=%p internal=%s", window, paths.internal_data_path);
     g_window = window;
 
