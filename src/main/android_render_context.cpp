@@ -40,6 +40,22 @@ static jmethodID g_notify_game_started_method = nullptr;
 static jmethodID g_notify_return_to_launcher_method = nullptr;
 static jmethodID g_notify_first_game_frame_method = nullptr;
 static std::atomic<bool> g_expecting_first_game_frame{false};
+// The hook below fires on every present, including launcher transition
+// presents that happen BEFORE the game thread has produced any DLs. To keep
+// the shader splash from blinking off the moment Start Game is pressed, we
+// require both a minimum number of presents AND a minimum elapsed time
+// between arm and dismiss. The 45 s timeout on the Java side is still the
+// upper bound, so if the game-thread bug suppresses real frames we still
+// give the user some visible feedback rather than a soft hang.
+static std::atomic<int>     g_presents_since_arm{0};
+static std::atomic<int64_t> g_arm_time_ms{0};
+static constexpr int        kMinPresentsBeforeDismiss = 30;     // ~0.5 s @ 60 Hz
+static constexpr int64_t    kMinElapsedMsBeforeDismiss = 1500;  // safety floor
+
+static int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 // recompui::RT64Context::update_screen (rt64_render_context.cpp) calls this
 // pointer after each present when linked into BanjoRecompiled.
@@ -57,6 +73,8 @@ void banjo_android_set_jvm(JavaVM* vm) {
 
 extern "C" __attribute__((visibility("default")))
 void banjo_android_mark_expecting_first_game_frame() {
+    g_presents_since_arm.store(0, std::memory_order_release);
+    g_arm_time_ms.store(now_ms(), std::memory_order_release);
     g_expecting_first_game_frame.store(true, std::memory_order_release);
 }
 
@@ -86,9 +104,14 @@ void banjo_android_notify_return_to_launcher() {
 }
 
 extern "C" void banjo_android_on_present_after_rt64_update() {
-    if (!g_expecting_first_game_frame.exchange(false, std::memory_order_acq_rel)) {
+    if (!g_expecting_first_game_frame.load(std::memory_order_acquire)) {
         return;
     }
+    int n = g_presents_since_arm.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (n < kMinPresentsBeforeDismiss) return;
+    int64_t elapsed = now_ms() - g_arm_time_ms.load(std::memory_order_acquire);
+    if (elapsed < kMinElapsedMsBeforeDismiss) return;
+    if (!g_expecting_first_game_frame.exchange(false, std::memory_order_acq_rel)) return;
     call_main_activity_method("notify_first_game_frame", g_notify_first_game_frame_method);
 }
 

@@ -401,7 +401,7 @@ public class MainActivity extends NativeActivity {
             float rn = layout[i + 2];
             int mask = (int) layout[i + 3];
             int diam = Math.max(80, (int)(rn * shortSide * 2f));
-            Button btn = buildOverlayButton(labelForMask(mask), mask, colorForMask(mask));
+            Button btn = buildOverlayButton(labelForMask(mask), mask, colorForMask(mask), diam);
             WindowManager.LayoutParams lp = baseOverlayLp(diam, diam, token);
             lp.gravity = Gravity.TOP | Gravity.START;
             lp.x = (int)(xn * sw) - diam / 2;
@@ -431,17 +431,28 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    private Button buildOverlayButton(String label, final int mask, int color) {
+    private Button buildOverlayButton(String label, final int mask, int color, int diameterPx) {
         final Button btn = new Button(this);
         btn.setText(label);
         btn.setTextColor(Color.WHITE);
         btn.setAllCaps(false);
-        btn.setTextSize(28f);
+        // Text size scales with the button diameter so labels look right on
+        // both the small D-pad/C-button circles and the bigger A/B.
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_PX, diameterPx * 0.30f);
+        // Strip the default Android Button chrome (min size, padding, ascent
+        // padding) so the label sits inside the circle.
+        btn.setPadding(0, 0, 0, 0);
+        btn.setMinHeight(0);
+        btn.setMinWidth(0);
+        btn.setMinimumHeight(0);
+        btn.setMinimumWidth(0);
+        btn.setIncludeFontPadding(false);
+        btn.setGravity(Gravity.CENTER);
 
         GradientDrawable bg = new GradientDrawable();
         bg.setShape(GradientDrawable.OVAL);
         bg.setColor(color);
-        bg.setStroke(6, Color.argb(200, 255, 255, 255));
+        bg.setStroke(Math.max(3, diameterPx / 20), Color.argb(200, 255, 255, 255));
         btn.setBackground(bg);
 
         btn.setOnTouchListener((v, ev) -> {
