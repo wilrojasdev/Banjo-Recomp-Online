@@ -497,6 +497,30 @@ void debug_set_button(uint16_t mask, bool pressed) {
     }
 }
 
+// Same idea for the analog stick: the Java widget tracks the finger and
+// hands us already-normalized (-1..+1) coordinates, +y up matching N64.
+void debug_set_stick(float x, float y) {
+    auto clamp = [](float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); };
+    std::lock_guard lock{g_mutex};
+    g_stick_x = clamp(x);
+    g_stick_y = clamp(y);
+}
+
+// Layout snapshot for the Java overlay. We return by value so the Java
+// thread doesn't have to hold the mutex while building the overlay.
+LayoutSnapshot snapshot_layout() {
+    LayoutSnapshot s;
+    std::lock_guard lock{g_mutex};
+    s.stick_x = g_stick.center_x_norm;
+    s.stick_y = g_stick.center_y_norm;
+    s.stick_r = g_stick.radius_norm;
+    s.buttons.reserve(g_buttons.size());
+    for (const auto& b : g_buttons) {
+        s.buttons.push_back({ b.x_norm, b.y_norm, b.radius_norm, b.mask });
+    }
+    return s;
+}
+
 }  // namespace banjo_android::touch
 
 // JNI bridge for MainActivity.java's `private static native void
@@ -506,6 +530,48 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_banjorecomp_online_MainActivity_nativeSetButton(
     JNIEnv* /*env*/, jclass /*clazz*/, jint mask, jboolean pressed) {
     banjo_android::touch::debug_set_button(static_cast<uint16_t>(mask), pressed == JNI_TRUE);
+}
+
+// JNI bridge for MainActivity's analog stick. x and y are already in N64
+// stick coordinates (-1.0 .. +1.0; +y is up). The Java side does its own
+// normalization vs the stick widget center, so the native hit-tester is
+// bypassed in the same way debug_set_button bypasses button hit-test.
+extern "C" JNIEXPORT void JNICALL
+Java_com_banjorecomp_online_MainActivity_nativeSetStick(
+    JNIEnv* /*env*/, jclass /*clazz*/, jfloat x, jfloat y) {
+    banjo_android::touch::debug_set_stick(static_cast<float>(x), static_cast<float>(y));
+}
+
+// JNI bridge that returns the in-memory touch layout to Java so MainActivity
+// can instantiate the overlay widgets at the exact same positions the native
+// hit-tester uses. Returns a flat float array:
+//   [0]   stick center x (normalized)
+//   [1]   stick center y (normalized)
+//   [2]   stick radius   (normalized)
+//   [3..] per button: x_norm, y_norm, radius_norm, n64_mask (as float)
+// All coordinates are normalized 0..1 over the surface. The mask is the
+// uint16 N64 button bit value cast to float; the Java side rounds it back
+// to int. Returning empty array if nothing has loaded yet.
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_banjorecomp_online_MainActivity_nativeGetLayout(
+    JNIEnv* env, jclass /*clazz*/) {
+    auto snapshot = banjo_android::touch::snapshot_layout();
+    int total = 3 + static_cast<int>(snapshot.buttons.size()) * 4;
+    jfloatArray arr = env->NewFloatArray(total);
+    if (arr == nullptr) return nullptr;
+    std::vector<jfloat> data;
+    data.reserve(total);
+    data.push_back(snapshot.stick_x);
+    data.push_back(snapshot.stick_y);
+    data.push_back(snapshot.stick_r);
+    for (const auto& b : snapshot.buttons) {
+        data.push_back(b.x);
+        data.push_back(b.y);
+        data.push_back(b.r);
+        data.push_back(static_cast<jfloat>(b.mask));
+    }
+    env->SetFloatArrayRegion(arr, 0, total, data.data());
+    return arr;
 }
 
 #endif  // __ANDROID__

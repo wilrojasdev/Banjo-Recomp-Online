@@ -34,9 +34,22 @@ public class MainActivity extends NativeActivity {
 
     private static final String TAG = "BK64-Java";
 
-    // Must match BTN_START / BTN_A in android_touch.cpp.
-    private static final int BTN_START = 0x1000;
-    private static final int BTN_A     = 0x8000;
+    // Must match BTN_* in android_touch.cpp. Only used for log strings now
+    // that the overlay is built from the layout snapshot.
+    private static final int BTN_A        = 0x8000;
+    private static final int BTN_B        = 0x4000;
+    private static final int BTN_Z        = 0x2000;
+    private static final int BTN_START    = 0x1000;
+    private static final int BTN_UP       = 0x0800;
+    private static final int BTN_DOWN     = 0x0400;
+    private static final int BTN_LEFT     = 0x0200;
+    private static final int BTN_RIGHT    = 0x0100;
+    private static final int BTN_L        = 0x0020;
+    private static final int BTN_R        = 0x0010;
+    private static final int BTN_C_UP     = 0x0008;
+    private static final int BTN_C_DOWN   = 0x0004;
+    private static final int BTN_C_LEFT   = 0x0002;
+    private static final int BTN_C_RIGHT  = 0x0001;
 
     private boolean mWindowTokenReady = false;
 
@@ -45,8 +58,7 @@ public class MainActivity extends NativeActivity {
 
     private View mRomGateView = null;
     private View mShaderLoadingView = null;
-    private View mStartButtonView = null;
-    private View mAButtonView = null;
+    private final java.util.List<View> mGamepadViews = new java.util.ArrayList<>();
     private android.os.IBinder mGameToken = null;
     private final Handler mUiHandler = new Handler(Looper.getMainLooper());
     private static final long SHADER_LOADING_TIMEOUT_MS = 45_000;
@@ -66,6 +78,8 @@ public class MainActivity extends NativeActivity {
     }
 
     private static native void nativeSetButton(int mask, boolean pressed);
+    private static native void nativeSetStick(float x, float y);
+    private static native float[] nativeGetLayout();
 
     private static native void nativeInit();
 
@@ -321,165 +335,246 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    private void installStartWindowOverlay(android.os.IBinder token) {
-        Button btn = buildStartButton();
-
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                700, 280,
-                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.y = 60;
-        lp.token = token;
-
-        try {
-            getWindowManager().addView(btn, lp);
-            mStartButtonView = btn;
-            Log.i(TAG, "WindowManager.addView START OK token=" + token);
-        } catch (Throwable t) {
-            Log.e(TAG, "WindowManager.addView START FAILED: " + t, t);
-            FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
-                    700, 280,
-                    Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-            flp.topMargin = 60;
-            addContentView(btn, flp);
-            mStartButtonView = btn;
-            Log.i(TAG, "fallback addContentView START");
-        }
-    }
-
-    private Button buildStartButton() {
-        final Button btn = new Button(this);
-        btn.setText("START");
-        btn.setTextColor(Color.WHITE);
-        btn.setAllCaps(false);
-        btn.setTextSize(40f);
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.argb(255, 220, 30, 30));
-        bg.setCornerRadius(60f);
-        bg.setStroke(8, Color.WHITE);
-        btn.setBackground(bg);
-
-        btn.setOnTouchListener((v, ev) -> {
-            switch (ev.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    Log.i(TAG, "START pressed");
-                    nativeSetButton(BTN_START, true);
-                    v.setPressed(true);
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    Log.i(TAG, "START released");
-                    nativeSetButton(BTN_START, false);
-                    v.setPressed(false);
-                    return true;
-                default:
-                    return false;
-            }
-        });
-        return btn;
-    }
-
-    private void installAWindowOverlay(android.os.IBinder token) {
-        Button btn = buildAButton();
-
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                320, 320,
-                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-        lp.x = 80;
-        lp.y = 120;
-        lp.token = token;
-
-        try {
-            getWindowManager().addView(btn, lp);
-            mAButtonView = btn;
-            Log.i(TAG, "WindowManager.addView A OK token=" + token);
-        } catch (Throwable t) {
-            Log.e(TAG, "WindowManager.addView A FAILED: " + t, t);
-            FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
-                    320, 320,
-                    Gravity.BOTTOM | Gravity.RIGHT);
-            flp.rightMargin = 80;
-            flp.bottomMargin = 120;
-            addContentView(btn, flp);
-            mAButtonView = btn;
-            Log.i(TAG, "fallback addContentView A");
-        }
-    }
-
-    private Button buildAButton() {
-        final Button btn = new Button(this);
-        btn.setText("A");
-        btn.setTextColor(Color.WHITE);
-        btn.setAllCaps(false);
-        btn.setTextSize(56f);
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Color.argb(255, 30, 120, 220));
-        bg.setStroke(8, Color.WHITE);
-        btn.setBackground(bg);
-
-        btn.setOnTouchListener((v, ev) -> {
-            switch (ev.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    Log.i(TAG, "A pressed");
-                    nativeSetButton(BTN_A, true);
-                    v.setPressed(true);
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    Log.i(TAG, "A released");
-                    nativeSetButton(BTN_A, false);
-                    v.setPressed(false);
-                    return true;
-                default:
-                    return false;
-            }
-        });
-        return btn;
-    }
-
+    // Gamepad overlay — reads the touch layout from native (which loads it
+    // from assets/touch_overlay/default.layout, see android_touch.cpp) and
+    // instantiates a Button per entry plus a custom StickView for the analog
+    // stick. Each view positions itself via WindowManager params so they sit
+    // on top of the Vulkan surface NativeActivity owns.
     private void showGameControls() {
         if (mGameToken == null) {
             Log.w(TAG, "showGameControls: no window token yet, skipping");
             return;
         }
-        if (mStartButtonView == null) {
-            installStartWindowOverlay(mGameToken);
-        }
-        if (mAButtonView == null) {
-            installAWindowOverlay(mGameToken);
-        }
+        if (!mGamepadViews.isEmpty()) return;
+        installGamepadOverlay(mGameToken);
     }
 
     private void hideGameControls() {
         dismissShaderLoadingOverlay();
         mUiHandler.removeCallbacks(mShaderLoadingTimeoutRunnable);
-        if (mStartButtonView != null) {
+        for (View v : mGamepadViews) {
             try {
-                getWindowManager().removeView(mStartButtonView);
+                getWindowManager().removeView(v);
             } catch (Throwable t) {
-                Log.w(TAG, "removeView START failed: " + t);
+                Log.w(TAG, "removeView overlay failed: " + t);
             }
-            mStartButtonView = null;
         }
-        if (mAButtonView != null) {
-            try {
-                getWindowManager().removeView(mAButtonView);
-            } catch (Throwable t) {
-                Log.w(TAG, "removeView A failed: " + t);
+        mGamepadViews.clear();
+    }
+
+    private void installGamepadOverlay(android.os.IBinder token) {
+        float[] layout = null;
+        try {
+            layout = nativeGetLayout();
+        } catch (Throwable t) {
+            Log.e(TAG, "nativeGetLayout threw: " + t, t);
+        }
+        if (layout == null || layout.length < 3) {
+            Log.w(TAG, "installGamepadOverlay: empty/invalid layout from native");
+            return;
+        }
+
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        int sw = dm.widthPixels;
+        int sh = dm.heightPixels;
+        int shortSide = Math.min(sw, sh);
+        Log.i(TAG, "gamepad overlay: surface=" + sw + "x" + sh + " entries=" + ((layout.length - 3) / 4));
+
+        // Stick widget first so buttons can overlap if a layout author wants.
+        float stickXn = layout[0];
+        float stickYn = layout[1];
+        float stickRn = layout[2];
+        int stickDiam = Math.max(80, (int)(stickRn * shortSide * 2f));
+        StickView stick = new StickView(this);
+        int stickPx = (int)(stickXn * sw) - stickDiam / 2;
+        int stickPy = (int)(stickYn * sh) - stickDiam / 2;
+        WindowManager.LayoutParams stickLp = baseOverlayLp(stickDiam, stickDiam, token);
+        stickLp.gravity = Gravity.TOP | Gravity.START;
+        stickLp.x = stickPx;
+        stickLp.y = stickPy;
+        addOverlayView(stick, stickLp, "stick");
+
+        // Buttons.
+        for (int i = 3; i + 3 < layout.length; i += 4) {
+            float xn = layout[i];
+            float yn = layout[i + 1];
+            float rn = layout[i + 2];
+            int mask = (int) layout[i + 3];
+            int diam = Math.max(80, (int)(rn * shortSide * 2f));
+            Button btn = buildOverlayButton(labelForMask(mask), mask, colorForMask(mask));
+            WindowManager.LayoutParams lp = baseOverlayLp(diam, diam, token);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            lp.x = (int)(xn * sw) - diam / 2;
+            lp.y = (int)(yn * sh) - diam / 2;
+            addOverlayView(btn, lp, labelForMask(mask));
+        }
+    }
+
+    private WindowManager.LayoutParams baseOverlayLp(int w, int h, android.os.IBinder token) {
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                w, h,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.token = token;
+        return lp;
+    }
+
+    private void addOverlayView(View v, WindowManager.LayoutParams lp, String tag) {
+        try {
+            getWindowManager().addView(v, lp);
+            mGamepadViews.add(v);
+        } catch (Throwable t) {
+            Log.w(TAG, "addView " + tag + " failed (likely no token yet): " + t);
+        }
+    }
+
+    private Button buildOverlayButton(String label, final int mask, int color) {
+        final Button btn = new Button(this);
+        btn.setText(label);
+        btn.setTextColor(Color.WHITE);
+        btn.setAllCaps(false);
+        btn.setTextSize(28f);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(color);
+        bg.setStroke(6, Color.argb(200, 255, 255, 255));
+        btn.setBackground(bg);
+
+        btn.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    nativeSetButton(mask, true);
+                    v.setPressed(true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    nativeSetButton(mask, false);
+                    v.setPressed(false);
+                    return true;
+                default:
+                    return false;
             }
-            mAButtonView = null;
+        });
+        return btn;
+    }
+
+    private static String labelForMask(int mask) {
+        switch (mask) {
+            case BTN_A:       return "A";
+            case BTN_B:       return "B";
+            case BTN_Z:       return "Z";
+            case BTN_START:   return "START";
+            case BTN_L:       return "L";
+            case BTN_R:       return "R";
+            case BTN_C_UP:    return "C↑";
+            case BTN_C_DOWN:  return "C↓";
+            case BTN_C_LEFT:  return "C←";
+            case BTN_C_RIGHT: return "C→";
+            case BTN_UP:      return "↑";
+            case BTN_DOWN:    return "↓";
+            case BTN_LEFT:    return "←";
+            case BTN_RIGHT:   return "→";
+            default:          return "?";
+        }
+    }
+
+    private static int colorForMask(int mask) {
+        // Loose nod to the N64 controller palette.
+        switch (mask) {
+            case BTN_A:                                                 return Color.argb(255,  30, 120, 220);   // blue
+            case BTN_B:                                                 return Color.argb(255,  40, 175,  60);   // green
+            case BTN_C_UP: case BTN_C_DOWN: case BTN_C_LEFT: case BTN_C_RIGHT:
+                                                                        return Color.argb(255, 240, 195,  40);   // yellow
+            case BTN_START:                                             return Color.argb(255, 220,  30,  30);   // red
+            case BTN_Z:                                                 return Color.argb(255,  60,  60,  60);   // dark grey
+            case BTN_L: case BTN_R:                                     return Color.argb(255, 110, 110, 110);
+            default:                                                    return Color.argb(255, 150, 150, 150);   // d-pad / unknown
+        }
+    }
+
+    /**
+     * Analog stick: outer ring + thumb that tracks the finger. Touch is
+     * clamped to the ring radius, then forwarded as N64 stick coords
+     * (-1..+1, +y up) via nativeSetStick. ACTION_UP / CANCEL springs back.
+     */
+    static final class StickView extends View {
+        private final android.graphics.Paint mPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private float mThumbCx = 0f;
+        private float mThumbCy = 0f;
+        private boolean mHeld = false;
+        private float mCenterX = 0f;
+        private float mCenterY = 0f;
+        private float mRadius = 1f;
+
+        StickView(android.content.Context ctx) {
+            super(ctx);
+            setBackgroundColor(Color.TRANSPARENT);
+        }
+
+        @Override
+        protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            mCenterX = w / 2f;
+            mCenterY = h / 2f;
+            mRadius = Math.min(w, h) / 2f - 8f;
+            mThumbCx = mCenterX;
+            mThumbCy = mCenterY;
+        }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas canvas) {
+            super.onDraw(canvas);
+            mPaint.setStyle(android.graphics.Paint.Style.STROKE);
+            mPaint.setStrokeWidth(6f);
+            mPaint.setColor(Color.argb(220, 255, 255, 255));
+            canvas.drawCircle(mCenterX, mCenterY, mRadius, mPaint);
+
+            mPaint.setStyle(android.graphics.Paint.Style.FILL);
+            mPaint.setColor(mHeld ? Color.argb(230, 240, 240, 240) : Color.argb(180, 200, 200, 200));
+            canvas.drawCircle(mThumbCx, mThumbCy, mRadius * 0.45f, mPaint);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent ev) {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_MOVE:
+                    mHeld = true;
+                    updateThumb(ev.getX(), ev.getY());
+                    invalidate();
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    mHeld = false;
+                    mThumbCx = mCenterX;
+                    mThumbCy = mCenterY;
+                    nativeSetStick(0f, 0f);
+                    invalidate();
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private void updateThumb(float fx, float fy) {
+            float dx = fx - mCenterX;
+            float dy = fy - mCenterY;
+            float dist = (float) Math.sqrt(dx * dx + dy * dy);
+            float r = mRadius;
+            if (dist > r && r > 0f) {
+                dx *= r / dist;
+                dy *= r / dist;
+            }
+            mThumbCx = mCenterX + dx;
+            mThumbCy = mCenterY + dy;
+            // N64: +y is up; Android: +y is down.
+            float nx = r > 0f ? dx / r : 0f;
+            float ny = r > 0f ? -dy / r : 0f;
+            nativeSetStick(nx, ny);
         }
     }
 }

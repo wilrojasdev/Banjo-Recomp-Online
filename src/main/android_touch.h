@@ -9,7 +9,9 @@
 
 #ifdef __ANDROID__
 
+#include <cstdint>
 #include <filesystem>
+#include <vector>
 
 #include "ultramodern/input.hpp"
 
@@ -55,6 +57,22 @@ void render_overlay();
 // without going through process_motion_event. `mask` matches the BTN_* bits
 // declared inside android_touch.cpp (e.g. 0x1000 for START).
 void debug_set_button(uint16_t mask, bool pressed);
+
+// Direct stick injection from the Java overlay's StickView. x and y are
+// already in N64 stick coords (-1..+1, +y up). Bypasses process_motion_event
+// the same way debug_set_button does.
+void debug_set_stick(float x, float y);
+
+// Snapshot of the current layout (stick + buttons) for Java consumers. The
+// JNI bridge serializes this into the float array MainActivity reads.
+struct LayoutSnapshot {
+    float stick_x = 0.0f;
+    float stick_y = 0.0f;
+    float stick_r = 0.0f;
+    struct Btn { float x; float y; float r; uint16_t mask; };
+    std::vector<Btn> buttons;
+};
+LayoutSnapshot snapshot_layout();
 
 }  // namespace banjo_android::touch
 
