@@ -1,14 +1,17 @@
 # BK64-Online — Android Port
 
-**Status**: Phases 1-8 (graphics core + recomp runtime + main app .so + touch input + overlay render + audio + APK shell) — **DONE** ✅
-**Last updated**: 2026-05-09
+**Status**: Phases 1-13 — **DONE** ✅ (Mali Valhall renders BK64 title; RmlUi launcher navigable on emulator)
+**Last updated**: 2026-05-11
+**Working branch**: `android-phase12-mali-vulkan-wip` (Phase 13 work-in-progress on top of Phase 12 Mali fixes)
 **Target**: arm64-v8a Android, NativeActivity + Vulkan path (no SDL2-Vulkan), Adreno 6xx+ / Mali Valhall+
 
 ---
 
 ## TL;DR
 
-**The APK runs on Pixel 8 emulator.** Phases 0-8 are **DONE**. `app-debug.apk` (36 MB) installs cleanly, `libBanjoRecompiled.so` loads (`dlopen ok`), `android_main()` enters its event loop, Oboe audio opens at 32 kHz, NativeActivity hands us a 2400×1080 surface and focus — all in 2.3 seconds, no crashes. Screen is black because RT64 isn't yet hooked to the `ANativeWindow*` — Phase 9 wires the boot flow to feed the surface into `rt64::Application::setup()` (Plume already accepts `ANativeWindow*` natively).
+**The game boots into a navigable launcher on a Samsung A24 (Mali-G57 Valhall) and on the Pixel 8 emulator.** Phases 0-13 are **DONE**. APK installs cleanly, ubershaders compile during a Java loading splash (~27 s on A24, gated to dismiss on first frame), then the title screen and RmlUi launcher (`Start Game / Controls / Settings / Mods / Exit`) render via the RT64 compositor. Tapping `Start Game` enters the game; touch overlay maps to N64 buttons + analog stick; audio runs through Oboe at 32 kHz.
+
+**Active blocker**: file-select menu shows a black screen after the title — the game emits `FillRect`-only display lists, no triangles. Renderer is healthy; this is a game-logic-level issue currently under investigation (rt64 has uncapped `ALOG` instrumentation in workload_queue / framebuffer_renderer / present_queue on the Phase 12 branch).
 
 ---
 
@@ -389,35 +392,118 @@ adb logcat -s BK64-Main BK64-Audio BK64-Stub  # tail logs
 
 ---
 
-### Phase 9 — First Device Boot (2-3 weeks)
+### Phase 9-10 — Boot Wire-Up + First Display List — **DONE 2026-05-09** (commit `41b4da6`)
 
-Iterate until the game runs on a real Android device.
+Squashed Phases 9 and 10 into one bring-up effort. The APK now boots through full BK init and emits its first display list.
 
-**Tasks**:
-- [ ] Test on Pixel 7 / 8 (Mali-G715 / Mali-G715 Immortalis) — Mali Valhall reference
-- [ ] Test on Snapdragon 8 Gen 2+ device (Adreno 740/750) — Adreno reference
-- [ ] Enable Vulkan validation layers in debug build
-- [ ] Diagnose any optional Vulkan extension fallbacks (descriptor indexing, buffer device address, etc.)
-- [ ] Profile frame time, GPU memory pressure
-- [ ] Audio latency tuning
+**Boot path** ([src/main/android_run_game.cpp](src/main/android_run_game.cpp)):
+- Anchors recomp config in the app's external/internal data dir.
+- Registers all `recomp_*` / `recomp_net_*` / `bknet_debug_log` REGISTER_FUNC targets.
+- Calls `recomputil::register_data_api_exports` + `register_bk_overlays` + `register_bk_patches` + `init_extended_object_data(2)`.
+- Auto-starts BK on the first gfx update once VI states are seeded.
 
-**Deliverable**: Sustained gameplay (30+ seconds, multiple levels) on at least 2 device classes without crashes.
+**Render context** ([src/main/android_render_context.cpp](src/main/android_render_context.cpp)):
+- Minimal `RT64::Application` driver for the NativeActivity path. Forces Vulkan, mirrors the desktop `recompui RT64Context` for the bits we need (no texture-pack hot-swap, no recompui dependency at this stage).
+- Heartbeat counters log every ~5 s so logcat shows "frames flowing".
+
+**Per-domain stub partitioning** (replaces the monolithic `android_stubs.cpp`):
+- `android_nfd_stubs.cpp` — `NFD_Init/Quit → OKAY`, dialogs return ERROR. Needed because `RT64::FileDialog::initialize()` runs unconditionally.
+- `android_respv_stubs.cpp` — re-spirv shader/optimizer return false (replaced by real lib in Phase 11).
+- `android_recompui_stubs.cpp` — `recomp_run_ui_callbacks` no-op + `recompui::get_window_size` routed to android_touch viewport.
+- `android_recompinput_stubs.cpp` — right analog / gyro / mouse return zero; rumble + mapper setup no-op.
+- `android_stubs.cpp` — aborting per-symbol stubs for the residue, named via `android_unimplemented_stub_named` so logcat shows exactly which symbol fires next.
+- `platform/android/scripts/regen_stubs.sh` regenerates `android_stubs.cpp` from the current `.so` UND list, filtering NDK + per-domain providers.
+
+**APK size after Phase 10**: ~77 MB.
+
+**CMake**: `-Wl,--unresolved-symbols=ignore-all` retained so Bionic-incompatible desktop symbols don't block link.
 
 ---
 
-### Phase 10 — Driver QA / Device Fragmentation (2-3 months)
+### Phase 11 — Real re-spirv Shader Optimizer — **DONE 2026-05-09** (commit `6f93393`)
 
-Stabilize across the real-world Android device matrix.
+The Phase 10 stub of `respv::Optimizer::run` returned empty vectors, which were then handed to `vkCreateShaderModule` with `codeSize=0` and SIGSEGV'd inside the Mali driver (validation caught `VUID-VkShaderModuleCreateInfo-codeSize-01085`).
 
-**Tasks**:
-- [ ] Adreno 6xx (older Snapdragon) — descriptor indexing driver bugs known
-- [ ] Mali Bifrost / Midgard — likely cut as unsupported (out of scope)
-- [ ] Memory pressure under thermal throttling
-- [ ] Multi-resolution + ratio handling (foldables, tablets)
-- [ ] Multiplayer over cellular (CoopNet ICE behavior)
-- [ ] Battery drain measurement
+**Fix**: `rt64/CMakeLists.txt` now builds re-spirv when `ANDROID` is set even with `RT64_ANDROID_SPIKE` on. re-spirv is plain C++17 with header-only SPIRV-Headers — cross-compiles cleanly for arm64-v8a. Stub file dropped from SOURCES; real lib linked.
 
-**Deliverable**: Public-ready APK with documented minimum specs and known-issue list.
+**Result on Samsung A24 / Mali G57**: RT64's first DL pipeline creation succeeds. Gfx thread produces steady 60 Hz: **1107 display lists, 4926 screen_updates over 85 s**, swapchain presenting.
+
+`.gitignore` excludes `platform/android/app/src/main/jniLibs/` so the 24 MB Vulkan validation layer .so doesn't end up in the repo (download from KhronosGroup/Vulkan-ValidationLayers releases when debugging on device).
+
+---
+
+### Phase 12 — Mali Valhall White Frame → BK64 Title Renders — **DONE 2026-05-10**
+
+Mali-G57 booted steady 60 Hz but rendered pure white. Root cause: when `dualSrcBlend` is OFF, Mali routes `SV_TARGET1` to the color attachment instead of the blend factor — the fallback path was reading coverage as color.
+
+**Fix sequence** (commits `541b0dd` → `7f656b8`):
+- `541b0dd` Phase 12 WIP scaffold: NativeActivity swapped for a thin `MainActivity` Java subclass with a START button overlay (validates input → recomp pipeline regardless of render). Two gradle props (`-Prt64DiagRasterPs=N` / `-Prt64DiagVi=N`) wired through to CMake cache for in-shader diagnostic modes (cyan/grid/classifier outputs).
+- `d8d815d` — enable Mali `SV_TARGET1` strip via `RT64_NO_DUAL_SOURCE_DYNAMIC_PS`.
+- `ef077fb` — 2× resolution scale, drop validation, document via callback.
+- `3999231` — loading splash + JNI first-frame signal + skip-spec-constant bump.
+- `ee0b5ef` — strip `SV_TARGET1` from spec-constant + restore alpha blend.
+- `79852cc` — gate game thread on ubershader compile + Java loading splash. `setup()` now blocks until ubershader pipelines `0+3+rest` are ready; `recomp::start` waits on `setup()`, stalling game loop AND audio scheduler in lockstep so splash, music, and intro first-frame all start together. `nativeInit()` caches a global ref to `MainActivity` from the static initializer (FindClass from the workload thread otherwise fails because the system classloader has no access to `com.banjorecomp.online.*`).
+- `7f656b8` — bump rt64 to `8b92211` (uncapped `ALOG` instrumentation in workload_queue / framebuffer_renderer / present_queue for the next investigation — file-select menu black-screen).
+
+**Cost**: boot is ~27 s on A24 because Mali serializes the 8 ubershader pipeline compiles. Reduction targets: persistent `VkPipelineCache` on disk, prune unused variants (BK64 may only need 3-4 of 8), or compile critical-path synchronously + rest lazily.
+
+**Result**: A24 renders the BK64 title screen.
+
+---
+
+### Phase 13 — RmlUi Launcher on Android (WIP) — Renders + Navigable on Emulator — commit `aed5b99`
+
+End-to-end working on the Pixel 8 emulator: launcher menu (`Start Game / Controls / Settings / Mods / Exit`) renders in RT64's compositor over the BK framebuffer, touches map to clicks, tapping `Settings` opens the General/Graphics/Controls tabs built by `banjo::init_config()`.
+
+**Build / link**:
+- `add_subdirectory(RecompFrontend)` un-gated for Android; `BanjoRecompiled` now links `recompui` + `recompinput` on Android. The `android_recompui_stubs.cpp` / `android_recompinput_stubs.cpp` files are dropped (real impls win). `android_stubs.cpp` regenerated — **33 remaining off-path SDL_*/text-input symbols vs 162 before**.
+- `lib/RecompFrontend` submodule bumped: Freetype FetchContent for Android, SDL shim under `recompinput/include/sdl_shim/`, `set_program_path_override`.
+- `platform/android/app/build.gradle.kts`: `assets.srcDirs("../../../assets")` — APK picks up the same fonts/SVGs/RCSS the desktop build uses, no duplication.
+
+**Boot path** ([src/main/android_run_game.cpp](src/main/android_run_game.cpp)):
+- `extract_apk_assets` walks the APK's root + `icons/` + `promptfont/` subdirs into `internalDataPath/assets/` (idempotent on file size).
+- `recompui::file::set_program_path_override(internalDataPath)` so `get_asset_path` resolves to the extracted tree.
+- `setenv("HOME", internalDataPath, 1)` so RT64's `__linux__` branch builds `$HOME/.rt64` inside the sandbox (was `/data/.rt64` → `EACCES`).
+- `register_primary_font("Suplexmentary Comic NC.ttf")` + Inter font, `banjo::locale::init()`, `banjo::init_config()` builds all launcher tabs.
+- Render context switched from `banjo_android::renderer::create_render_context` to `recompui::renderer::create_render_context(rdram, win, PresentEarly, developer_mode)` — installs RT64 render hooks for the UI compositor.
+- `android_on_launcher_init` overrides `start_game` callback to also call `banjo_android_notify_game_started()` (JNI), then `recomp::start_game(supported_games.front().game_id, {})`.
+
+**Touch → click bridge** ([src/main/android_touch.cpp](src/main/android_touch.cpp)):
+- `push_ui_mouse_event` synthesizes `SDL_MOUSEMOTION` + `SDL_MOUSEBUTTONDOWN/UP` and feeds them into `recompui::queue_event` (bypassing `SDL_PollEvent` → `handle_events`, which nothing drives on Android).
+- Pointer 0 only — multi-touch still routes to the N64 button bitmask.
+
+**Java side** ([MainActivity.java](platform/android/app/src/main/java/com/banjorecomp/online/MainActivity.java)):
+- START / A overlay buttons no longer auto-installed at boot. New `nativeNotifyGameStarted()` / `nativeNotifyReturnToLauncher()` JNI methods show/hide them so the launcher gets the full screen.
+
+**Config migration** ([src/game/config.cpp](src/game/config.cpp)): default controller bindings use `recompinput::GamepadAxis` / `GamepadButton` enums instead of SDL2's `SDL_CONTROLLER_AXIS_/BUTTON_` symbols. Numerically identical (static_assert on `platform_sdl.cpp`); JSON profiles round-trip byte-for-byte.
+
+**Pending (next session)**: hide touch overlay while launcher is visible, networking init, JNI EditText bridge for lobby code.
+
+---
+
+### Active blocker — File-Select Menu Black-Screen
+
+After Phase 12 ships the title, the file-select menu renders black. Game emits `FillRect`-only display lists, no triangles. Renderer is healthy — this is a game-logic-level bug. rt64 has uncapped `ALOG` instrumentation in `workload_queue` / `framebuffer_renderer` / `present_queue` on the WIP branch for the next investigation pass.
+
+---
+
+### Remaining work (post-Phase 13)
+
+Real backlog, in recommended order:
+
+- [ ] **Resolve file-select black-screen** — debug why the game emits FillRect-only DLs after title.
+- [ ] **Hide touch overlay while launcher is visible** — currently overlaps the RmlUi menu.
+- [ ] **Networking init on Android** — Phase 13 left this as "next session".
+- [ ] **JNI EditText bridge for lobby code** — text-input is the main residue in the 33 remaining UND stubs.
+- [ ] **Boot-time reduction** — persistent `VkPipelineCache` on disk + prune unused ubershader variants. Target 10-15 s (from current ~27 s on A24).
+- [ ] **HUD pads** — D-pad / B / Z / C-buttons / stick layout polish (configurable size, position, opacity).
+- [ ] **Bluetooth gamepad support** — currently touch-only.
+- [ ] **Aspect ratio + multi-resolution** (foldables, tablets).
+- [ ] **Real DPI / orientation / refresh rate** — Phase 1.3 deferred: replace 60 Hz stub with `AChoreographer_postFrameCallback`; query `AConfiguration_getDensity` / `getOrientation`.
+- [ ] **Adreno reference device test** — Snapdragon 8 Gen 2+ (Adreno 740/750). All Phase 12 work was on Mali; Adreno path untested on real hardware.
+- [ ] **Battery / thermal profiling**.
+- [ ] **Multiplayer over cellular** (CoopNet ICE behavior on mobile networks).
+- [ ] **Public-ready APK** with documented minimum specs and known-issue list.
 
 ---
 
