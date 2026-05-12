@@ -1,0 +1,31 @@
+# BK64-Online Android touch overlay — default layout.
+#
+# Coordinates are normalized 0..1 over the surface, origin top-left, +y down.
+# Tuned for a 16:9 phone in landscape (2400x1080-ish).
+#
+# Format:
+#   stick   <x_norm> <y_norm> <radius_norm>
+#   button  <NAME>   <x_norm> <y_norm> <radius_norm>
+#
+# Button names: A B Z START L R
+#               C_UP C_DOWN C_LEFT C_RIGHT
+#               DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT
+#
+# Edit this file, push it to /storage/emulated/0/Android/data/com.banjorecomp.online/files/assets/touch_overlay/default.layout
+# to override without rebuilding the APK. Missing / malformed entries fall
+# back to the hardcoded defaults in android_touch.cpp.
+
+stick   0.18  0.78  0.12
+
+button  A         0.88  0.78  0.06
+button  B         0.78  0.86  0.05
+button  Z         0.93  0.50  0.04
+button  START     0.50  0.95  0.04
+button  L         0.10  0.10  0.04
+button  R         0.90  0.10  0.04
+button  C_UP      0.70  0.32  0.035
+button  C_DOWN    0.70  0.46  0.035
+button  C_LEFT    0.62  0.39  0.035
+button  C_RIGHT   0.78  0.39  0.035
+button  DPAD_UP   0.42  0.10  0.035
+button  DPAD_DOWN 0.42  0.18  0.035

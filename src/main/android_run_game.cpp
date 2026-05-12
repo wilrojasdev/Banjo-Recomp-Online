@@ -262,9 +262,10 @@ void extract_apk_assets(AAssetManager* am, const std::filesystem::path& dest_roo
     // so recompui's get_asset_path (which prepends `assets/`) finds them.
     // AAssetManager has no recursive listing API; update this list when
     // new subdirs land under assets/.
-    extract_asset_dir(am, "",            dest_root / "assets");
-    extract_asset_dir(am, "icons",       dest_root / "assets" / "icons");
-    extract_asset_dir(am, "promptfont",  dest_root / "assets" / "promptfont");
+    extract_asset_dir(am, "",              dest_root / "assets");
+    extract_asset_dir(am, "icons",         dest_root / "assets" / "icons");
+    extract_asset_dir(am, "promptfont",    dest_root / "assets" / "promptfont");
+    extract_asset_dir(am, "touch_overlay", dest_root / "assets" / "touch_overlay");
     LOGI("extract_apk_assets: extracted under %s/assets", dest_root.c_str());
 }
 
@@ -384,6 +385,12 @@ void run_game(ANativeWindow* window, AppPaths paths) {
     if (!internal_root.empty()) {
         extract_apk_assets(paths.asset_manager, internal_root);
         recompui::file::set_program_path_override(internal_root);
+
+        // Touch overlay layout — read after extraction so the on-disk copy at
+        // `<internal>/assets/touch_overlay/default.layout` wins. Missing /
+        // malformed file is non-fatal: built-in defaults stay in effect.
+        banjo_android::touch::load_layout(
+            internal_root / "assets" / "touch_overlay" / "default.layout");
 
         // RT64's UserPaths::detectDataPath uses the __linux__ branch on
         // Android (we're a Linux-flavored toolchain) and builds

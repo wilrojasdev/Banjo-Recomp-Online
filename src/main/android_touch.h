@@ -9,6 +9,8 @@
 
 #ifdef __ANDROID__
 
+#include <filesystem>
+
 #include "ultramodern/input.hpp"
 
 struct AInputEvent;
@@ -23,6 +25,14 @@ void set_viewport(int width, int height);
 // the window size (e.g. recompui::get_window_size) but don't have a direct
 // reference to the ANativeWindow.
 void get_viewport(int& width, int& height);
+
+// Replace the in-memory layout with the contents of `path`. Format is
+// described in android_touch.cpp (line-based: `stick X Y R` and
+// `button NAME X Y R`). Missing file / parse errors are non-fatal: returns
+// false and the built-in defaults remain in effect. Call once during boot
+// (after extract_apk_assets) so users can ship a custom layout in
+// `assets/touch_overlay/default.layout` without rebuilding.
+bool load_layout(const std::filesystem::path& path);
 
 // Dispatch an Android NativeActivity motion event into the touch state
 // machine. Returns 1 if the event was consumed, 0 otherwise.

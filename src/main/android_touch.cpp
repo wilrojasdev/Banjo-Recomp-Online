@@ -12,11 +12,15 @@
 #ifdef __ANDROID__
 
 #include <android/input.h>
-#include <array>
+#include <android/log.h>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <jni.h>
 #include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "imgui/imgui.h"
 
@@ -44,6 +48,32 @@ constexpr uint16_t BTN_C_DOWN  = 0x0004;
 constexpr uint16_t BTN_C_LEFT  = 0x0002;
 constexpr uint16_t BTN_C_RIGHT = 0x0001;
 
+// Layout file format (assets/touch_overlay/default.layout):
+//   # comments and blank lines ignored
+//   stick   <x_norm> <y_norm> <radius_norm>
+//   button  <NAME>   <x_norm> <y_norm> <radius_norm>
+// NAME ∈ A, B, Z, START, L, R, C_UP, C_DOWN, C_LEFT, C_RIGHT,
+//        DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT.
+// Each call to load_layout() replaces the in-memory layout entirely; if the
+// file is missing or malformed the hardcoded defaults below remain in effect.
+static uint16_t name_to_mask(const std::string& n) {
+    if (n == "A")          return BTN_A;
+    if (n == "B")          return BTN_B;
+    if (n == "Z")          return BTN_Z;
+    if (n == "START")      return BTN_START;
+    if (n == "L")          return BTN_L;
+    if (n == "R")          return BTN_R;
+    if (n == "C_UP")       return BTN_C_UP;
+    if (n == "C_DOWN")     return BTN_C_DOWN;
+    if (n == "C_LEFT")     return BTN_C_LEFT;
+    if (n == "C_RIGHT")    return BTN_C_RIGHT;
+    if (n == "DPAD_UP")    return BTN_UP;
+    if (n == "DPAD_DOWN")  return BTN_DOWN;
+    if (n == "DPAD_LEFT")  return BTN_LEFT;
+    if (n == "DPAD_RIGHT") return BTN_RIGHT;
+    return 0;
+}
+
 struct TouchButton {
     float x_norm, y_norm;
     float radius_norm;
@@ -58,23 +88,25 @@ struct VirtualStick {
 };
 
 // All coordinates normalized 0..1 (origin top-left, +y down).
-// Default layout targets a 16:9 phone in landscape.
+// Default layout targets a 16:9 phone in landscape — also written verbatim to
+// `assets/touch_overlay/default.layout` so the on-disk file matches the
+// fallback the code uses when the layout file is missing or malformed.
 static VirtualStick g_stick = { 0.18f, 0.78f, 0.12f, -1 };
 
-static std::array<TouchButton, 12> g_buttons = {{
-    { 0.88f, 0.78f, 0.06f, BTN_A,        -1 },
-    { 0.78f, 0.86f, 0.05f, BTN_B,        -1 },
-    { 0.93f, 0.50f, 0.04f, BTN_Z,        -1 },
-    { 0.50f, 0.95f, 0.04f, BTN_START,    -1 },
-    { 0.10f, 0.10f, 0.04f, BTN_L,        -1 },
-    { 0.90f, 0.10f, 0.04f, BTN_R,        -1 },
-    { 0.70f, 0.32f, 0.035f, BTN_C_UP,    -1 },
-    { 0.70f, 0.46f, 0.035f, BTN_C_DOWN,  -1 },
-    { 0.62f, 0.39f, 0.035f, BTN_C_LEFT,  -1 },
-    { 0.78f, 0.39f, 0.035f, BTN_C_RIGHT, -1 },
-    { 0.42f, 0.10f, 0.035f, BTN_UP,      -1 },  // D-pad simplified
-    { 0.42f, 0.18f, 0.035f, BTN_DOWN,    -1 },
-}};
+static std::vector<TouchButton> g_buttons = {
+    { 0.88f, 0.78f, 0.06f,  BTN_A,        -1 },
+    { 0.78f, 0.86f, 0.05f,  BTN_B,        -1 },
+    { 0.93f, 0.50f, 0.04f,  BTN_Z,        -1 },
+    { 0.50f, 0.95f, 0.04f,  BTN_START,    -1 },
+    { 0.10f, 0.10f, 0.04f,  BTN_L,        -1 },
+    { 0.90f, 0.10f, 0.04f,  BTN_R,        -1 },
+    { 0.70f, 0.32f, 0.035f, BTN_C_UP,     -1 },
+    { 0.70f, 0.46f, 0.035f, BTN_C_DOWN,   -1 },
+    { 0.62f, 0.39f, 0.035f, BTN_C_LEFT,   -1 },
+    { 0.78f, 0.39f, 0.035f, BTN_C_RIGHT,  -1 },
+    { 0.42f, 0.10f, 0.035f, BTN_UP,       -1 },  // D-pad simplified
+    { 0.42f, 0.18f, 0.035f, BTN_DOWN,     -1 },
+};
 
 static std::mutex g_mutex;
 static int g_viewport_w = 1920;
@@ -93,6 +125,85 @@ void get_viewport(int& width, int& height) {
     std::lock_guard lock{g_mutex};
     width = g_viewport_w;
     height = g_viewport_h;
+}
+
+bool load_layout(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+            "load_layout: '%s' not openable — keeping built-in defaults",
+            path.c_str());
+        return false;
+    }
+
+    VirtualStick parsed_stick{};
+    bool parsed_stick_set = false;
+    std::vector<TouchButton> parsed_buttons;
+    int line_no = 0;
+    int errors = 0;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        ++line_no;
+        // Strip inline `#` comments.
+        if (auto hash = line.find('#'); hash != std::string::npos) {
+            line.erase(hash);
+        }
+        std::istringstream ss(line);
+        std::string kw;
+        if (!(ss >> kw)) continue;  // blank line
+
+        if (kw == "stick") {
+            float x, y, r;
+            if (!(ss >> x >> y >> r)) {
+                __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+                    "layout %s:%d: bad stick entry", path.c_str(), line_no);
+                ++errors;
+                continue;
+            }
+            parsed_stick = { x, y, r, -1 };
+            parsed_stick_set = true;
+        } else if (kw == "button") {
+            std::string name;
+            float x, y, r;
+            if (!(ss >> name >> x >> y >> r)) {
+                __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+                    "layout %s:%d: bad button entry", path.c_str(), line_no);
+                ++errors;
+                continue;
+            }
+            uint16_t mask = name_to_mask(name);
+            if (mask == 0) {
+                __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+                    "layout %s:%d: unknown button name '%s'",
+                    path.c_str(), line_no, name.c_str());
+                ++errors;
+                continue;
+            }
+            parsed_buttons.push_back({ x, y, r, mask, -1 });
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+                "layout %s:%d: unknown keyword '%s'",
+                path.c_str(), line_no, kw.c_str());
+            ++errors;
+        }
+    }
+
+    if (parsed_buttons.empty() && !parsed_stick_set) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Touch",
+            "load_layout: '%s' empty — keeping built-in defaults", path.c_str());
+        return false;
+    }
+
+    {
+        std::lock_guard lock{g_mutex};
+        if (parsed_stick_set) g_stick = parsed_stick;
+        if (!parsed_buttons.empty()) g_buttons = std::move(parsed_buttons);
+    }
+    __android_log_print(ANDROID_LOG_INFO, "BK64-Touch",
+        "load_layout: '%s' loaded %zu buttons (errors=%d)",
+        path.c_str(), g_buttons.size(), errors);
+    return true;
 }
 
 static bool point_in_circle(float px, float py, float cx, float cy, float r) {
