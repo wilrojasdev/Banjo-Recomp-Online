@@ -333,6 +333,35 @@ void android_on_launcher_init(recompui::LauncherMenu* menu) {
         LOGW("on_launcher_init: no start_game_option to override");
     }
 
+    // Layout pass — mirror the desktop launcher (main.cpp::on_launcher_init):
+    // right-aligned options column over the launcher animation BG, transparent
+    // hover/focus, square corners, no default title. Same constants and shape
+    // as desktop so Android matches visually until the multiplayer-specific
+    // panels (Host/Join/CoopNet indicator) are ported.
+    options->set_width(30, recompui::Unit::Percent);
+    for (auto* opt : options->get_options()) {
+        opt->set_justify_content(recompui::JustifyContent::FlexEnd);
+        opt->set_border_radius(0);
+        for (auto* style : { &opt->hover_style, &opt->focus_style }) {
+            style->set_background_color(recompui::theme::color::Transparent);
+        }
+    }
+
+    recompui::Element* menu_container = menu->get_menu_container();
+    menu_container->set_width(1440);
+    menu_container->unset_left();
+    menu_container->set_top(banjo::launcher_options_top_offset);
+    menu_container->set_bottom(-banjo::launcher_options_top_offset);
+    menu_container->set_right(50, recompui::Unit::Percent);
+    menu_container->set_translate_2D(50.0f, 0.0f, recompui::Unit::Percent);
+
+    options->unset_left();
+    options->set_bottom(50.0f, recompui::Unit::Percent);
+    options->set_translate_2D(0.0f, 50.0f, recompui::Unit::Percent);
+    options->set_right(banjo::launcher_options_right_position_start);
+
+    menu->remove_default_title();
+
     banjo::launcher_animation_setup(menu);
 }
 
