@@ -1,18 +1,10 @@
-// Phase 9 smoke test: a thin NativeActivity subclass that overlays a single
-// visible START Button on top of the surface NativeActivity owns. The button
-// is rendered by Android's standard View hierarchy (independent of the
-// Vulkan render context that's currently producing a white frame on Mali
-// Valhall G57), so we can validate the input → recomp pipeline regardless
-// of whether anything is visible inside the game viewport.
+// NativeActivity + Java overlays for Android boot flow:
+//  1) Optional ROM hint (nativeNotifyRomGate) if no valid stored ROM.
+//  2) RmlUi launcher on the Vulkan surface (no Java splash).
+//  3) After "Start Game": shader-compilation splash (nativeNotifyGameStarted).
+//  4) First in-game frame (nativeNotifyFirstGameFrame): dismiss splash + START/A.
 //
-// On press it calls into JNI (`nativeSetButton`) which OR's BTN_START into
-// banjo_android::touch::g_btn_state via debug_set_button(). On release it
-// AND's the bit out. The recomp polls g_btn_state through the
-// ultramodern::input callbacks registered in android_run_game.cpp.
-//
-// AndroidManifest must point its launcher activity at this class instead of
-// android.app.NativeActivity, AND set android:hasCode="true". The native
-// .so is still loaded by NativeActivity using the same lib_name meta-data.
+// Touch buttons call nativeSetButton → banjo_android::touch (see android_touch.cpp).
 
 package com.banjorecomp.online;
 
@@ -35,7 +27,8 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
-import android.widget.Toast;
+
+import java.io.File;
 
 public class MainActivity extends NativeActivity {
 
@@ -45,77 +38,75 @@ public class MainActivity extends NativeActivity {
     private static final int BTN_START = 0x1000;
     private static final int BTN_A     = 0x8000;
 
-    // Guard: only install the overlay once (onWindowFocusChanged can fire
-    // multiple times during the activity lifetime).
-    private boolean mOverlayInstalled = false;
+    private boolean mWindowTokenReady = false;
 
-    // Loading splash on top of NativeActivity's surface while the Mali driver
-    // compiles RT64's ubershader pipelines (~22 s on the A24). Dismissed when
-    // native code calls nativeNotifyFirstFrame() or — as a safety net — after
-    // LOADING_TIMEOUT_MS. The START / A buttons are not installed until the
-    // launcher fires "Start Game" → native → nativeNotifyGameStarted(), so the
-    // RmlUi launcher menu has the full screen.
-    private View mLoadingView = null;
+    /** Native asked to show the "add ROM" hint until the user continues. */
+    private volatile boolean mPendingRomGate = false;
+
+    private View mRomGateView = null;
+    private View mShaderLoadingView = null;
     private View mStartButtonView = null;
     private View mAButtonView = null;
     private android.os.IBinder mGameToken = null;
     private final Handler mUiHandler = new Handler(Looper.getMainLooper());
-    private static final long LOADING_TIMEOUT_MS = 45_000;
+    private static final long SHADER_LOADING_TIMEOUT_MS = 45_000;
+
+    private final Runnable mShaderLoadingTimeoutRunnable = new Runnable() {
+        @Override
+        public void run() {
+            Log.w(TAG, "shader loading timeout — dismissing splash");
+            dismissShaderLoadingOverlay();
+            showGameControls();
+        }
+    };
 
     static {
-        // The native library is also loaded by NativeActivity via the
-        // android.app.lib_name meta-data, but loading it here as well is
-        // harmless (subsequent loads are no-ops) and guarantees the JNI
-        // symbol is resolvable before any onTouch fires.
         System.loadLibrary("BanjoRecompiled");
-        // Give the native side a JNIEnv that has the app classloader so it
-        // can cache a global ref to this class + the notifyFirstFrame method
-        // ID. Without this, FindClass from the workload/audio threads fails
-        // (system classloader doesn't see com.banjorecomp.online.*) and the
-        // first-frame splash dismiss never fires.
         nativeInit();
     }
 
-    /** Set or clear an N64 button bit in the global touch state. */
     private static native void nativeSetButton(int mask, boolean pressed);
 
-    /** Cache class+method on the native side for first-frame callback. */
     private static native void nativeInit();
 
     /**
-     * Called by native code from android_run_game.cpp once the first VI frame
-     * has been presented. Runs on a non-UI thread, so the implementation
-     * forwards to the UI handler before touching views.
+     * Called from native after stored ROMs are scanned. If {@code romPresent}
+     * is false, we offer a short explanation; the launcher still loads
+     * underneath (Cargar ROM / Load ROM in RmlUi).
      */
-    @SuppressWarnings("unused") // Called via JNI.
-    public static void nativeNotifyFirstFrame() {
-        // Static so JNI lookup is simple; resolves to the live MainActivity via
-        // sInstance set in onCreate.
+    @SuppressWarnings("unused")
+    public static void nativeNotifyRomGate(boolean romPresent) {
         final MainActivity inst = sInstance;
         if (inst != null) {
-            inst.mUiHandler.post(inst::dismissLoadingOverlay);
+            inst.mPendingRomGate = !romPresent;
+            inst.mUiHandler.post(inst::tryApplyRomGateOverlay);
         }
     }
 
     /**
-     * Called by native code when the user clicks "Start Game" in the RmlUi
-     * launcher (and the recomp game thread is actually starting). Shows the
-     * START / A touch buttons so the player can drive the N64 controller.
+     * User pressed Start Game: show full-screen shader compilation splash until
+     * the first real game frame or {@link #SHADER_LOADING_TIMEOUT_MS}.
      */
-    @SuppressWarnings("unused") // Called via JNI.
+    @SuppressWarnings("unused")
     public static void nativeNotifyGameStarted() {
         final MainActivity inst = sInstance;
         if (inst != null) {
-            inst.mUiHandler.post(inst::showGameControls);
+            inst.mUiHandler.post(inst::onNativeGameLoadStarted);
         }
     }
 
     /**
-     * Called by native code when the user returns from the game to the
-     * launcher. Removes the START / A buttons so they don't cover the
-     * launcher's menu text.
+     * First RT64 present after {@code banjo_android_mark_expecting_first_game_frame()}.
      */
-    @SuppressWarnings("unused") // Called via JNI.
+    @SuppressWarnings("unused")
+    public static void nativeNotifyFirstGameFrame() {
+        final MainActivity inst = sInstance;
+        if (inst != null) {
+            inst.mUiHandler.post(inst::onNativeFirstGameFrame);
+        }
+    }
+
+    @SuppressWarnings("unused")
     public static void nativeNotifyReturnToLauncher() {
         final MainActivity inst = sInstance;
         if (inst != null) {
@@ -130,14 +121,11 @@ public class MainActivity extends NativeActivity {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "MainActivity onCreate");
         sInstance = this;
-
-        // NOTE: we do NOT attempt the WindowManager overlay here.
-        // getDecorView().getWindowToken() is null until the window has been
-        // attached, which only happens after onResume → onWindowFocusChanged.
     }
 
     @Override
     protected void onDestroy() {
+        mUiHandler.removeCallbacks(mShaderLoadingTimeoutRunnable);
         if (sInstance == this) {
             sInstance = null;
         }
@@ -147,22 +135,192 @@ public class MainActivity extends NativeActivity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus && !mOverlayInstalled) {
-            mOverlayInstalled = true;
+        if (hasFocus && !mWindowTokenReady) {
+            mWindowTokenReady = true;
             mGameToken = getWindow().getDecorView().getWindowToken();
             Log.i(TAG, "onWindowFocusChanged(true) — token=" + mGameToken);
-            installLoadingOverlay(mGameToken);
-            // START / A buttons are installed in dismissLoadingOverlay()
-            // once the first real game frame is on screen.
+            tryApplyRomGateOverlay();
         }
     }
 
-    /**
-     * Install a Button as a separate TYPE_APPLICATION_PANEL window on top of
-     * the NativeActivity's SurfaceView. Called from showGameControls() once
-     * the launcher hands off to the game; the decorView window token is
-     * captured at onWindowFocusChanged(true) and reused.
-     */
+    private void tryApplyRomGateOverlay() {
+        if (mGameToken == null) {
+            return;
+        }
+        if (mPendingRomGate) {
+            if (mRomGateView == null) {
+                installRomMissingOverlay(mGameToken);
+            }
+        } else {
+            dismissRomMissingOverlay();
+        }
+    }
+
+    private void installRomMissingOverlay(android.os.IBinder token) {
+        dismissRomMissingOverlay();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setBackgroundColor(Color.argb(240, 0, 0, 0));
+        int pad = (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, 24f, getResources().getDisplayMetrics());
+        root.setPadding(pad, pad, pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("ROM no encontrada");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f);
+        title.setGravity(Gravity.CENTER);
+
+        File ext = getExternalFilesDir(null);
+        String folder = ext != null ? ext.getAbsolutePath() : getFilesDir().getAbsolutePath();
+
+        TextView body = new TextView(this);
+        body.setText(
+                "Coloca una copia válida de la ROM NTSC-U de Banjo-Kazooie (N64) en la carpeta de la app para que el recomp la detecte.\n\n"
+                        + "Ruta sugerida (adb push):\n"
+                        + folder
+                        + "\n\n"
+                        + "Después podrás usar «Cargar ROM» en el menú si hace falta.");
+        body.setTextColor(Color.argb(255, 220, 220, 220));
+        body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        body.setGravity(Gravity.CENTER);
+
+        Button ok = new Button(this);
+        ok.setText("Continuar al menú");
+        ok.setOnClickListener(v -> {
+            mPendingRomGate = false;
+            dismissRomMissingOverlay();
+        });
+
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        gap.topMargin = 32;
+
+        root.addView(title);
+        root.addView(body, gap);
+        root.addView(ok, gap);
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.OPAQUE);
+        lp.token = token;
+
+        try {
+            getWindowManager().addView(root, lp);
+            mRomGateView = root;
+            Log.i(TAG, "ROM gate overlay installed");
+        } catch (Throwable t) {
+            Log.e(TAG, "ROM gate addView FAILED: " + t, t);
+            mRomGateView = null;
+        }
+    }
+
+    private void dismissRomMissingOverlay() {
+        if (mRomGateView != null) {
+            try {
+                getWindowManager().removeView(mRomGateView);
+            } catch (Throwable t) {
+                Log.w(TAG, "ROM gate removeView failed: " + t);
+            }
+            mRomGateView = null;
+        }
+    }
+
+    private void onNativeGameLoadStarted() {
+        mUiHandler.removeCallbacks(mShaderLoadingTimeoutRunnable);
+        if (mGameToken == null) {
+            Log.w(TAG, "onNativeGameLoadStarted: no window token yet");
+            return;
+        }
+        installShaderLoadingOverlay(mGameToken);
+        mUiHandler.postDelayed(mShaderLoadingTimeoutRunnable, SHADER_LOADING_TIMEOUT_MS);
+    }
+
+    private void onNativeFirstGameFrame() {
+        mUiHandler.removeCallbacks(mShaderLoadingTimeoutRunnable);
+        dismissShaderLoadingOverlay();
+        showGameControls();
+    }
+
+    private void installShaderLoadingOverlay(android.os.IBinder token) {
+        dismissShaderLoadingOverlay();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setBackgroundColor(Color.BLACK);
+
+        TextView title = new TextView(this);
+        title.setText("Banjo-Kazooie Online");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f);
+        title.setGravity(Gravity.CENTER);
+
+        TextView subtitle = new TextView(this);
+        subtitle.setText("Compilando shaders del juego…");
+        subtitle.setTextColor(Color.argb(255, 200, 200, 200));
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
+        subtitle.setGravity(Gravity.CENTER);
+
+        ProgressBar bar = new ProgressBar(this);
+        bar.setIndeterminate(true);
+
+        TextView hint = new TextView(this);
+        hint.setText("La primera vez en este dispositivo puede tardar varios segundos.\nLas siguientes suelen ser más rápidas (caché del driver).");
+        hint.setTextColor(Color.argb(255, 150, 150, 150));
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        hint.setGravity(Gravity.CENTER);
+
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        gap.topMargin = 48;
+
+        root.addView(title);
+        root.addView(subtitle, gap);
+        root.addView(bar, gap);
+        root.addView(hint, gap);
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.OPAQUE);
+        lp.token = token;
+
+        try {
+            getWindowManager().addView(root, lp);
+            mShaderLoadingView = root;
+            Log.i(TAG, "shader loading overlay installed");
+        } catch (Throwable t) {
+            Log.e(TAG, "shader loading addView FAILED: " + t, t);
+            mShaderLoadingView = null;
+        }
+    }
+
+    private void dismissShaderLoadingOverlay() {
+        if (mShaderLoadingView != null) {
+            try {
+                getWindowManager().removeView(mShaderLoadingView);
+                Log.i(TAG, "shader loading overlay dismissed");
+            } catch (Throwable t) {
+                Log.w(TAG, "shader loading removeView failed: " + t);
+            }
+            mShaderLoadingView = null;
+        }
+    }
+
     private void installStartWindowOverlay(android.os.IBinder token) {
         Button btn = buildStartButton();
 
@@ -180,19 +338,16 @@ public class MainActivity extends NativeActivity {
         try {
             getWindowManager().addView(btn, lp);
             mStartButtonView = btn;
-            Log.i(TAG, "WindowManager.addView OK token=" + token);
+            Log.i(TAG, "WindowManager.addView START OK token=" + token);
         } catch (Throwable t) {
-            Log.e(TAG, "WindowManager.addView FAILED: " + t, t);
-            // Fallback: addContentView lands below NativeActivity's SurfaceView
-            // in the View hierarchy, so it won't be visible, but it at least
-            // proves the View system is alive and touch routing works.
+            Log.e(TAG, "WindowManager.addView START FAILED: " + t, t);
             FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
                     700, 280,
                     Gravity.TOP | Gravity.CENTER_HORIZONTAL);
             flp.topMargin = 60;
             addContentView(btn, flp);
             mStartButtonView = btn;
-            Log.i(TAG, "fallback addContentView installed");
+            Log.i(TAG, "fallback addContentView START");
         }
     }
 
@@ -209,34 +364,26 @@ public class MainActivity extends NativeActivity {
         bg.setStroke(8, Color.WHITE);
         btn.setBackground(bg);
 
-        btn.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View v, MotionEvent ev) {
-                switch (ev.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        Log.i(TAG, "START pressed");
-                        nativeSetButton(BTN_START, true);
-                        v.setPressed(true);
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        Log.i(TAG, "START released");
-                        nativeSetButton(BTN_START, false);
-                        v.setPressed(false);
-                        return true;
-                    default:
-                        return false;
-                }
+        btn.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    Log.i(TAG, "START pressed");
+                    nativeSetButton(BTN_START, true);
+                    v.setPressed(true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    Log.i(TAG, "START released");
+                    nativeSetButton(BTN_START, false);
+                    v.setPressed(false);
+                    return true;
+                default:
+                    return false;
             }
         });
         return btn;
     }
 
-    /**
-     * Install the A button as a separate TYPE_APPLICATION_PANEL window anchored
-     * to the bottom-right, matching the canonical N64 A position. Uses the same
-     * JNI bridge (nativeSetButton) as START with mask BTN_A.
-     */
     private void installAWindowOverlay(android.os.IBinder token) {
         Button btn = buildAButton();
 
@@ -265,7 +412,7 @@ public class MainActivity extends NativeActivity {
             flp.bottomMargin = 120;
             addContentView(btn, flp);
             mAButtonView = btn;
-            Log.i(TAG, "fallback addContentView A installed");
+            Log.i(TAG, "fallback addContentView A");
         }
     }
 
@@ -282,117 +429,26 @@ public class MainActivity extends NativeActivity {
         bg.setStroke(8, Color.WHITE);
         btn.setBackground(bg);
 
-        btn.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View v, MotionEvent ev) {
-                switch (ev.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        Log.i(TAG, "A pressed");
-                        nativeSetButton(BTN_A, true);
-                        v.setPressed(true);
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        Log.i(TAG, "A released");
-                        nativeSetButton(BTN_A, false);
-                        v.setPressed(false);
-                        return true;
-                    default:
-                        return false;
-                }
+        btn.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    Log.i(TAG, "A pressed");
+                    nativeSetButton(BTN_A, true);
+                    v.setPressed(true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    Log.i(TAG, "A released");
+                    nativeSetButton(BTN_A, false);
+                    v.setPressed(false);
+                    return true;
+                default:
+                    return false;
             }
         });
         return btn;
     }
 
-    /**
-     * Install a full-screen opaque loading splash above the NativeActivity
-     * surface. The first 20+ s after launch are pipeline compilation; the
-     * surface shows nothing useful, so we cover it with a "Cargando..."
-     * panel until native signals first-frame readiness (or the timeout
-     * fires as a safety net).
-     */
-    private void installLoadingOverlay(android.os.IBinder token) {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER);
-        root.setBackgroundColor(Color.BLACK);
-
-        TextView title = new TextView(this);
-        title.setText("Banjo-Kazooie Online");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f);
-        title.setGravity(Gravity.CENTER);
-
-        TextView subtitle = new TextView(this);
-        subtitle.setText("Compilando shaders…");
-        subtitle.setTextColor(Color.argb(255, 200, 200, 200));
-        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
-        subtitle.setGravity(Gravity.CENTER);
-
-        ProgressBar bar = new ProgressBar(this);
-        bar.setIndeterminate(true);
-
-        TextView hint = new TextView(this);
-        hint.setText("Primera carga en este dispositivo, ~20 s.\nLas próximas serán más rápidas (caché del driver).");
-        hint.setTextColor(Color.argb(255, 150, 150, 150));
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
-        hint.setGravity(Gravity.CENTER);
-
-        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        gap.topMargin = 48;
-
-        root.addView(title);
-        root.addView(subtitle, gap);
-        root.addView(bar, gap);
-        root.addView(hint, gap);
-
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.OPAQUE);
-        lp.token = token;
-
-        try {
-            getWindowManager().addView(root, lp);
-            mLoadingView = root;
-            Log.i(TAG, "loading overlay installed");
-        } catch (Throwable t) {
-            Log.e(TAG, "loading overlay addView FAILED: " + t, t);
-            mLoadingView = null;
-        }
-
-        // Safety net: dismiss after a hard timeout in case native never sends
-        // the first-frame notification (e.g. crash, hang, race).
-        mUiHandler.postDelayed(this::dismissLoadingOverlay, LOADING_TIMEOUT_MS);
-    }
-
-    private void dismissLoadingOverlay() {
-        if (mLoadingView != null) {
-            try {
-                getWindowManager().removeView(mLoadingView);
-                Log.i(TAG, "loading overlay dismissed");
-            } catch (Throwable t) {
-                Log.w(TAG, "loading overlay removeView failed: " + t);
-            }
-            mLoadingView = null;
-        }
-        // Touch buttons are NOT installed here anymore — the launcher (RmlUi)
-        // owns the full screen now. showGameControls() is called from native
-        // once the user clicks "Start Game" so the buttons only appear with
-        // the running game.
-    }
-
-    /**
-     * Install the START / A overlay buttons on the UI thread. Idempotent:
-     * called by nativeNotifyGameStarted() when transitioning launcher → game.
-     */
     private void showGameControls() {
         if (mGameToken == null) {
             Log.w(TAG, "showGameControls: no window token yet, skipping");
@@ -406,12 +462,9 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    /**
-     * Remove the START / A overlay buttons on the UI thread. Idempotent:
-     * called by nativeNotifyReturnToLauncher() when the game exits to the
-     * launcher.
-     */
     private void hideGameControls() {
+        dismissShaderLoadingOverlay();
+        mUiHandler.removeCallbacks(mShaderLoadingTimeoutRunnable);
         if (mStartButtonView != null) {
             try {
                 getWindowManager().removeView(mStartButtonView);

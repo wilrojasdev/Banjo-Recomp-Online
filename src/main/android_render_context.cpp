@@ -32,15 +32,21 @@
 // (it uses the system classloader). The Java side calls nativeInit() right
 // after loadLibrary in MainActivity's static initializer; we use that
 // JNIEnv (which DOES have the app classloader) to cache a global ref to
-// MainActivity and the methodID for nativeNotifyFirstFrame. Background
-// threads can then invoke the cached method without doing FindClass.
-namespace {
-JavaVM* g_jvm = nullptr;
-jclass g_main_activity_class = nullptr;
-jmethodID g_notify_first_frame_method = nullptr;
-jmethodID g_notify_game_started_method = nullptr;
-jmethodID g_notify_return_to_launcher_method = nullptr;
-}
+// MainActivity. Background threads invoke cached methods without FindClass.
+static JavaVM* g_jvm = nullptr;
+static jclass g_main_activity_class = nullptr;
+static jmethodID g_notify_rom_gate_method = nullptr;
+static jmethodID g_notify_game_started_method = nullptr;
+static jmethodID g_notify_return_to_launcher_method = nullptr;
+static jmethodID g_notify_first_game_frame_method = nullptr;
+static std::atomic<bool> g_expecting_first_game_frame{false};
+
+// recompui::RT64Context::update_screen (rt64_render_context.cpp) calls this
+// pointer after each present when linked into BanjoRecompiled.
+extern "C" void (*recompui_android_after_present_hook)(void) = nullptr;
+
+static bool call_main_activity_method(const char* tag, jmethodID method);
+static bool call_main_activity_void_bool(const char* tag, jmethodID method, bool arg);
 
 extern "C" __attribute__((visibility("default")))
 void banjo_android_set_jvm(JavaVM* vm) {
@@ -49,12 +55,24 @@ void banjo_android_set_jvm(JavaVM* vm) {
         "banjo_android_set_jvm: vm=%p", (void*)vm);
 }
 
-// Trampolines for the launcher: Start-Game → show touch buttons,
-// return-to-launcher → hide them. Forward-declared here so the JNI helpers
-// (defined further down) can be referenced from anywhere in the codebase
-// without dragging in <jni.h>.
-namespace { bool call_main_activity_method(const char*, jmethodID); }
+extern "C" __attribute__((visibility("default")))
+void banjo_android_mark_expecting_first_game_frame() {
+    g_expecting_first_game_frame.store(true, std::memory_order_release);
+}
 
+extern "C" __attribute__((visibility("default")))
+void banjo_android_cancel_expecting_first_game_frame() {
+    g_expecting_first_game_frame.store(false, std::memory_order_release);
+}
+
+extern "C" __attribute__((visibility("default")))
+void banjo_android_notify_rom_gate(bool rom_present) {
+    call_main_activity_void_bool("notify_rom_gate", g_notify_rom_gate_method, rom_present);
+}
+
+// Start Game pressed: Java shows shader splash. We only arm the first-frame
+// latch *after* recomp::start_game() returns so a leftover launcher present
+// cannot dismiss the splash early (see android_run_game.cpp).
 extern "C" __attribute__((visibility("default")))
 void banjo_android_notify_game_started() {
     call_main_activity_method("notify_game_started", g_notify_game_started_method);
@@ -62,8 +80,16 @@ void banjo_android_notify_game_started() {
 
 extern "C" __attribute__((visibility("default")))
 void banjo_android_notify_return_to_launcher() {
+    banjo_android_cancel_expecting_first_game_frame();
     call_main_activity_method("notify_return_to_launcher",
                               g_notify_return_to_launcher_method);
+}
+
+extern "C" void banjo_android_on_present_after_rt64_update() {
+    if (!g_expecting_first_game_frame.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    call_main_activity_method("notify_first_game_frame", g_notify_first_game_frame_method);
 }
 
 // Called from MainActivity's static initializer (Java thread, app classloader
@@ -72,39 +98,37 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_banjorecomp_online_MainActivity_nativeInit(JNIEnv* env, jclass clazz) {
     if (env == nullptr) return;
     g_main_activity_class = static_cast<jclass>(env->NewGlobalRef(clazz));
-    g_notify_first_frame_method =
-        env->GetStaticMethodID(clazz, "nativeNotifyFirstFrame", "()V");
+    g_notify_rom_gate_method =
+        env->GetStaticMethodID(clazz, "nativeNotifyRomGate", "(Z)V");
     g_notify_game_started_method =
         env->GetStaticMethodID(clazz, "nativeNotifyGameStarted", "()V");
     g_notify_return_to_launcher_method =
         env->GetStaticMethodID(clazz, "nativeNotifyReturnToLauncher", "()V");
+    g_notify_first_game_frame_method =
+        env->GetStaticMethodID(clazz, "nativeNotifyFirstGameFrame", "()V");
     if (env->ExceptionCheck()) env->ExceptionClear();
+    recompui_android_after_present_hook = banjo_android_on_present_after_rt64_update;
     __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
-        "nativeInit: class=%p firstFrame=%p gameStarted=%p returnToLauncher=%p",
+        "nativeInit: class=%p romGate=%p gameStarted=%p returnToLauncher=%p firstGameFrame=%p hook=%p",
         (void*)g_main_activity_class,
-        (void*)g_notify_first_frame_method,
+        (void*)g_notify_rom_gate_method,
         (void*)g_notify_game_started_method,
-        (void*)g_notify_return_to_launcher_method);
+        (void*)g_notify_return_to_launcher_method,
+        (void*)g_notify_first_game_frame_method,
+        (void*)recompui_android_after_present_hook);
 }
 
 #define LOG_TAG "BK64-Render"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-namespace {
+// Heartbeat counters for the gfx-pipeline entry points (AndroidRenderContext).
+static std::atomic<uint64_t> g_dl_count{0};
+static std::atomic<uint64_t> g_dummy_count{0};
+static std::atomic<uint64_t> g_screen_update_count{0};
+static std::atomic<std::chrono::steady_clock::time_point> g_last_log{std::chrono::steady_clock::now()};
 
-// Heartbeat counters for the gfx-pipeline entry points. Logged every ~5s so
-// logcat carries a clear "frames are flowing" signal during Phase 10 bringup.
-// Stays cheap (relaxed atomics + a single log line) and harmless once the
-// port is stable.
-std::atomic<uint64_t> g_dl_count{0};
-std::atomic<uint64_t> g_dummy_count{0};
-std::atomic<uint64_t> g_screen_update_count{0};
-std::atomic<std::chrono::steady_clock::time_point> g_last_log{std::chrono::steady_clock::now()};
-
-// Call a static void()V method on MainActivity from any thread, attaching
-// the current thread to the JVM if needed. Returns true on dispatch.
-bool call_main_activity_method(const char* tag, jmethodID method) {
+static bool call_main_activity_method(const char* tag, jmethodID method) {
     if (g_jvm == nullptr || g_main_activity_class == nullptr || method == nullptr) {
         __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
             "%s: missing jvm/class/method (jvm=%p cls=%p mid=%p)",
@@ -138,14 +162,41 @@ bool call_main_activity_method(const char* tag, jmethodID method) {
     return true;
 }
 
-// One-shot JNI ping to MainActivity.nativeNotifyFirstFrame() right after
-// the first VI present succeeds, so the Java loading splash can dismiss
-// itself instead of relying solely on the 45-second timeout.
-void notify_first_frame_to_java() {
-    call_main_activity_method("notify_first_frame", g_notify_first_frame_method);
+static bool call_main_activity_void_bool(const char* tag, jmethodID method, bool arg) {
+    if (g_jvm == nullptr || g_main_activity_class == nullptr || method == nullptr) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+            "%s: missing jvm/class/method (jvm=%p cls=%p mid=%p)",
+            tag, (void*)g_jvm, (void*)g_main_activity_class, (void*)method);
+        return false;
+    }
+
+    JavaVM* vm = g_jvm;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint getEnvResult = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (getEnvResult == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+                "%s: AttachCurrentThread failed", tag);
+            return false;
+        }
+        attached = true;
+    } else if (getEnvResult != JNI_OK) {
+        __android_log_print(ANDROID_LOG_WARN, "BK64-Render",
+            "%s: GetEnv returned %d", tag, (int)getEnvResult);
+        return false;
+    }
+
+    env->CallStaticVoidMethod(g_main_activity_class, method, arg ? JNI_TRUE : JNI_FALSE);
+    __android_log_print(ANDROID_LOG_INFO, "BK64-Render",
+        "%s: signalled MainActivity (bool=%d)", tag, (int)arg);
+
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) vm->DetachCurrentThread();
+    return true;
 }
 
-void heartbeat(const char* who) {
+static void heartbeat(const char* who) {
     auto now = std::chrono::steady_clock::now();
     auto last = g_last_log.load();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last).count() >= 5 &&
@@ -175,9 +226,9 @@ unsigned int g_DPC_TMEM_REG = 0;
 uint8_t g_DMEM[0x1000];
 uint8_t g_IMEM[0x1000];
 
-void dummy_check_interrupts() {}
+static void dummy_check_interrupts() {}
 
-ultramodern::renderer::SetupResult map_setup_result(RT64::Application::SetupResult r) {
+static ultramodern::renderer::SetupResult map_setup_result(RT64::Application::SetupResult r) {
     switch (r) {
         case RT64::Application::SetupResult::Success:
             return ultramodern::renderer::SetupResult::Success;
@@ -324,12 +375,10 @@ public:
 
     void update_screen() override {
         if (!app) return;
-        const uint64_t prev = g_screen_update_count.fetch_add(1, std::memory_order_relaxed);
-        if (prev == 0) {
-            notify_first_frame_to_java();
-        }
+        g_screen_update_count.fetch_add(1, std::memory_order_relaxed);
         heartbeat("update_screen");
         app->updateScreen();
+        banjo_android_on_present_after_rt64_update();
     }
 
     void shutdown() override {
@@ -353,8 +402,6 @@ public:
 private:
     std::unique_ptr<RT64::Application> app;
 };
-
-}  // namespace
 
 namespace banjo_android::renderer {
 

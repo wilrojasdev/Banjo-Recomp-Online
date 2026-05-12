@@ -287,6 +287,7 @@ void android_on_launcher_init(recompui::LauncherMenu* menu) {
                 banjo_android_notify_game_started();
                 recomp::start_game(game_id, {});
                 recompui::hide_all_contexts();
+                banjo_android_mark_expecting_first_game_frame();
             }
         });
     } else {
@@ -395,6 +396,16 @@ void run_game(ANativeWindow* window, AppPaths paths) {
     // Register supported games (BK).
     for (const auto& game : supported_games) {
         recomp::register_game(game);
+    }
+
+    // Same validation as recomp::start() — notify Java before the launcher so
+    // we can show a ROM hint screen without blocking native boot.
+    recomp::check_all_stored_roms();
+    if (!supported_games.empty()) {
+        std::u8string gid = supported_games[0].game_id;
+        banjo_android_notify_rom_gate(recomp::is_rom_valid(gid));
+    } else {
+        banjo_android_notify_rom_gate(false);
     }
 
     recomp::mods::register_deprecated_mod(
